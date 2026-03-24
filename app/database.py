@@ -117,12 +117,10 @@ TABLE_STATEMENTS = [
         id INT AUTO_INCREMENT PRIMARY KEY,
         quote_date DATE NOT NULL COMMENT '报价日期',
         upload_batch_no VARCHAR(40) COMMENT '上传批次号（同一天可多批）',
-        warehouse_id INT NOT NULL COMMENT '发货仓库ID',
         supplier_id INT COMMENT '供应商ID（关联dict_factories.id）',
         status ENUM('DRAFT', 'CONFIRMED', 'CLOSED') DEFAULT 'DRAFT' COMMENT '状态',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-        CONSTRAINT fk_order_warehouse FOREIGN KEY (warehouse_id) REFERENCES dict_warehouses (id) ON UPDATE CASCADE ON DELETE RESTRICT,
         CONSTRAINT fk_order_supplier FOREIGN KEY (supplier_id) REFERENCES dict_factories (id) ON UPDATE CASCADE ON DELETE SET NULL,
         INDEX idx_quote_date (quote_date),
         INDEX idx_quote_batch (quote_date, upload_batch_no)
