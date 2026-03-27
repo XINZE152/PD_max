@@ -23,6 +23,7 @@ from app.models.tl import (
     CategoryMappingItem,
     ConfirmPriceTableRequest,
     AddWarehouseRequest,
+    PurchaseSuggestionRequest,
 )
 from app.services.tl_service import TLService, get_tl_service
 
@@ -159,7 +160,24 @@ def get_category_mapping(service: TLService = Depends(get_tl_service)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ===================== 接口7：更新品类映射表 =====================
+
+# ===================== 接口A7：采购建议 =====================
+
+@router.post("/get_purchase_suggestion", summary="采购建议")
+def get_purchase_suggestion(
+    body: PurchaseSuggestionRequest,
+    service: TLService = Depends(get_tl_service),
+):
+    try:
+        demands = [d.model_dump() for d in body.demands]
+        return service.get_purchase_suggestion(
+            warehouse_ids=body.warehouse_ids,
+            demands=demands,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/update_category_mapping", summary="更新品类映射表")
 def update_category_mapping(

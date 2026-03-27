@@ -47,3 +47,16 @@ class ConfirmPriceTableRequest(BaseModel):
     """接口5b 请求体 - 确认写入报价数据"""
     报价日期: str = Field(..., description="报价日期，格式 YYYY-MM-DD")
     数据: List[ConfirmPriceTableItem] = Field(..., description="报价明细列表")
+
+
+class DemandItem(BaseModel):
+    """A7 单条需求"""
+    smelter_id: int = Field(..., description="冶炼厂ID")
+    category_id: int = Field(..., description="品类分组ID")
+    demand: float = Field(..., description="需求吨数")
+
+
+class PurchaseSuggestionRequest(BaseModel):
+    """A7 采购建议请求体"""
+    warehouse_ids: List[int] = Field(..., description="仓库ID列表")
+    demands: List[DemandItem] = Field(..., description="需求列表")

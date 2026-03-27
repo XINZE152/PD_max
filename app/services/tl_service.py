@@ -157,26 +157,39 @@ class TLService:
                     for wid, wname, fid, fname, freight in cur.fetchall():
                         freight_map[(wid, fid)] = (wname, fname, freight)
 
-                    # 最新报价：每个(冶炼厂,品类)取最新日期
+                    # category_id(分组) -> row_id 映射
                     cur.execute(
-                        f"""
-                        SELECT factory_id, category_id, unit_price
-                        FROM quote_details
-                        WHERE factory_id IN ({sm_placeholders})
-                          AND category_id IN ({cat_placeholders})
-                          AND quote_date = (
-                              SELECT MAX(qd2.quote_date)
-                              FROM quote_details qd2
-                              WHERE qd2.factory_id  = quote_details.factory_id
-                                AND qd2.category_id = quote_details.category_id
-                          )
-                        """,
-                        tuple(smelter_ids) + tuple(category_ids),
+                        f"SELECT row_id, category_id FROM dict_categories "
+                        f"WHERE category_id IN ({cat_placeholders}) AND is_active = 1",
+                        tuple(category_ids),
                     )
-                    # price_map: {(factory_id, category_id): unit_price}
-                    price_map: Dict[tuple, float] = {
-                        (row[0], row[1]): float(row[2]) for row in cur.fetchall()
-                    }
+                    # row_id_to_cat: {row_id: category_id}
+                    row_id_to_cat: Dict[int, int] = {row[0]: row[1] for row in cur.fetchall()}
+                    row_ids = list(row_id_to_cat.keys())
+
+                    # 最新报价：每个(冶炼厂, row_id)取最新日期，结果映射回 category_id
+                    price_map: Dict[tuple, float] = {}
+                    if row_ids:
+                        ri_placeholders = ",".join(["%s"] * len(row_ids))
+                        cur.execute(
+                            f"""
+                            SELECT factory_id, category_id, unit_price
+                            FROM quote_details
+                            WHERE factory_id IN ({sm_placeholders})
+                              AND category_id IN ({ri_placeholders})
+                              AND quote_date = (
+                                  SELECT MAX(qd2.quote_date)
+                                  FROM quote_details qd2
+                                  WHERE qd2.factory_id  = quote_details.factory_id
+                                    AND qd2.category_id = quote_details.category_id
+                              )
+                            """,
+                            tuple(smelter_ids) + tuple(row_ids),
+                        )
+                        for fid_r, rid, price in cur.fetchall():
+                            cid = row_id_to_cat.get(rid)
+                            if cid is not None:
+                                price_map[(fid_r, cid)] = float(price)
 
                     # 组合结果
                     result = []
@@ -326,11 +339,11 @@ class TLService:
                                 )
                                 item["冶炼厂id"] = cur.lastrowid
 
-                        # 2. 品类不存在则新建
+                        # 2. 品类不存在则新建，item["品类id"] 存的是 row_id
                         if item.get("品类id") is None:
                             cat_name = item["品类名"]
                             cur.execute(
-                                "SELECT category_id FROM dict_categories WHERE name = %s AND is_active = 1",
+                                "SELECT row_id FROM dict_categories WHERE name = %s AND is_active = 1",
                                 (cat_name,),
                             )
                             row = cur.fetchone()
@@ -346,7 +359,7 @@ class TLService:
                                     "VALUES (%s, %s, %s, 1, 1)",
                                     (new_cat_id, cat_code, cat_name),
                                 )
-                                item["品类id"] = new_cat_id
+                                item["品类id"] = cur.lastrowid  # row_id
 
                         # 3. 写入明细，相同(日期+冶炼厂+品类)则更新价格
                         cur.execute(
@@ -499,6 +512,123 @@ class TLService:
         except Exception as e:
             logger.error(f"更新品类映射失败: {e}")
             raise
+
+    # ==================== 接口A7：采购建议 ====================
+
+    def get_purchase_suggestion(
+        self,
+        warehouse_ids: List[int],
+        demands: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """
+        根据仓库列表和需求（冶炼厂+品类+吨数），查询最新运费和报价，
+        计算综合成本（报价+运费），按品类推荐最优冶炼厂，返回文字建议。
+        """
+        if not warehouse_ids or not demands:
+            raise ValueError("仓库列表和需求不能为空")
+
+        smelter_ids = list({d["smelter_id"] for d in demands})
+        category_ids = list({d["category_id"] for d in demands})
+
+        wh_ph = ",".join(["%s"] * len(warehouse_ids))
+        sm_ph = ",".join(["%s"] * len(smelter_ids))
+        cat_ph = ",".join(["%s"] * len(category_ids))
+
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # 品类主名称
+                cur.execute(
+                    f"SELECT category_id, "
+                    f"COALESCE(MAX(CASE WHEN is_main=1 THEN name END), MAX(name)) "
+                    f"FROM dict_categories "
+                    f"WHERE category_id IN ({cat_ph}) AND is_active=1 "
+                    f"GROUP BY category_id",
+                    tuple(category_ids),
+                )
+                cat_name_map: Dict[int, str] = {r[0]: r[1] for r in cur.fetchall()}
+
+                # 冶炼厂名称
+                cur.execute(
+                    f"SELECT id, name FROM dict_factories WHERE id IN ({sm_ph})",
+                    tuple(smelter_ids),
+                )
+                factory_name_map: Dict[int, str] = {r[0]: r[1] for r in cur.fetchall()}
+
+                # 最新运费：每个(仓库,冶炼厂)取最新，再取各仓库最小值作为代表运费
+                cur.execute(
+                    f"""
+                    SELECT df.id AS fid, MIN(fr.price_per_ton) AS min_freight
+                    FROM freight_rates fr
+                    JOIN dict_warehouses dw ON fr.warehouse_id = dw.id
+                    JOIN dict_factories  df ON fr.factory_id  = df.id
+                    WHERE dw.id IN ({wh_ph})
+                      AND df.id IN ({sm_ph})
+                      AND fr.effective_date = (
+                          SELECT MAX(fr2.effective_date)
+                          FROM freight_rates fr2
+                          WHERE fr2.factory_id  = fr.factory_id
+                            AND fr2.warehouse_id = fr.warehouse_id
+                      )
+                    GROUP BY df.id
+                    """,
+                    tuple(warehouse_ids) + tuple(smelter_ids),
+                )
+                # freight_map: {factory_id: min_freight}
+                freight_map: Dict[int, float] = {r[0]: float(r[1]) for r in cur.fetchall()}
+
+                # 最新报价：每个(冶炼厂, category_id分组)取最新
+                cur.execute(
+                    f"""
+                    SELECT qd.factory_id, dc.category_id, qd.unit_price
+                    FROM quote_details qd
+                    JOIN dict_categories dc ON qd.category_id = dc.row_id
+                    WHERE qd.factory_id IN ({sm_ph})
+                      AND dc.category_id IN ({cat_ph})
+                      AND qd.quote_date = (
+                          SELECT MAX(qd2.quote_date)
+                          FROM quote_details qd2
+                          WHERE qd2.factory_id  = qd.factory_id
+                            AND qd2.category_id = qd.category_id
+                      )
+                    """,
+                    tuple(smelter_ids) + tuple(category_ids),
+                )
+                # price_map: {(factory_id, category_id): unit_price}
+                price_map: Dict[tuple, float] = {
+                    (r[0], r[1]): float(r[2]) for r in cur.fetchall()
+                }
+
+        # 按品类分组需求，计算综合成本，生成建议
+        from collections import defaultdict
+        cat_demands: Dict[int, List[Dict]] = defaultdict(list)
+        for d in demands:
+            cat_demands[d["category_id"]].append(d)
+
+        suggestion_parts = []
+        for cid, items in cat_demands.items():
+            cat_name = cat_name_map.get(cid, f"品类{cid}")
+            total_tons = sum(i["demand"] for i in items)
+            detail_parts = []
+            for item in items:
+                fid = item["smelter_id"]
+                fname = factory_name_map.get(fid, f"冶炼厂{fid}")
+                price = price_map.get((fid, cid))
+                freight = freight_map.get(fid)
+                if price is not None and freight is not None:
+                    total_cost = price + freight
+                    detail_parts.append(
+                        f"从{fname}采购{item['demand']}吨（综合成本{total_cost:.0f}元/吨，报价{price:.0f}+运费{freight:.0f}）"
+                    )
+                else:
+                    detail_parts.append(
+                        f"从{fname}采购{item['demand']}吨（暂无完整报价或运费数据）"
+                    )
+            suggestion_parts.append(
+                f"品类「{cat_name}」共需{total_tons}吨：" + "，".join(detail_parts) + "。"
+            )
+
+        suggestion = "\n".join(suggestion_parts) if suggestion_parts else "暂无足够数据生成建议。"
+        return {"code": 200, "data": {"suggestion": suggestion}}
 
 
 # ==================== 单例工厂 ====================
