@@ -111,57 +111,21 @@ TABLE_STATEMENTS = [
         INDEX idx_effective_date (effective_date)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='运费价格表';
     """,
-    # 报价主单表
-    """
-    CREATE TABLE IF NOT EXISTS quote_orders (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        quote_date DATE NOT NULL COMMENT '报价日期',
-        upload_batch_no VARCHAR(40) COMMENT '上传批次号（同一天可多批）',
-        supplier_id INT COMMENT '供应商ID（关联dict_factories.id）',
-        status ENUM('DRAFT', 'CONFIRMED', 'CLOSED') DEFAULT 'DRAFT' COMMENT '状态',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-        CONSTRAINT fk_order_supplier FOREIGN KEY (supplier_id) REFERENCES dict_factories (id) ON UPDATE CASCADE ON DELETE SET NULL,
-        INDEX idx_quote_date (quote_date),
-        INDEX idx_quote_batch (quote_date, upload_batch_no)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='报价主单表';
-    """,
     # 报价明细表
     """
     CREATE TABLE IF NOT EXISTS quote_details (
         id INT AUTO_INCREMENT PRIMARY KEY,
-        order_id INT NOT NULL COMMENT '主单ID',
+        quote_date DATE NOT NULL COMMENT '报价日期',
         factory_id INT NOT NULL COMMENT '冶炼厂ID',
-        raw_category_name VARCHAR(100) NOT NULL COMMENT '报价原始品类名（如：电动车电池）',
-        mapped_category_row_id INT COMMENT '映射到dict_categories.row_id（具体别名行）',
-        category_id INT COMMENT '归并后大类ID（如：电池=301，用于利润聚合）',
-        weight_tons DECIMAL(10, 2) NOT NULL COMMENT '重量（吨）',
+        category_id INT NOT NULL COMMENT '品类ID',
+        raw_category_name VARCHAR(100) NOT NULL COMMENT '原始品类名',
         unit_price DECIMAL(10, 2) NOT NULL COMMENT '单价（元/吨）',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-        CONSTRAINT fk_detail_order FOREIGN KEY (order_id) REFERENCES quote_orders (id) ON DELETE CASCADE,
+        UNIQUE KEY uk_date_factory_category (quote_date, factory_id, category_id),
         CONSTRAINT fk_detail_factory FOREIGN KEY (factory_id) REFERENCES dict_factories (id) ON UPDATE CASCADE ON DELETE RESTRICT,
-        CONSTRAINT fk_detail_category_row FOREIGN KEY (mapped_category_row_id) REFERENCES dict_categories (row_id) ON UPDATE CASCADE ON DELETE SET NULL,
-        INDEX idx_order_id (order_id),
-        INDEX idx_factory_id (factory_id),
-        INDEX idx_mapped_category_row (mapped_category_row_id),
-        INDEX idx_category_id (category_id),
-        INDEX idx_raw_category_name (raw_category_name)
+        CONSTRAINT fk_detail_category FOREIGN KEY (category_id) REFERENCES dict_categories (row_id) ON UPDATE CASCADE ON DELETE RESTRICT
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='报价明细表';
-    """,
-    # 利润计算结果表
-    """
-    CREATE TABLE IF NOT EXISTS optimization_results (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        order_id INT NOT NULL UNIQUE COMMENT '主单ID',
-        total_profit DECIMAL(15, 2) DEFAULT 0.00 COMMENT '总利润（元）',
-        best_combination JSON COMMENT '最优组合方案',
-        calculation_time_ms INT COMMENT '计算耗时（毫秒）',
-        error_msg TEXT COMMENT '错误信息',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-        CONSTRAINT fk_result_order FOREIGN KEY (order_id) REFERENCES quote_orders (id) ON DELETE CASCADE
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='利润计算结果表';
     """,
 ]
 

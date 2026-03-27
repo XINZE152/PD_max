@@ -2,14 +2,16 @@
 TL比价模块路由
 接口前缀：/tl
 包含接口：
-  1. GET  /tl/get_warehouses         - 获取仓库列表
-  2. GET  /tl/get_smelters            - 获取冶炼厂列表
-  3. GET  /tl/get_categories          - 获取品类列表
-  4. POST /tl/get_comparison          - 获取比价表
-  5. POST /tl/upload_price_table      - 上传价格表（批量图片，OCR解析并返回匹配结果）
-  5b.POST /tl/confirm_price_table     - 确认并写入报价数据到数据库
-  6. POST /tl/upload_freight          - 上传运费
-  7. POST /tl/update_category_mapping - 更新品类映射表
+  0. POST /tl/add_warehouse            - 添加仓库（不存在则新建）
+  1. GET  /tl/get_warehouses           - 获取仓库列表
+  2. GET  /tl/get_smelters             - 获取冶炼厂列表
+  3. GET  /tl/get_categories           - 获取品类列表
+  4. POST /tl/get_comparison           - 获取比价表
+  5. POST /tl/upload_price_table       - 上传价格表（OCR识别，返回原始识别结果）
+  5b.POST /tl/confirm_price_table      - 确认写入报价数据（自动新建缺失冶炼厂/品类）
+  6. POST /tl/upload_freight           - 上传运费
+  7a.GET  /tl/get_category_mapping     - 获取品类映射表
+  7. POST /tl/update_category_mapping  - 更新品类映射表
 """
 from typing import List
 

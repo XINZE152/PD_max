@@ -123,7 +123,7 @@ class TLService:
                     sm_placeholders = ",".join(["%s"] * len(smelter_ids))
                     cat_placeholders = ",".join(["%s"] * len(category_ids))
 
-                    # 获取每个品类的主名称（is_main=1），若无则取任意一条
+                    # 品类主名称
                     cur.execute(
                         f"SELECT DISTINCT category_id, "
                         f"COALESCE(MAX(CASE WHEN is_main=1 THEN name END), MAX(name)) AS cat_name "
@@ -132,18 +132,12 @@ class TLService:
                         f"GROUP BY category_id",
                         tuple(category_ids),
                     )
-                    cat_map: Dict[int, str] = {
-                        row[0]: row[1] for row in cur.fetchall()
-                    }
+                    cat_map: Dict[int, str] = {row[0]: row[1] for row in cur.fetchall()}
 
-                    # 查询运费：取最新生效日期
-                    sql = f"""
-                        SELECT
-                            dw.id        AS warehouse_id,
-                            dw.name      AS warehouse_name,
-                            df.id        AS factory_id,
-                            df.name      AS factory_name,
-                            fr.price_per_ton AS freight
+                    # 最新运费：每个(仓库,冶炼厂)取最新日期
+                    cur.execute(
+                        f"""
+                        SELECT dw.id, dw.name, df.id, df.name, fr.price_per_ton
                         FROM freight_rates fr
                         JOIN dict_warehouses dw ON fr.warehouse_id = dw.id
                         JOIN dict_factories  df ON fr.factory_id  = df.id
@@ -155,13 +149,38 @@ class TLService:
                               WHERE fr2.factory_id  = fr.factory_id
                                 AND fr2.warehouse_id = fr.warehouse_id
                           )
-                    """
-                    cur.execute(sql, tuple(warehouse_ids) + tuple(smelter_ids))
-                    freight_rows = cur.fetchall()
+                        """,
+                        tuple(warehouse_ids) + tuple(smelter_ids),
+                    )
+                    # freight_map: {(warehouse_id, factory_id): (wname, fname, freight)}
+                    freight_map: Dict[tuple, tuple] = {}
+                    for wid, wname, fid, fname, freight in cur.fetchall():
+                        freight_map[(wid, fid)] = (wname, fname, freight)
 
-                    # 笛卡尔积：运费记录 × 品类
+                    # 最新报价：每个(冶炼厂,品类)取最新日期
+                    cur.execute(
+                        f"""
+                        SELECT factory_id, category_id, unit_price
+                        FROM quote_details
+                        WHERE factory_id IN ({sm_placeholders})
+                          AND category_id IN ({cat_placeholders})
+                          AND quote_date = (
+                              SELECT MAX(qd2.quote_date)
+                              FROM quote_details qd2
+                              WHERE qd2.factory_id  = quote_details.factory_id
+                                AND qd2.category_id = quote_details.category_id
+                          )
+                        """,
+                        tuple(smelter_ids) + tuple(category_ids),
+                    )
+                    # price_map: {(factory_id, category_id): unit_price}
+                    price_map: Dict[tuple, float] = {
+                        (row[0], row[1]): float(row[2]) for row in cur.fetchall()
+                    }
+
+                    # 组合结果
                     result = []
-                    for wid, wname, fid, fname, freight in freight_rows:
+                    for (wid, fid), (wname, fname, freight) in freight_map.items():
                         for cid in category_ids:
                             cat_name = cat_map.get(cid)
                             if cat_name is None:
@@ -170,7 +189,8 @@ class TLService:
                                 "仓库": wname,
                                 "冶炼厂": fname,
                                 "品类": cat_name,
-                                "运费列表": float(freight) if freight is not None else None,
+                                "运费": float(freight) if freight is not None else None,
+                                "报价": price_map.get((fid, cid)),
                             })
                     return result
 
@@ -274,11 +294,6 @@ class TLService:
         quote_date_str: str,
         items: List[Dict[str, Any]],
     ) -> Dict[str, Any]:
-        """
-        前端确认后，将报价数据写入 quote_orders + quote_details。
-        items 格式: [{"冶炼厂名": "xxx", "冶炼厂id": 1或null, "品类名": "xxx", "品类id": 3或null, "价格": 9350}, ...]
-        冶炼厂id/品类id为null时自动新建。
-        """
         if not items:
             raise ValueError("报价数据不能为空")
 
@@ -287,14 +302,12 @@ class TLService:
         except (ValueError, TypeError):
             raise ValueError(f"日期格式不正确: {quote_date_str}，应为 YYYY-MM-DD")
 
-        batch_no = uuid.uuid4().hex[:16]
-
         try:
             with get_conn() as conn:
                 with conn.cursor() as cur:
-                    # 1. 自动新建缺失的冶炼厂和品类
+                    inserted, updated = 0, 0
                     for item in items:
-                        # 冶炼厂不存在则新建
+                        # 1. 冶炼厂不存在则新建
                         if item.get("冶炼厂id") is None:
                             factory_name = item["冶炼厂名"]
                             cur.execute(
@@ -313,7 +326,7 @@ class TLService:
                                 )
                                 item["冶炼厂id"] = cur.lastrowid
 
-                        # 品类不存在则新建
+                        # 2. 品类不存在则新建
                         if item.get("品类id") is None:
                             cat_name = item["品类名"]
                             cur.execute(
@@ -324,7 +337,6 @@ class TLService:
                             if row:
                                 item["品类id"] = row[0]
                             else:
-                                # 生成新的 category_id（取当前最大值+1）
                                 cur.execute("SELECT COALESCE(MAX(category_id), 0) + 1 FROM dict_categories")
                                 new_cat_id = cur.fetchone()[0]
                                 cat_code = f"CAT_{uuid.uuid4().hex[:8].upper()}"
@@ -336,53 +348,25 @@ class TLService:
                                 )
                                 item["品类id"] = new_cat_id
 
-                    # 2. 插入主单
-                    cur.execute(
-                        "INSERT INTO quote_orders "
-                        "(quote_date, upload_batch_no, status) "
-                        "VALUES (%s, %s, 'DRAFT')",
-                        (quote_dt, batch_no),
-                    )
-                    order_id = cur.lastrowid
-
-                    # 3. 插入明细
-                    for item in items:
-                        factory_id = item["冶炼厂id"]
-                        category_id = item["品类id"]
-                        price = item["价格"]
-                        cat_name = item["品类名"]
-
-                        # 查找 mapped_category_row_id
-                        cur.execute(
-                            "SELECT row_id FROM dict_categories "
-                            "WHERE category_id = %s AND is_active = 1 "
-                            "ORDER BY is_main DESC LIMIT 1",
-                            (category_id,),
-                        )
-                        row = cur.fetchone()
-                        mapped_row_id = row[0] if row else None
-
+                        # 3. 写入明细，相同(日期+冶炼厂+品类)则更新价格
                         cur.execute(
                             "INSERT INTO quote_details "
-                            "(order_id, factory_id, raw_category_name, "
-                            "mapped_category_row_id, category_id, weight_tons, unit_price) "
-                            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                            (
-                                order_id,
-                                factory_id,
-                                cat_name,
-                                mapped_row_id,
-                                category_id,
-                                0,
-                                price,
-                            ),
+                            "(quote_date, factory_id, category_id, raw_category_name, unit_price) "
+                            "VALUES (%s, %s, %s, %s, %s) "
+                            "ON DUPLICATE KEY UPDATE "
+                            "unit_price = VALUES(unit_price), "
+                            "raw_category_name = VALUES(raw_category_name), "
+                            "updated_at = CURRENT_TIMESTAMP",
+                            (quote_dt, item["冶炼厂id"], item["品类id"], item["品类名"], item["价格"]),
                         )
+                        if cur.rowcount == 1:
+                            inserted += 1
+                        else:
+                            updated += 1
 
             return {
                 "code": 200,
-                "msg": "报价数据已写入数据库",
-                "order_id": order_id,
-                "batch_no": batch_no,
+                "msg": f"写入成功：新增 {inserted} 条，更新 {updated} 条",
             }
 
         except ValueError:
