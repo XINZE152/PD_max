@@ -53,6 +53,19 @@ def create_database_if_not_exists():
 
 
 TABLE_STATEMENTS = [
+     # 用户表（用于用户认证）
+    """
+    CREATE TABLE IF NOT EXISTS users (
+        id INT AUTO_INCREMENT PRIMARY KEY COMMENT '用户ID',
+        username VARCHAR(50) NOT NULL UNIQUE COMMENT '用户名',
+        hashed_password VARCHAR(255) NOT NULL COMMENT 'bcrypt 加密后的密码',
+        nickname VARCHAR(50) COMMENT '昵称',
+        is_active TINYINT(1) DEFAULT 1 COMMENT '是否启用：1-启用 0-禁用',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_username (username)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='用户表';
+    """,
     # 品类字典表
     """
     CREATE TABLE IF NOT EXISTS dict_categories (
@@ -127,6 +140,47 @@ TABLE_STATEMENTS = [
         CONSTRAINT fk_detail_category FOREIGN KEY (category_id) REFERENCES dict_categories (row_id) ON UPDATE CASCADE ON DELETE RESTRICT
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='报价明细表';
     """,
+    # 仓库库存表（最小化：仓库+品类+可用吨数）
+    """
+    CREATE TABLE IF NOT EXISTS warehouse_inventories (
+        id INT AUTO_INCREMENT PRIMARY KEY COMMENT '行主键',
+        warehouse_id INT NOT NULL COMMENT '仓库ID',
+        category_id INT NOT NULL COMMENT '品类行ID（关联dict_categories.row_id）',
+        available_tons DECIMAL(10, 3) NOT NULL DEFAULT 0 COMMENT '当前可用吨数',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        CONSTRAINT fk_inventory_warehouse FOREIGN KEY (warehouse_id) REFERENCES dict_warehouses (id) ON UPDATE CASCADE ON DELETE RESTRICT,
+        CONSTRAINT fk_inventory_category FOREIGN KEY (category_id) REFERENCES dict_categories (row_id) ON UPDATE CASCADE ON DELETE RESTRICT,
+        UNIQUE KEY uk_inventory_warehouse_category (warehouse_id, category_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='仓库库存表';
+    """,
+    # 冶炼厂需求主表（最小化：按天配置）
+    """
+    CREATE TABLE IF NOT EXISTS factory_demands (
+        id INT AUTO_INCREMENT PRIMARY KEY COMMENT '需求主表ID',
+        factory_id INT NOT NULL COMMENT '冶炼厂ID',
+        demand_date DATE NOT NULL COMMENT '需求日期',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        CONSTRAINT fk_demand_factory FOREIGN KEY (factory_id) REFERENCES dict_factories (id) ON UPDATE CASCADE ON DELETE RESTRICT,
+        UNIQUE KEY uk_factory_demand_date (factory_id, demand_date)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='冶炼厂需求主表';
+    """,
+    # 冶炼厂需求明细表（最小化：品类+吨数）
+    """
+    CREATE TABLE IF NOT EXISTS factory_demand_items (
+        id INT AUTO_INCREMENT PRIMARY KEY COMMENT '需求明细ID',
+        demand_id INT NOT NULL COMMENT '需求主表ID',
+        category_id INT NOT NULL COMMENT '品类行ID（关联dict_categories.row_id）',
+        required_tons DECIMAL(10, 3) NOT NULL DEFAULT 0 COMMENT '需求吨数',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        CONSTRAINT fk_demand_item_demand FOREIGN KEY (demand_id) REFERENCES factory_demands (id) ON UPDATE CASCADE ON DELETE CASCADE,
+        CONSTRAINT fk_demand_item_category FOREIGN KEY (category_id) REFERENCES dict_categories (row_id) ON UPDATE CASCADE ON DELETE RESTRICT,
+        UNIQUE KEY uk_demand_category (demand_id, category_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='冶炼厂需求明细表';
+    """,
+
 ]
 
 

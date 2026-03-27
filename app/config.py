@@ -22,3 +22,9 @@ MYSQL_CHARSET = os.getenv("MYSQL_CHARSET", "utf8mb4")
 
 # 文件上传目录
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "uploads")
+
+
+# JWT 认证配置
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "change_this_to_a_strong_random_secret")
+JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
+JWT_ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("JWT_ACCESS_TOKEN_EXPIRE_MINUTES", "1440"))  # 默认 24 小时
