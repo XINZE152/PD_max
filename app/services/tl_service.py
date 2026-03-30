@@ -107,8 +107,7 @@ class TLService:
 
     # ==================== 接口4：获取比价表 ====================
 
-    def get_comparison(
-        self,
+    ,
         warehouse_ids: List[int],
         smelter_ids: List[int],
         category_ids: List[int],

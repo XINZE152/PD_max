@@ -8,6 +8,10 @@ class ComparisonRequest(BaseModel):
     选中仓库id列表: List[int] = Field(..., description="选中的仓库ID列表")
     冶炼厂id列表: List[int] = Field(..., description="冶炼厂ID列表")
     品类id列表: List[int] = Field(..., description="品类ID列表")
+    税率类型: Optional[str] = Field(
+        None,
+        description="价格税率类型：null=普通价、1pct=1%增值税、3pct=3%增值税、13pct=13%增值税、normal_invoice=普通发票、reverse_invoice=反向发票"
+    )
 
 
 class AddWarehouseRequest(BaseModel):
