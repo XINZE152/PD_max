@@ -4,42 +4,42 @@
 
 ## 一、环境准备
 
-确保已安装 Docker，查看版本：
+确保已安装 Docker 和 Docker Compose：
 ```bash
 docker --version
+docker compose version
 ```
 
 ---
 
-## 二、单独启动（手动逐个）
-
-### 1. 启动 MySQL
-
-```bash
-docker run -d \
-  --name mysql-lite \
-  --network mynet \
-  -e MYSQL_ROOT_PASSWORD=123456 \
-  -e MYSQL_DATABASE=demo \
-  -p 3306:3306 \
-  -v mysql_data:/var/lib/mysql \
-  mysql:8.0
-```
-
-> 第一次运行需要先创建网络：
-> ```bash
-> docker network create new_rq_default
-> ```
-
----
-
-### 2. 构建后端镜像
+## 二、构建镜像
 
 ```bash
 docker build -t my-backend .
 ```
 
 ---
+
+## 三、启动（手动传入配置）
+
+### 1. 创建网络
+
+```bash
+docker network create mynet
+```
+
+### 2. 启动 MySQL
+
+```bash
+docker run -d \
+  --name mysql-lite \
+  --network mynet \
+  -e MYSQL_ROOT_PASSWORD=your_db_password \
+  -e MYSQL_DATABASE=demo \
+  -p 3306:3306 \
+  -v mysql_data:/var/lib/mysql \
+  mysql:8.0
+```
 
 ### 3. 启动后端
 
@@ -48,49 +48,80 @@ docker run -d \
   --name my-backend \
   --network mynet \
   -p 8000:8000 \
-  -e ADMIN_USERNAME=admin \
-  -e ADMIN_PASSWORD=your-password
   -e MYSQL_HOST=mysql-lite \
   -e MYSQL_PORT=3306 \
   -e MYSQL_USER=root \
-  -e MYSQL_PASSWORD=123456 \
+  -e MYSQL_PASSWORD=your_db_password \
   -e MYSQL_DATABASE=demo \
-  -e JWT_SECRET_KEY=your-secret-key \
-  -e LLM_API_KEY=sk-sp-85d22a3083934e79850cba43520cc569 \
-  -e LLM_BASE_URL=https://coding.dashscope.aliyuncs.com/v1\
-  -e LLM_MODEL=qwen3.5-plus \
+  -e JWT_SECRET_KEY=your_random_secret \
+  -e ADMIN_USERNAME=admin \
+  -e ADMIN_PASSWORD=your_admin_password \
+  -e LLM_API_KEY=sk-xxxxxx \
+  -e LLM_BASE_URL=https://api.anthropic.com \
+  -e LLM_MODEL=claude-sonnet-4-6 \
+  -e VLM_API_KEY=sk-xxxxxx \
+  -e VLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1 \
+  -e VLM_MODEL=qwen-vl-max-latest \
   my-backend
 ```
 
 ---
 
-## 三、更新代码后重新部署
+## 四、Docker Compose（可选）
+
+`docker-compose.yml` 通过 `${VAR}` 占位读取 shell 环境变量。
+在本地开发时可以创建 `.env` 文件（已在 `.gitignore` 中，不会上传）：
+
+```bash
+cp .env.example .env
+# 编辑 .env 填入真实配置
+docker compose up -d --build
+```
+
+服务器部署时直接 export 环境变量后启动：
+
+```bash
+export MYSQL_PASSWORD=your_db_password
+export MYSQL_DATABASE=demo
+export JWT_SECRET_KEY=your_random_secret
+# ... 其余变量同理
+docker compose up -d --build
+```
+
+---
+
+## 五、更新代码后重新部署
 
 ```bash
 # 停止并删除旧容器
 docker rm -f my-backend
 
-# 重新构建镜像
+# 重新构建并启动（同上 docker run 命令）
 docker build -t my-backend .
+docker run -d ...
+```
 
-# 重新启动（同上 docker run 命令）
+使用 Compose：
+```bash
+docker compose down
+docker compose up -d --build
 ```
 
 ---
 
-## 四、常用指令
+## 六、常用指令
 
 ### 查看容器状态
 ```bash
-docker ps                  # 查看运行中的容器
-docker ps -a               # 查看所有容器（含已停止）
+docker ps
+docker ps -a
 ```
 
 ### 查看日志
 ```bash
-docker logs my-backend             # 查看全部日志
-docker logs my-backend -f          # 实时跟踪日志
-docker logs my-backend --tail 50   # 只看最后50行
+docker logs my-backend
+docker logs my-backend -f
+docker logs my-backend --tail 50
 ```
 
 ### 启动 / 停止 / 重启
@@ -100,66 +131,51 @@ docker stop my-backend
 docker restart my-backend
 ```
 
-### 进入容器内部
+### 进入容器
 ```bash
 docker exec -it my-backend bash
+docker exec -it mysql-lite mysql -uroot -p demo
 ```
 
-### 进入 MySQL
+### 删除容器 / 镜像
 ```bash
-docker exec -it mysql-lite mysql -uroot -p123456 demo
-```
-
-### 删除容器
-```bash
-docker rm -f my-backend     # 强制删除（含运行中）
+docker rm -f my-backend
 docker rm -f mysql-lite
-```
-
-### 查看镜像
-```bash
-docker images
-```
-
-### 删除镜像
-```bash
 docker rmi my-backend
 ```
 
-### 查看网络
+### 查看网络 / 数据卷
 ```bash
 docker network ls
-docker network inspect new_rq_default
-```
-
-### 查看数据卷
-```bash
 docker volume ls
 docker volume inspect mysql_data
 ```
 
 ---
 
-## 五、环境变量说明
+## 七、环境变量说明
 
 | 变量名 | 说明 | 默认值 |
 |--------|------|--------|
-| `MYSQL_HOST` | MySQL 容器名或地址 | - |
-| `MYSQL_PORT` | MySQL 端口 | 3306 |
-| `MYSQL_USER` | MySQL 用户名 | - |
-| `MYSQL_PASSWORD` | MySQL 密码 | - |
-| `MYSQL_DATABASE` | 数据库名 | - |
-| `JWT_SECRET_KEY` | JWT 签名密钥（同时用于 A5 改密校验） | change_this_to_a_strong_random_secret |
-| `JWT_ACCESS_TOKEN_EXPIRE_MINUTES` | Token 有效期（分钟） | 1440（24小时） |
-| `ADMIN_USERNAME` | 默认管理员账号（首次启动自动创建） | admin |
-| `ADMIN_PASSWORD` | 默认管理员密码（首次启动自动创建） | admin123 |
-| `LLM_API_KEY` | LLM 接口 API Key | - |
-| `LLM_BASE_URL` | LLM 接口 Base URL | https://api.anthropic.com |
-| `LLM_MODEL` | LLM 模型名称 | claude-sonnet-4-6 |
+| `MYSQL_HOST` | MySQL 地址（Compose 内用容器名） | 必填 |
+| `MYSQL_PORT` | MySQL 端口 | `3306` |
+| `MYSQL_USER` | MySQL 用户名 | 必填 |
+| `MYSQL_PASSWORD` | MySQL 密码 | 必填 |
+| `MYSQL_DATABASE` | 数据库名 | 必填 |
+| `JWT_SECRET_KEY` | JWT 签名密钥（同时用于改密校验） | 必填，建议随机字符串 |
+| `JWT_ACCESS_TOKEN_EXPIRE_MINUTES` | Token 有效期（分钟） | `1440`（24小时） |
+| `ADMIN_USERNAME` | 首次启动自动创建的管理员账号 | `admin` |
+| `ADMIN_PASSWORD` | 首次启动自动创建的管理员密码 | `admin123` |
+| `LLM_API_KEY` | 采购建议 LLM 的 API Key | 必填 |
+| `LLM_BASE_URL` | 采购建议 LLM 的 Base URL | `https://api.anthropic.com` |
+| `LLM_MODEL` | 采购建议使用的模型名 | `claude-sonnet-4-6` |
+| `VLM_API_KEY` | 报价表识别 VLM 的 API Key | 必填 |
+| `VLM_BASE_URL` | 报价表识别 VLM 的 Base URL | `https://dashscope.aliyuncs.com/compatible-mode/v1` |
+| `VLM_MODEL` | 报价表识别使用的模型名 | `qwen-vl-max-latest` |
 
 ---
 
-## 六、接口访问
+## 八、接口访问
 
 - 后端 API：http://localhost:8000
 - Swagger 文档：http://localhost:8000/docs

@@ -53,7 +53,7 @@ def create_database_if_not_exists():
 
 
 TABLE_STATEMENTS = [
-     # 用户表（用于用户认证）
+     # 用户表
     """
     CREATE TABLE IF NOT EXISTS users (
         id INT AUTO_INCREMENT PRIMARY KEY COMMENT '用户ID',
@@ -63,35 +63,30 @@ TABLE_STATEMENTS = [
         role ENUM('admin', 'user') NOT NULL DEFAULT 'user' COMMENT '角色',
         phone VARCHAR(20) COMMENT '手机号',
         email VARCHAR(100) COMMENT '邮箱',
-        is_active TINYINT(1) DEFAULT 1 COMMENT '是否启用：1-启用 0-禁用',
+        is_active TINYINT(1) DEFAULT 1 COMMENT '是否启用',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-        INDEX idx_username (username)
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='用户表';
     """,
     # 品类字典表
     """
     CREATE TABLE IF NOT EXISTS dict_categories (
-        row_id INT AUTO_INCREMENT PRIMARY KEY COMMENT '行主键（自增，唯一）',
-        category_id INT NOT NULL COMMENT '品类分组ID（多名称共用同一值，如铜=301）',
-        category_code VARCHAR(20) NOT NULL UNIQUE COMMENT '品类业务码（如：CAT_CU），不随名称变化',
-        name VARCHAR(50) NOT NULL UNIQUE COMMENT '品类名称（如：紫铜、黄铜）',
-        is_main TINYINT(1) DEFAULT 0 COMMENT '是否主品类：1-是（用于比价表展示），0-否',
+        row_id INT AUTO_INCREMENT PRIMARY KEY COMMENT '行主键',
+        category_id INT NOT NULL COMMENT '品类分组ID（多名称共用同一值）',
+        name VARCHAR(50) NOT NULL UNIQUE COMMENT '品类名称',
+        is_main TINYINT(1) DEFAULT 0 COMMENT '是否主品类（用于比价表展示）',
         is_active TINYINT(1) DEFAULT 1 COMMENT '是否启用',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         INDEX idx_category_id (category_id),
-        INDEX idx_category_main (category_id, is_main),
-        INDEX idx_is_main (is_main)
+        INDEX idx_category_main (category_id, is_main)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='品类字典表（多名称共用同一category_id）';
     """,
     # 仓库字典表
     """
     CREATE TABLE IF NOT EXISTS dict_warehouses (
-        id INT AUTO_INCREMENT PRIMARY KEY COMMENT '行主键（自增，唯一）',
-        warehouse_code VARCHAR(20) NOT NULL UNIQUE COMMENT '仓库业务码（如：WH_SH），不随名称变化',
+        id INT AUTO_INCREMENT PRIMARY KEY COMMENT '仓库ID',
         name VARCHAR(100) NOT NULL UNIQUE COMMENT '仓库名称',
-        location VARCHAR(100) COMMENT '仓库地址',
         is_active TINYINT(1) DEFAULT 1 COMMENT '是否启用',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
@@ -100,12 +95,8 @@ TABLE_STATEMENTS = [
     # 冶炼厂字典表
     """
     CREATE TABLE IF NOT EXISTS dict_factories (
-        id INT AUTO_INCREMENT PRIMARY KEY COMMENT '行主键（自增，唯一）',
-        factory_code VARCHAR(20) NOT NULL UNIQUE COMMENT '冶炼厂业务码（如：FAC_BJ），不随名称变化',
+        id INT AUTO_INCREMENT PRIMARY KEY COMMENT '冶炼厂ID',
         name VARCHAR(100) NOT NULL UNIQUE COMMENT '冶炼厂名称',
-        location VARCHAR(100) COMMENT '地点',
-        contact VARCHAR(50) COMMENT '联系人',
-        phone VARCHAR(30) COMMENT '联系电话',
         is_active TINYINT(1) DEFAULT 1 COMMENT '是否启用',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
@@ -127,66 +118,72 @@ TABLE_STATEMENTS = [
         INDEX idx_effective_date (effective_date)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='运费价格表';
     """,
-    # 报价表元数据表（存储报价表的整体信息）
+    # 报价表元数据表（存储VLM提取的完整原始信息）
     """
     CREATE TABLE IF NOT EXISTS quote_table_metadata (
         id INT AUTO_INCREMENT PRIMARY KEY COMMENT '报价表ID',
         factory_id INT NOT NULL COMMENT '冶炼厂ID',
         quote_date DATE NOT NULL COMMENT '报价日期',
         execution_date VARCHAR(50) COMMENT '执行日期（如：2026年3月17日）',
-        doc_title VARCHAR(200) COMMENT '文档标题（如：废铅酸蓄电池回收价格报价表）',
+        doc_title VARCHAR(200) COMMENT '文档标题',
+        subtitle VARCHAR(200) COMMENT '副标题',
+        valid_period VARCHAR(100) COMMENT '有效期',
         price_unit VARCHAR(50) DEFAULT '元/吨' COMMENT '价格单位',
-        has_merged_cells TINYINT(1) DEFAULT 0 COMMENT '是否有合并单元格',
-        vat_columns_detected JSON COMMENT '检测到的VAT列类型（JSON数组）',
+        headers JSON COMMENT '表头列表',
+        footer_notes JSON COMMENT '页脚备注列表',
+        footer_notes_raw TEXT COMMENT '页脚备注原始文本',
+        brand_specifications TEXT COMMENT '品牌规格说明',
+        policies JSON COMMENT '政策信息',
         raw_full_text LONGTEXT COMMENT '原始完整识别文本',
-        markdown_table LONGTEXT COMMENT 'Markdown格式的表格',
-        processing_time DECIMAL(10, 2) COMMENT '处理耗时（秒）',
+        source_image VARCHAR(500) COMMENT '来源图片文件名',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         CONSTRAINT fk_metadata_factory FOREIGN KEY (factory_id) REFERENCES dict_factories (id) ON UPDATE CASCADE ON DELETE RESTRICT,
         UNIQUE KEY uk_factory_quote_date (factory_id, quote_date)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='报价表元数据表';
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='报价表元数据表（VLM全量提取）';
     """,
-    # 报价明细表（优化版本）
+    # 冶炼厂税率表（用户手动维护，按冶炼厂+税率存一行）
+    """
+    CREATE TABLE IF NOT EXISTS factory_tax_rates (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        factory_id INT NOT NULL COMMENT '冶炼厂ID',
+        tax_type VARCHAR(20) NOT NULL COMMENT '税率类型：1pct/3pct/13pct',
+        tax_rate DECIMAL(6, 4) NOT NULL COMMENT '税率值，如 0.03 表示3%',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        CONSTRAINT fk_tax_factory FOREIGN KEY (factory_id) REFERENCES dict_factories (id) ON UPDATE CASCADE ON DELETE CASCADE,
+        UNIQUE KEY uk_factory_tax_type (factory_id, tax_type)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='冶炼厂税率表';
+    """,
+    # 报价明细表
     """
     CREATE TABLE IF NOT EXISTS quote_details (
         id INT AUTO_INCREMENT PRIMARY KEY,
-        metadata_id INT NOT NULL COMMENT '报价表元数据ID',
-        category_id INT NOT NULL COMMENT '品类ID',
-        raw_category_name VARCHAR(100) NOT NULL COMMENT '原始品类名',
-        unit_price DECIMAL(10, 2) NOT NULL COMMENT '单价（元/吨）',
+        quote_date DATE NOT NULL COMMENT '报价日期',
+        factory_id INT NOT NULL COMMENT '冶炼厂ID',
+        category_id INT NOT NULL COMMENT '品类行ID（关联dict_categories.row_id）',
+        metadata_id INT COMMENT '关联报价表元数据ID',
+        raw_category_name VARCHAR(100) COMMENT '原始品类名',
+        unit_price DECIMAL(10, 2) COMMENT '普通单价（元/吨）',
         price_1pct_vat DECIMAL(10, 2) COMMENT '1%增值税价格',
         price_3pct_vat DECIMAL(10, 2) COMMENT '3%增值税价格',
         price_13pct_vat DECIMAL(10, 2) COMMENT '13%增值税价格',
         price_normal_invoice DECIMAL(10, 2) COMMENT '普通发票价格',
         price_reverse_invoice DECIMAL(10, 2) COMMENT '反向发票价格',
-        remark VARCHAR(500) COMMENT '备注（如：均为控水价格）',
-        raw_text VARCHAR(500) COMMENT '原始识别文本',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-        UNIQUE KEY uk_metadata_category (metadata_id, category_id),
-        CONSTRAINT fk_detail_metadata FOREIGN KEY (metadata_id) REFERENCES quote_table_metadata (id) ON UPDATE CASCADE ON DELETE CASCADE,
-        CONSTRAINT fk_detail_category FOREIGN KEY (category_id) REFERENCES dict_categories (row_id) ON UPDATE CASCADE ON DELETE RESTRICT
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='报价明细表（优化版本）';
+        CONSTRAINT fk_detail_factory FOREIGN KEY (factory_id) REFERENCES dict_factories (id) ON UPDATE CASCADE ON DELETE RESTRICT,
+        CONSTRAINT fk_detail_category FOREIGN KEY (category_id) REFERENCES dict_categories (row_id) ON UPDATE CASCADE ON DELETE RESTRICT,
+        CONSTRAINT fk_detail_metadata FOREIGN KEY (metadata_id) REFERENCES quote_table_metadata (id) ON UPDATE CASCADE ON DELETE SET NULL,
+        UNIQUE KEY uk_factory_category_date (factory_id, category_id, quote_date),
+        INDEX idx_quote_date (quote_date),
+        INDEX idx_factory_id (factory_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='报价明细表';
     """,
-    # 报价表规则和备注表
-    """
-    CREATE TABLE IF NOT EXISTS quote_table_rules (
-        id INT AUTO_INCREMENT PRIMARY KEY COMMENT '规则ID',
-        metadata_id INT NOT NULL COMMENT '报价表元数据ID',
-        rule_type ENUM('footer_note', 'policy', 'brand_spec') DEFAULT 'footer_note' COMMENT '规则类型',
-        rule_order INT DEFAULT 0 COMMENT '规则顺序',
-        rule_content TEXT NOT NULL COMMENT '规则内容',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-        CONSTRAINT fk_rule_metadata FOREIGN KEY (metadata_id) REFERENCES quote_table_metadata (id) ON UPDATE CASCADE ON DELETE CASCADE,
-        INDEX idx_metadata_type (metadata_id, rule_type)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='报价表规则和备注表';
-    """,
-    # 仓库库存表（最小化：仓库+品类+可用吨数）
+    # 仓库库存表（预留）
     """
     CREATE TABLE IF NOT EXISTS warehouse_inventories (
-        id INT AUTO_INCREMENT PRIMARY KEY COMMENT '行主键',
+        id INT AUTO_INCREMENT PRIMARY KEY,
         warehouse_id INT NOT NULL COMMENT '仓库ID',
         category_id INT NOT NULL COMMENT '品类行ID（关联dict_categories.row_id）',
         available_tons DECIMAL(10, 3) NOT NULL DEFAULT 0 COMMENT '当前可用吨数',
@@ -195,24 +192,24 @@ TABLE_STATEMENTS = [
         CONSTRAINT fk_inventory_warehouse FOREIGN KEY (warehouse_id) REFERENCES dict_warehouses (id) ON UPDATE CASCADE ON DELETE RESTRICT,
         CONSTRAINT fk_inventory_category FOREIGN KEY (category_id) REFERENCES dict_categories (row_id) ON UPDATE CASCADE ON DELETE RESTRICT,
         UNIQUE KEY uk_inventory_warehouse_category (warehouse_id, category_id)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='仓库库存表';
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='仓库库存表（预留）';
     """,
-    # 冶炼厂需求主表（最小化：按天配置）
+    # 冶炼厂需求主表（预留）
     """
     CREATE TABLE IF NOT EXISTS factory_demands (
-        id INT AUTO_INCREMENT PRIMARY KEY COMMENT '需求主表ID',
+        id INT AUTO_INCREMENT PRIMARY KEY,
         factory_id INT NOT NULL COMMENT '冶炼厂ID',
         demand_date DATE NOT NULL COMMENT '需求日期',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         CONSTRAINT fk_demand_factory FOREIGN KEY (factory_id) REFERENCES dict_factories (id) ON UPDATE CASCADE ON DELETE RESTRICT,
         UNIQUE KEY uk_factory_demand_date (factory_id, demand_date)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='冶炼厂需求主表';
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='冶炼厂需求主表（预留）';
     """,
-    # 冶炼厂需求明细表（最小化：品类+吨数）
+    # 冶炼厂需求明细表（预留）
     """
     CREATE TABLE IF NOT EXISTS factory_demand_items (
-        id INT AUTO_INCREMENT PRIMARY KEY COMMENT '需求明细ID',
+        id INT AUTO_INCREMENT PRIMARY KEY,
         demand_id INT NOT NULL COMMENT '需求主表ID',
         category_id INT NOT NULL COMMENT '品类行ID（关联dict_categories.row_id）',
         required_tons DECIMAL(10, 3) NOT NULL DEFAULT 0 COMMENT '需求吨数',
@@ -221,9 +218,8 @@ TABLE_STATEMENTS = [
         CONSTRAINT fk_demand_item_demand FOREIGN KEY (demand_id) REFERENCES factory_demands (id) ON UPDATE CASCADE ON DELETE CASCADE,
         CONSTRAINT fk_demand_item_category FOREIGN KEY (category_id) REFERENCES dict_categories (row_id) ON UPDATE CASCADE ON DELETE RESTRICT,
         UNIQUE KEY uk_demand_category (demand_id, category_id)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='冶炼厂需求明细表';
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='冶炼厂需求明细表（预留）';
     """,
-
 ]
 
 
@@ -237,6 +233,27 @@ def create_tables() -> None:
                 cursor.execute(statement)
         connection.commit()
         print("所有数据表创建完成")
+    finally:
+        connection.close()
+
+
+def init_default_data() -> None:
+    """插入默认的仓库和冶炼厂数据"""
+    connection = pymysql.connect(**get_mysql_config())
+    try:
+        with connection.cursor() as cursor:
+            # 插入默认仓库
+            cursor.execute(
+                "INSERT IGNORE INTO dict_warehouses (id, name, is_active) VALUES "
+                "(1, '默认仓库', 1)"
+            )
+            # 插入默认冶炼厂
+            cursor.execute(
+                "INSERT IGNORE INTO dict_factories (id, name, is_active) VALUES "
+                "(1, '默认冶炼厂', 1)"
+            )
+        connection.commit()
+        print("默认数据初始化完成")
     finally:
         connection.close()
 

@@ -33,3 +33,8 @@ JWT_ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("JWT_ACCESS_TOKEN_EXPIRE_MINUTES
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.anthropic.com")
 LLM_MODEL = os.getenv("LLM_MODEL", "claude-sonnet-4-6")
+
+# VLM API 配置
+VLM_API_KEY = os.getenv("VLM_API_KEY", "")
+VLM_BASE_URL = os.getenv("VLM_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
+VLM_MODEL = os.getenv("VLM_MODEL", "qwen-vl-max-latest")

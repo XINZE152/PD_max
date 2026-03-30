@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from app.config import UPLOAD_DIR
 from app.database import get_conn
-from app.services.battery_quote_service1 import BatteryQuoteService
+from app.services.vlm_extractor_service import QwenVLFullExtractor, VLMConfig
 
 logger = logging.getLogger(__name__)
 
@@ -36,10 +36,9 @@ class TLService:
                     row = cur.fetchone()
                     if row:
                         return {"code": 200, "msg": "仓库已存在", "仓库id": row[0], "新建": False}
-                    warehouse_code = f"WH_{uuid.uuid4().hex[:8].upper()}"
                     cur.execute(
-                        "INSERT INTO dict_warehouses (warehouse_code, name, is_active) VALUES (%s, %s, 1)",
-                        (warehouse_code, name),
+                        "INSERT INTO dict_warehouses (name, is_active) VALUES (%s, 1)",
+                        (name,),
                     )
                     return {"code": 200, "msg": "仓库新建成功", "仓库id": cur.lastrowid, "新建": True}
         except Exception as e:
@@ -107,42 +106,68 @@ class TLService:
 
     # ==================== 接口4：获取比价表 ====================
     def get_comparison(
-       self,
+        self,
         warehouse_ids: List[int],
         smelter_ids: List[int],
         category_ids: List[int],
-        tax_type: Optional[str] = None,
+        price_type: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
+        """
+        price_type: 目标税率类型，None=普通价, 1pct/3pct/13pct/normal_invoice/reverse_invoice
+        取价逻辑（按优先级）：
+          1. 报价表中直接有对应 price_type 的价格 → 直接使用
+          2. 报价表中有普通价(unit_price) + 税率表中有对应税率 → 正向换算
+          3. 报价表中有某已知含税价 + 税率表中有该税率和目标税率 → 先反算不含税，再正向换算
+          4. 以上均无 → None，返回 price_source="unavailable"
+        """
         if not warehouse_ids or not smelter_ids or not category_ids:
             return []
+
+        # price_type → (quote_details列名, 展示名)
+        PRICE_COL_MAP = {
+            None:             ("unit_price",            "普通价"),
+            "1pct":           ("price_1pct_vat",        "1%增值税"),
+            "3pct":           ("price_3pct_vat",        "3%增值税"),
+            "13pct":          ("price_13pct_vat",       "13%增值税"),
+            "normal_invoice": ("price_normal_invoice",  "普通发票"),
+            "reverse_invoice":("price_reverse_invoice", "反向发票"),
+        }
+        # 仅以下三种有税率换算意义
+        VAT_TAX_TYPE_MAP = {"1pct": "1pct", "3pct": "3pct", "13pct": "13pct"}
+
+        if price_type not in PRICE_COL_MAP:
+            raise ValueError(f"不支持的 price_type: {price_type}")
+
+        target_col, price_type_name = PRICE_COL_MAP[price_type]
+        target_tax = VAT_TAX_TYPE_MAP.get(price_type)  # None 表示不需要税率换算
 
         try:
             with get_conn() as conn:
                 with conn.cursor() as cur:
-                    wh_placeholders = ",".join(["%s"] * len(warehouse_ids))
-                    sm_placeholders = ",".join(["%s"] * len(smelter_ids))
-                    cat_placeholders = ",".join(["%s"] * len(category_ids))
+                    wh_ph = ",".join(["%s"] * len(warehouse_ids))
+                    sm_ph = ",".join(["%s"] * len(smelter_ids))
+                    cat_ph = ",".join(["%s"] * len(category_ids))
 
                     # 品类主名称
                     cur.execute(
                         f"SELECT DISTINCT category_id, "
                         f"COALESCE(MAX(CASE WHEN is_main=1 THEN name END), MAX(name)) AS cat_name "
                         f"FROM dict_categories "
-                        f"WHERE category_id IN ({cat_placeholders}) AND is_active = 1 "
+                        f"WHERE category_id IN ({cat_ph}) AND is_active = 1 "
                         f"GROUP BY category_id",
                         tuple(category_ids),
                     )
                     cat_map: Dict[int, str] = {row[0]: row[1] for row in cur.fetchall()}
 
-                    # 最新运费：每个(仓库,冶炼厂)取最新日期
+                    # 最新运费
                     cur.execute(
                         f"""
                         SELECT dw.id, dw.name, df.id, df.name, fr.price_per_ton
                         FROM freight_rates fr
                         JOIN dict_warehouses dw ON fr.warehouse_id = dw.id
                         JOIN dict_factories  df ON fr.factory_id  = df.id
-                        WHERE dw.id IN ({wh_placeholders})
-                          AND df.id IN ({sm_placeholders})
+                        WHERE dw.id IN ({wh_ph})
+                          AND df.id IN ({sm_ph})
                           AND fr.effective_date = (
                               SELECT MAX(fr2.effective_date)
                               FROM freight_rates fr2
@@ -152,77 +177,220 @@ class TLService:
                         """,
                         tuple(warehouse_ids) + tuple(smelter_ids),
                     )
-                    # freight_map: {(warehouse_id, factory_id): (wname, fname, freight)}
                     freight_map: Dict[tuple, tuple] = {}
                     for wid, wname, fid, fname, freight in cur.fetchall():
                         freight_map[(wid, fid)] = (wname, fname, freight)
 
-                    # category_id(分组) -> row_id 映射
+                    # category_id 分组 → row_id 列表
                     cur.execute(
                         f"SELECT row_id, category_id FROM dict_categories "
-                        f"WHERE category_id IN ({cat_placeholders}) AND is_active = 1",
+                        f"WHERE category_id IN ({cat_ph}) AND is_active = 1",
                         tuple(category_ids),
                     )
-                    # row_id_to_cat: {row_id: category_id}
                     row_id_to_cat: Dict[int, int] = {row[0]: row[1] for row in cur.fetchall()}
                     row_ids = list(row_id_to_cat.keys())
 
-                    tax_type_map = {
-                        None: ("unit_price", "普通价"),
-                        "1pct": ("price_1pct_vat", "1%增值税"),
-                        "3pct": ("price_3pct_vat", "3%增值税"),
-                        "13pct": ("price_13pct_vat", "13%增值税"),
-                        "normal_invoice": ("price_normal_invoice", "普通发票"),
-                        "reverse_invoice": ("price_reverse_invoice", "反向发票"),
-                    }
-                    if tax_type not in tax_type_map:
-                        raise ValueError(f"不支持的税率类型: {tax_type}")
+                    if not row_ids:
+                        return []
 
-                    price_column, tax_type_name = tax_type_map[tax_type]
+                    ri_ph = ",".join(["%s"] * len(row_ids))
 
-                    # 最新报价：每个(冶炼厂, row_id)取最新日期，结果映射回 category_id
-                    price_map: Dict[tuple, float] = {}
-                    if row_ids:
-                        ri_placeholders = ",".join(["%s"] * len(row_ids))
-                        cur.execute(
-                            f"""
-                            SELECT factory_id, category_id, {price_column}
-                            FROM quote_details
-                            WHERE factory_id IN ({sm_placeholders})
-                              AND category_id IN ({ri_placeholders})
-                              AND quote_date = (
-                                  SELECT MAX(qd2.quote_date)
-                                  FROM quote_details qd2
-                                  WHERE qd2.factory_id  = quote_details.factory_id
-                                    AND qd2.category_id = quote_details.category_id
-                              )
-                            """,
-                            tuple(smelter_ids) + tuple(row_ids),
-                        )
-                        for fid_r, rid, price in cur.fetchall():
-                            cid = row_id_to_cat.get(rid)
-                            if cid is not None and price is not None:
-                                price_map[(fid_r, cid)] = float(price)
+                    # 税率表：{factory_id: {tax_type: rate}}
+                    cur.execute(
+                        f"SELECT factory_id, tax_type, tax_rate "
+                        f"FROM factory_tax_rates "
+                        f"WHERE factory_id IN ({sm_ph})",
+                        tuple(smelter_ids),
+                    )
+                    tax_rate_map: Dict[int, Dict[str, float]] = {}
+                    for fid, ttype, rate in cur.fetchall():
+                        tax_rate_map.setdefault(fid, {})[ttype] = float(rate)
 
-                    # 组合结果
-                    result = []
-                    for (wid, fid), (wname, fname, freight) in freight_map.items():
-                        for cid in category_ids:
-                            cat_name = cat_map.get(cid)
-                            if cat_name is None:
-                                continue
-                            result.append({
-                                "仓库": wname,
-                                "冶炼厂": fname,
-                                "品类": cat_name,
-                                "税率类型": tax_type_name,
-                                "运费": float(freight) if freight is not None else None,
-                                "报价": price_map.get((fid, cid)),
-                            })
-                    return result
+                    # 最新报价（取全部价格列，用于换算回退）
+                    cur.execute(
+                        f"""
+                        SELECT factory_id, category_id,
+                               unit_price, price_1pct_vat, price_3pct_vat, price_13pct_vat,
+                               price_normal_invoice, price_reverse_invoice
+                        FROM quote_details
+                        WHERE factory_id IN ({sm_ph})
+                          AND category_id IN ({ri_ph})
+                          AND quote_date = (
+                              SELECT MAX(qd2.quote_date)
+                              FROM quote_details qd2
+                              WHERE qd2.factory_id  = quote_details.factory_id
+                                AND qd2.category_id = quote_details.category_id
+                          )
+                        """,
+                        tuple(smelter_ids) + tuple(row_ids),
+                    )
+                    # raw_price_map: {(factory_id, row_id): {col: value}}
+                    col_names = ["unit_price", "price_1pct_vat", "price_3pct_vat",
+                                 "price_13pct_vat", "price_normal_invoice", "price_reverse_invoice"]
+                    raw_price_map: Dict[tuple, Dict[str, Optional[float]]] = {}
+                    for row in cur.fetchall():
+                        fid_r, rid = row[0], row[1]
+                        raw_price_map[(fid_r, rid)] = {
+                            col: (float(v) if v is not None else None)
+                            for col, v in zip(col_names, row[2:])
+                        }
+
+            # 换算逻辑（纯 Python，连接已关闭）
+            # col → tax_type 的对应关系，用于反算不含税价
+            COL_TO_TAX: Dict[str, str] = {
+                "price_1pct_vat": "1pct",
+                "price_3pct_vat": "3pct",
+                "price_13pct_vat": "13pct",
+            }
+
+            def resolve_price(fid: int, rid: int) -> Tuple[Optional[float], str]:
+                """
+                返回 (price, source)
+                source: "direct" | "calc_from_base" | "calc_from_other_vat" | "unavailable"
+                """
+                prices = raw_price_map.get((fid, rid), {})
+                rates = tax_rate_map.get(fid, {})
+
+                # 1. 直接有目标列
+                direct = prices.get(target_col)
+                if direct is not None:
+                    return direct, "direct"
+
+                # 2. 目标是含税价，且有不含税基础价 + 目标税率
+                if target_tax and prices.get("unit_price") is not None and target_tax in rates:
+                    base = prices["unit_price"]
+                    calc = round(base * (1 + rates[target_tax]), 2)
+                    return calc, "calc_from_base"
+
+                # 3. 目标是基础价(unit_price)，从已知含税价反算
+                if target_col == "unit_price":
+                    for col, src_tax in COL_TO_TAX.items():
+                        known_price = prices.get(col)
+                        if known_price is not None and src_tax in rates:
+                            base = round(known_price / (1 + rates[src_tax]), 2)
+                            return base, f"calc_from_{src_tax}"
+
+                # 4. 从其他已知含税价反算不含税，再正向换算
+                if target_tax and target_tax in rates:
+                    for col, src_tax in COL_TO_TAX.items():
+                        known_price = prices.get(col)
+                        if known_price is not None and src_tax in rates:
+                            base = round(known_price / (1 + rates[src_tax]), 4)
+                            calc = round(base * (1 + rates[target_tax]), 2)
+                            return calc, f"calc_from_{src_tax}"
+
+                return None, "unavailable"
+
+            # 组合结果
+            result = []
+            for (wid, fid), (wname, fname, freight) in freight_map.items():
+                for cid in category_ids:
+                    cat_name = cat_map.get(cid)
+                    if cat_name is None:
+                        continue
+                    # 找该 category_id 下所有 row_id，取第一个有报价的
+                    price, source = None, "unavailable"
+                    for rid, cat in row_id_to_cat.items():
+                        if cat == cid:
+                            p, s = resolve_price(fid, rid)
+                            if p is not None:
+                                price, source = p, s
+                                break
+
+                    result.append({
+                        "仓库": wname,
+                        "冶炼厂": fname,
+                        "品类": cat_name,
+                        "price_type": price_type_name,
+                        "运费": float(freight) if freight is not None else 0.0,
+                        "报价": price if price is not None else 0.0,
+                        "报价来源": source,
+                    })
+            return result
 
         except Exception as e:
             logger.error(f"获取比价表失败: {e}")
+            raise
+
+    # ==================== 税率表 CRUD ====================
+
+    def get_tax_rates(self, factory_ids: Optional[List[int]] = None) -> List[Dict[str, Any]]:
+        """获取税率表，可按冶炼厂过滤"""
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    if factory_ids:
+                        ph = ",".join(["%s"] * len(factory_ids))
+                        cur.execute(
+                            f"SELECT ftr.id, ftr.factory_id, df.name AS factory_name, "
+                            f"ftr.tax_type, ftr.tax_rate "
+                            f"FROM factory_tax_rates ftr "
+                            f"JOIN dict_factories df ON ftr.factory_id = df.id "
+                            f"WHERE ftr.factory_id IN ({ph}) "
+                            f"ORDER BY ftr.factory_id, ftr.tax_type",
+                            tuple(factory_ids),
+                        )
+                    else:
+                        cur.execute(
+                            "SELECT ftr.id, ftr.factory_id, df.name AS factory_name, "
+                            "ftr.tax_type, ftr.tax_rate "
+                            "FROM factory_tax_rates ftr "
+                            "JOIN dict_factories df ON ftr.factory_id = df.id "
+                            "ORDER BY ftr.factory_id, ftr.tax_type"
+                        )
+                    cols = [d[0] for d in cur.description]
+                    return [dict(zip(cols, row)) for row in cur.fetchall()]
+        except Exception as e:
+            logger.error(f"获取税率表失败: {e}")
+            raise
+
+    def upsert_tax_rates(self, items: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """批量设置税率（存在则更新，不存在则插入）"""
+        from app.models.tl import VALID_TAX_TYPES
+        for item in items:
+            if item["tax_type"] not in VALID_TAX_TYPES:
+                raise ValueError(f"不支持的 tax_type: {item['tax_type']}，有效值：{VALID_TAX_TYPES}")
+            if not (0 <= item["tax_rate"] <= 1):
+                raise ValueError(f"tax_rate 必须在 0~1 之间，收到：{item['tax_rate']}")
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    for item in items:
+                        # 验证冶炼厂是否存在
+                        cur.execute("SELECT id FROM dict_factories WHERE id = %s", (item["factory_id"],))
+                        if not cur.fetchone():
+                            raise ValueError(f"冶炼厂 ID {item['factory_id']} 不存在")
+
+                        cur.execute(
+                            "INSERT INTO factory_tax_rates (factory_id, tax_type, tax_rate) "
+                            "VALUES (%s, %s, %s) "
+                            "ON DUPLICATE KEY UPDATE tax_rate = VALUES(tax_rate), "
+                            "updated_at = CURRENT_TIMESTAMP",
+                            (item["factory_id"], item["tax_type"], item["tax_rate"]),
+                        )
+            return {"code": 200, "msg": f"已保存 {len(items)} 条税率记录"}
+        except ValueError:
+            raise
+        except Exception as e:
+            logger.error(f"设置税率失败: {e}")
+            raise
+
+    def delete_tax_rate(self, factory_id: int, tax_type: str) -> Dict[str, Any]:
+        """删除某冶炼厂的某税率记录"""
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "DELETE FROM factory_tax_rates WHERE factory_id = %s AND tax_type = %s",
+                        (factory_id, tax_type),
+                    )
+                    if cur.rowcount == 0:
+                        raise ValueError(f"未找到 factory_id={factory_id}, tax_type={tax_type} 的记录")
+            return {"code": 200, "msg": "删除成功"}
+        except ValueError:
+            raise
+        except Exception as e:
+            logger.error(f"删除税率失败: {e}")
             raise
 
     # ==================== 接口5：上传价格表（OCR解析） ====================
@@ -265,45 +433,63 @@ class TLService:
                     f.write(content)
                 saved_paths.append((str(save_path), md5, upload_file.filename))
 
-            # 2. OCR 识别，直接返回原始识别结果
-            ocr_service = BatteryQuoteService()
+            # 2. VLM识别
+            from app import config as app_config
+            if not app_config.VLM_API_KEY:
+                raise ValueError("未配置 VLM_API_KEY，请在环境变量中设置 VLM_API_KEY")
+            vlm_config = VLMConfig(
+                api_key=app_config.VLM_API_KEY,
+                base_url=app_config.VLM_BASE_URL,
+                model=app_config.VLM_MODEL,
+                save_individual=False,
+            )
 
-            items: List[Dict[str, Any]] = []
-            details: List[Dict[str, Any]] = []
+            details = []
+            with QwenVLFullExtractor(vlm_config) as extractor:
+                for image_path, md5, orig_name in saved_paths:
+                    result = extractor.recognize(image_path, save_output=False)
 
-            for image_path, md5, orig_name in saved_paths:
-                ocr_result = ocr_service.parse_image(image_path)
+                    if not result.success:
+                        details.append({
+                            "image": orig_name,
+                            "success": False,
+                            "error": result.error_message,
+                        })
+                        continue
 
-                if ocr_result.get("error"):
-                    details.append({"image": orig_name, "error": ocr_result["error"]})
-                    continue
-
-                factory_name_ocr = ocr_result.get("factory", "未知工厂")
-                image_detail: Dict[str, Any] = {
-                    "image": orig_name,
-                    "factory_name": factory_name_ocr,
-                    "date": ocr_result.get("date"),
-                    "items": [],
-                }
-
-                for item in ocr_result.get("items", []):
-                    row_item = {
-                        "冶炼厂名": factory_name_ocr,
-                        "品类名": item["category"],
-                        "价格": item["price"],
+                    # 3. 构建 full_data（VlmFullData格式，供前端保留并回传）
+                    full_data = {
+                        "image_path": result.image_path,
+                        "file_name": result.file_name,
+                        "source_image": orig_name,
+                        "company_name": result.company_name,
+                        "doc_title": result.doc_title,
+                        "subtitle": result.subtitle,
+                        "quote_date": result.quote_date,
+                        "execution_date": result.execution_date,
+                        "valid_period": result.valid_period,
+                        "price_unit": result.price_unit,
+                        "headers": result.headers,
+                        "rows": [row.model_dump() for row in result.rows],
+                        "policies": result.policies,
+                        "footer_notes": result.footer_notes,
+                        "footer_notes_raw": result.footer_notes_raw,
+                        "brand_specifications": result.brand_specifications,
+                        "raw_full_text": result.raw_full_text,
+                        "elapsed_time": result.elapsed_time,
                     }
-                    items.append(row_item)
-                    image_detail["items"].append(row_item)
 
-                details.append(image_detail)
+                    # 4. 映射为前端可编辑的 items（ConfirmPriceTableItem格式）
+                    items = self._map_vlm_to_confirm_items(result)
 
-            return {
-                "code": 200,
-                "data": {
-                    "items": items,
-                    "details": details,
-                },
-            }
+                    details.append({
+                        "image": orig_name,
+                        "success": True,
+                        "full_data": full_data,
+                        "items": items,
+                    })
+
+            return {"code": 200, "data": {"details": details}}
 
         except Exception as e:
             logger.error(f"上传价格表失败: {e}")
@@ -314,12 +500,43 @@ class TLService:
                     pass
             raise
 
+    def _map_vlm_to_confirm_items(self, result) -> List[Dict[str, Any]]:
+        """将 VLM 提取结果映射为前端可编辑的确认条目"""
+        items = []
+        factory_name = result.company_name or ""
+        for row in result.rows:
+            # 根据价格列类型，确定主价格字段
+            price_general = row.price_general
+            price_1pct = row.price_1pct_vat
+            price_3pct = row.price_3pct_vat
+            price_13pct = row.price_13pct_vat
+            price_normal = row.price_normal_invoice
+            price_reverse = row.price_reverse_invoice
+
+            # 对于单价列类型，price_general 填入 unit_price
+            unit_price = price_general
+
+            items.append({
+                "冶炼厂名": factory_name,
+                "冶炼厂id": None,
+                "品类名": row.category,
+                "品类id": None,
+                "价格": float(unit_price) if unit_price is not None else None,
+                "价格_1pct增值税": float(price_1pct) if price_1pct is not None else None,
+                "价格_3pct增值税": float(price_3pct) if price_3pct is not None else None,
+                "价格_13pct增值税": float(price_13pct) if price_13pct is not None else None,
+                "普通发票价格": float(price_normal) if price_normal is not None else None,
+                "反向发票价格": float(price_reverse) if price_reverse is not None else None,
+            })
+        return items
+
     # ==================== 接口5b：确认价格表写入数据库 ====================
 
     def confirm_price_table(
         self,
         quote_date_str: str,
         items: List[Dict[str, Any]],
+        full_data: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         if not items:
             raise ValueError("报价数据不能为空")
@@ -333,6 +550,7 @@ class TLService:
             with get_conn() as conn:
                 with conn.cursor() as cur:
                     inserted, updated = 0, 0
+
                     for item in items:
                         # 1. 冶炼厂不存在则新建
                         if item.get("冶炼厂id") is None:
@@ -345,11 +563,10 @@ class TLService:
                             if row:
                                 item["冶炼厂id"] = row[0]
                             else:
-                                factory_code = f"FAC_{uuid.uuid4().hex[:8].upper()}"
                                 cur.execute(
-                                    "INSERT INTO dict_factories (factory_code, name, is_active) "
-                                    "VALUES (%s, %s, 1)",
-                                    (factory_code, factory_name),
+                                    "INSERT INTO dict_factories (name, is_active) "
+                                    "VALUES (%s, 1)",
+                                    (factory_name,),
                                 )
                                 item["冶炼厂id"] = cur.lastrowid
 
@@ -366,36 +583,98 @@ class TLService:
                             else:
                                 cur.execute("SELECT COALESCE(MAX(category_id), 0) + 1 FROM dict_categories")
                                 new_cat_id = cur.fetchone()[0]
-                                cat_code = f"CAT_{uuid.uuid4().hex[:8].upper()}"
                                 cur.execute(
                                     "INSERT INTO dict_categories "
-                                    "(category_id, category_code, name, is_main, is_active) "
-                                    "VALUES (%s, %s, %s, 1, 1)",
-                                    (new_cat_id, cat_code, cat_name),
+                                    "(category_id, name, is_main, is_active) "
+                                    "VALUES (%s, %s, 1, 1)",
+                                    (new_cat_id, cat_name),
                                 )
-                                item["品类id"] = cur.lastrowid  # row_id
+                                item["品类id"] = cur.lastrowid
 
-                        # 3. 写入明细，相同(日期+冶炼厂+品类)则更新价格
+                    # 3. 存储全量元数据（如果有 full_data）
+                    metadata_id = None
+                    if full_data:
+                        # 取第一条 item 的冶炼厂id作为元数据的 factory_id
+                        factory_id_for_meta = items[0].get("冶炼厂id") if items else None
+                        if factory_id_for_meta:
+                            import json as _json
+                            cur.execute(
+                                """
+                                INSERT INTO quote_table_metadata
+                                (factory_id, quote_date, execution_date, doc_title, subtitle,
+                                 valid_period, price_unit, headers, footer_notes, footer_notes_raw,
+                                 brand_specifications, policies, raw_full_text, source_image)
+                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                ON DUPLICATE KEY UPDATE
+                                    execution_date = VALUES(execution_date),
+                                    doc_title = VALUES(doc_title),
+                                    subtitle = VALUES(subtitle),
+                                    valid_period = VALUES(valid_period),
+                                    price_unit = VALUES(price_unit),
+                                    headers = VALUES(headers),
+                                    footer_notes = VALUES(footer_notes),
+                                    footer_notes_raw = VALUES(footer_notes_raw),
+                                    brand_specifications = VALUES(brand_specifications),
+                                    policies = VALUES(policies),
+                                    raw_full_text = VALUES(raw_full_text),
+                                    source_image = VALUES(source_image),
+                                    updated_at = CURRENT_TIMESTAMP
+                                """,
+                                (
+                                    factory_id_for_meta,
+                                    quote_dt,
+                                    full_data.get("execution_date", ""),
+                                    full_data.get("doc_title", ""),
+                                    full_data.get("subtitle", ""),
+                                    full_data.get("valid_period", ""),
+                                    full_data.get("price_unit", "元/吨"),
+                                    _json.dumps(full_data.get("headers", []), ensure_ascii=False),
+                                    _json.dumps(full_data.get("footer_notes", []), ensure_ascii=False),
+                                    full_data.get("footer_notes_raw", ""),
+                                    full_data.get("brand_specifications", ""),
+                                    _json.dumps(full_data.get("policies", {}), ensure_ascii=False),
+                                    full_data.get("raw_full_text", ""),
+                                    full_data.get("source_image", full_data.get("file_name", "")),
+                                ),
+                            )
+                            # 取 metadata_id（INSERT 或 已存在的）
+                            if cur.lastrowid:
+                                metadata_id = cur.lastrowid
+                            else:
+                                cur.execute(
+                                    "SELECT id FROM quote_table_metadata WHERE factory_id=%s AND quote_date=%s",
+                                    (factory_id_for_meta, quote_dt),
+                                )
+                                row = cur.fetchone()
+                                metadata_id = row[0] if row else None
+
+                    # 4. 写入明细，相同(日期+冶炼厂+品类)则更新价格
+                    for item in items:
                         cur.execute(
-                            "INSERT INTO quote_details "
-                            "(quote_date, factory_id, category_id, raw_category_name, unit_price, "
-                            "price_1pct_vat, price_3pct_vat, price_13pct_vat, price_normal_invoice, price_reverse_invoice) "
-                            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
-                            "ON DUPLICATE KEY UPDATE "
-                            "unit_price = VALUES(unit_price), "
-                            "price_1pct_vat = VALUES(price_1pct_vat), "
-                            "price_3pct_vat = VALUES(price_3pct_vat), "
-                            "price_13pct_vat = VALUES(price_13pct_vat), "
-                            "price_normal_invoice = VALUES(price_normal_invoice), "
-                            "price_reverse_invoice = VALUES(price_reverse_invoice), "
-                            "raw_category_name = VALUES(raw_category_name), "
-                            "updated_at = CURRENT_TIMESTAMP",
+                            """
+                            INSERT INTO quote_details
+                            (quote_date, factory_id, category_id, metadata_id, raw_category_name,
+                             unit_price, price_1pct_vat, price_3pct_vat, price_13pct_vat,
+                             price_normal_invoice, price_reverse_invoice)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            ON DUPLICATE KEY UPDATE
+                                metadata_id = VALUES(metadata_id),
+                                raw_category_name = VALUES(raw_category_name),
+                                unit_price = VALUES(unit_price),
+                                price_1pct_vat = VALUES(price_1pct_vat),
+                                price_3pct_vat = VALUES(price_3pct_vat),
+                                price_13pct_vat = VALUES(price_13pct_vat),
+                                price_normal_invoice = VALUES(price_normal_invoice),
+                                price_reverse_invoice = VALUES(price_reverse_invoice),
+                                updated_at = CURRENT_TIMESTAMP
+                            """,
                             (
                                 quote_dt,
                                 item["冶炼厂id"],
                                 item["品类id"],
+                                metadata_id,
                                 item["品类名"],
-                                item["价格"],
+                                item.get("价格"),
                                 item.get("价格_1pct增值税"),
                                 item.get("价格_3pct增值税"),
                                 item.get("价格_13pct增值税"),
@@ -528,12 +807,11 @@ class TLService:
                                 (category_id, is_main, existing[0]),
                             )
                         else:
-                            category_code = f"CAT_{name.upper()[:10]}_{uuid.uuid4().hex[:6]}"
                             cur.execute(
                                 "INSERT INTO dict_categories "
-                                "(category_id, category_code, name, is_main, is_active) "
-                                "VALUES (%s, %s, %s, %s, 1)",
-                                (category_id, category_code, name, is_main),
+                                "(category_id, name, is_main, is_active) "
+                                "VALUES (%s, %s, %s, 1)",
+                                (category_id, name, is_main),
                             )
 
             return {"code": 200, "msg": "品类映射表更新成功，数据已存入数据库"}
@@ -550,14 +828,33 @@ class TLService:
         self,
         warehouse_ids: List[int],
         demands: List[Dict[str, Any]],
+        price_type: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         根据仓库列表和需求（冶炼厂+品类+吨数），查询最新运费和报价，
         整理结构化数据后调用 Claude 生成各仓库发车建议表。
         同一仓库发出的货物可混装，尽量整车发。
+        price_type: 目标税率类型，None=普通价, 1pct/3pct/13pct/normal_invoice/reverse_invoice
         """
         if not warehouse_ids or not demands:
             raise ValueError("仓库列表和需求不能为空")
+
+        # price_type → (quote_details列名, 展示名)
+        PRICE_COL_MAP = {
+            None:             ("unit_price",            "普通价"),
+            "1pct":           ("price_1pct_vat",        "1%增值税"),
+            "3pct":           ("price_3pct_vat",        "3%增值税"),
+            "13pct":          ("price_13pct_vat",       "13%增值税"),
+            "normal_invoice": ("price_normal_invoice",  "普通发票"),
+            "reverse_invoice":("price_reverse_invoice", "反向发票"),
+        }
+        VAT_TAX_TYPE_MAP = {"1pct": "1pct", "3pct": "3pct", "13pct": "13pct"}
+
+        if price_type not in PRICE_COL_MAP:
+            raise ValueError(f"不支持的 price_type: {price_type}")
+
+        target_col, price_type_name = PRICE_COL_MAP[price_type]
+        target_tax = VAT_TAX_TYPE_MAP.get(price_type)
 
         smelter_ids = list({d["smelter_id"] for d in demands})
         category_ids = list({d["category_id"] for d in demands})
@@ -615,29 +912,105 @@ class TLService:
                 )
                 # freight_map: {(warehouse_id, factory_id): freight}
                 freight_map: Dict[tuple, float] = {
-                    (r[0], r[2]): float(r[4]) for r in cur.fetchall()
+                    (r[0], r[2]): (float(r[4]) if r[4] is not None else 0.0) for r in cur.fetchall()
                 }
 
-                # 最新报价：每个(冶炼厂, category_id分组)
+                # 税率表
+                cur.execute(
+                    f"SELECT factory_id, tax_type, tax_rate "
+                    f"FROM factory_tax_rates WHERE factory_id IN ({sm_ph})",
+                    tuple(smelter_ids),
+                )
+                tax_rate_map: Dict[int, Dict[str, float]] = {}
+                for fid, ttype, rate in cur.fetchall():
+                    tax_rate_map.setdefault(fid, {})[ttype] = float(rate)
+
+                # category_id → row_id 映射
+                cur.execute(
+                    f"SELECT row_id, category_id FROM dict_categories "
+                    f"WHERE category_id IN ({cat_ph}) AND is_active = 1",
+                    tuple(category_ids),
+                )
+                row_id_to_cat: Dict[int, int] = {row[0]: row[1] for row in cur.fetchall()}
+                row_ids = list(row_id_to_cat.keys())
+
+                if not row_ids:
+                    return {"demand_rows": [], "raw": []}
+
+                ri_ph = ",".join(["%s"] * len(row_ids))
+
+                # 最新报价：查询所有价格列
                 cur.execute(
                     f"""
-                    SELECT qd.factory_id, dc.category_id, qd.unit_price
-                    FROM quote_details qd
-                    JOIN dict_categories dc ON qd.category_id = dc.row_id
-                    WHERE qd.factory_id IN ({sm_ph})
-                      AND dc.category_id IN ({cat_ph})
-                      AND qd.quote_date = (
+                    SELECT factory_id, category_id,
+                           unit_price, price_1pct_vat, price_3pct_vat, price_13pct_vat,
+                           price_normal_invoice, price_reverse_invoice
+                    FROM quote_details
+                    WHERE factory_id IN ({sm_ph})
+                      AND category_id IN ({ri_ph})
+                      AND quote_date = (
                           SELECT MAX(qd2.quote_date)
                           FROM quote_details qd2
-                          WHERE qd2.factory_id  = qd.factory_id
-                            AND qd2.category_id = qd.category_id
+                          WHERE qd2.factory_id = quote_details.factory_id
+                            AND qd2.category_id = quote_details.category_id
                       )
                     """,
-                    tuple(smelter_ids) + tuple(category_ids),
+                    tuple(smelter_ids) + tuple(row_ids),
                 )
-                price_map: Dict[tuple, float] = {
-                    (r[0], r[1]): float(r[2]) for r in cur.fetchall()
-                }
+                col_names = ["unit_price", "price_1pct_vat", "price_3pct_vat",
+                             "price_13pct_vat", "price_normal_invoice", "price_reverse_invoice"]
+                raw_price_map: Dict[tuple, Dict[str, Optional[float]]] = {}
+                for row in cur.fetchall():
+                    fid_r, rid = row[0], row[1]
+                    raw_price_map[(fid_r, rid)] = {
+                        col: (float(v) if v is not None else None)
+                        for col, v in zip(col_names, row[2:])
+                    }
+
+        # 价格反算逻辑
+        COL_TO_TAX: Dict[str, str] = {
+            "price_1pct_vat": "1pct",
+            "price_3pct_vat": "3pct",
+            "price_13pct_vat": "13pct",
+        }
+
+        def resolve_price(fid: int, rid: int) -> Optional[float]:
+            prices = raw_price_map.get((fid, rid), {})
+            rates = tax_rate_map.get(fid, {})
+
+            # 1. 直接有目标列
+            direct = prices.get(target_col)
+            if direct is not None:
+                return direct
+
+            # 2. 目标是含税价，且有不含税基础价 + 目标税率
+            if target_tax and prices.get("unit_price") is not None and target_tax in rates:
+                base = prices["unit_price"]
+                return round(base * (1 + rates[target_tax]), 2)
+
+            # 3. 目标是基础价，从已知含税价反算
+            if target_col == "unit_price":
+                for col, src_tax in COL_TO_TAX.items():
+                    known_price = prices.get(col)
+                    if known_price is not None and src_tax in rates:
+                        return round(known_price / (1 + rates[src_tax]), 2)
+
+            # 4. 从其他已知含税价反算
+            if target_tax and target_tax in rates:
+                for col, src_tax in COL_TO_TAX.items():
+                    known_price = prices.get(col)
+                    if known_price is not None and src_tax in rates:
+                        base = round(known_price / (1 + rates[src_tax]), 4)
+                        return round(base * (1 + rates[target_tax]), 2)
+
+            return None
+
+        # 构建 price_map: {(factory_id, category_id): price}
+        price_map: Dict[tuple, Optional[float]] = {}
+        for (fid, rid), _ in raw_price_map.items():
+            cid = row_id_to_cat.get(rid)
+            if cid:
+                price_map[(fid, cid)] = resolve_price(fid, rid)
 
         # 构造结构化数据：以需求为主体，报价统一（不含仓库），各仓库运费嵌套对比
         demand_rows = []

@@ -13,7 +13,7 @@ TL比价模块路由
   7a.GET  /tl/get_category_mapping     - 获取品类映射表
   7. POST /tl/update_category_mapping  - 更新品类映射表
 """
-from typing import List
+from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 
@@ -24,6 +24,9 @@ from app.models.tl import (
     ConfirmPriceTableRequest,
     AddWarehouseRequest,
     PurchaseSuggestionRequest,
+    VlmFullData,
+    TaxRateItem,
+    TaxRateUpsertRequest,
 )
 from app.services.tl_service import TLService, get_tl_service
 
@@ -88,7 +91,7 @@ def get_comparison(
             warehouse_ids=body.选中仓库id列表,
             smelter_ids=body.冶炼厂id列表,
             category_ids=body.品类id列表,
-            tax_type=body.税率类型,
+            price_type=body.price_type,
         )
         return {"code": 200, "data": data}
     except ValueError as e:
@@ -126,9 +129,11 @@ def confirm_price_table(
 ):
     try:
         items = [item.model_dump() for item in body.数据]
+        full_data = body.full_data.model_dump() if body.full_data else None
         return service.confirm_price_table(
             quote_date_str=body.报价日期,
             items=items,
+            full_data=full_data,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -176,13 +181,57 @@ def get_purchase_suggestion(
         return service.get_purchase_suggestion(
             warehouse_ids=body.warehouse_ids,
             demands=demands,
+            price_type=body.price_type,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.post("/update_category_mapping", summary="更新品类映射表")
+
+# ===================== 税率表接口 =====================
+
+@router.get("/get_tax_rates", summary="获取税率表")
+def get_tax_rates(
+    factory_ids: Optional[str] = None,
+    service: TLService = Depends(get_tl_service),
+):
+    """factory_ids: 逗号分隔的冶炼厂ID，不传则返回全部"""
+    try:
+        ids = [int(x) for x in factory_ids.split(",")] if factory_ids else None
+        data = service.get_tax_rates(factory_ids=ids)
+        return {"code": 200, "data": data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/upsert_tax_rates", summary="批量设置税率")
+def upsert_tax_rates(
+    body: TaxRateUpsertRequest,
+    service: TLService = Depends(get_tl_service),
+):
+    try:
+        items = [item.model_dump() for item in body.items]
+        return service.upsert_tax_rates(items)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/delete_tax_rate", summary="删除某冶炼厂的某税率记录")
+def delete_tax_rate(
+    factory_id: int,
+    tax_type: str,
+    service: TLService = Depends(get_tl_service),
+):
+    try:
+        return service.delete_tax_rate(factory_id=factory_id, tax_type=tax_type)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 def update_category_mapping(
     body: List[CategoryMappingItem],
     service: TLService = Depends(get_tl_service),

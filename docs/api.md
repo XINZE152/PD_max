@@ -86,18 +86,32 @@
 ## 接口4：获取比价表
 - 方法：`POST`
 - 路由：`/tl/get_comparison`
-- 传入：选中仓库id列表、冶炼厂id列表、品类id列表
-- 输出：(仓库、冶炼厂、品类、运费、报价) 列表
-- 逻辑说明：
-  - 运费取 `freight_rates` 中该(仓库,冶炼厂)最新生效日期的价格
-  - 报价取 `quote_details` 中该(冶炼厂,品类)最新日期的单价，无记录则为 null
-  - 结果为 (仓库×冶炼厂运费记录) × 品类 的笛卡尔积
+- 传入：选中仓库id列表、冶炼厂id列表、品类id列表、price_type（目标税率类型）
+- 输出：(仓库、冶炼厂、品类、运费、报价、报价来源) 列表
+
+**price_type 可选值：**
+| 值 | 含义 |
+|---|---|
+| `null` | 普通价（不含税基础价） |
+| `"1pct"` | 含1%增值税 |
+| `"3pct"` | 含3%增值税 |
+| `"13pct"` | 含13%增值税 |
+| `"normal_invoice"` | 普通发票价 |
+| `"reverse_invoice"` | 反向发票价 |
+
+**报价取价逻辑（按优先级）：**
+1. 报价表中直接有对应 `price_type` 的价格 → 直接使用，`报价来源: "direct"`
+2. 报价表有不含税基础价（`unit_price`）+ 该冶炼厂税率表有目标税率 → 正向换算，`报价来源: "calc_from_base"`
+3. 报价表有其他已知含税价 + 税率表有对应税率 → 先反算不含税价，再正向换算，`报价来源: "calc_from_3pct"` 等
+4. 以上均无 → `报价: null`，`报价来源: "unavailable"`
+
 - 模拟请求JSON：
 ```json
 {
   "选中仓库id列表": [101, 102],
   "冶炼厂id列表": [201],
-  "品类id列表": [301]
+  "品类id列表": [301, 302],
+  "price_type": "3pct"
 }
 ```
 - 模拟返回JSON：
@@ -105,45 +119,54 @@
 {
   "code": 200,
   "data": [
-    { "仓库": "北京仓", "冶炼厂": "华北冶炼厂", "品类": "铜", "运费": 200, "报价": 9350 },
-    { "仓库": "上海仓", "冶炼厂": "华北冶炼厂", "品类": "铜", "运费": 300, "报价": 9350 }
+    { "仓库": "北京仓", "冶炼厂": "华北冶炼厂", "品类": "铜", "price_type": "3%增值税", "运费": 200, "报价": 9737, "报价来源": "direct" },
+    { "仓库": "北京仓", "冶炼厂": "华北冶炼厂", "品类": "铝", "price_type": "3%增值税", "运费": 200, "报价": 8350, "报价来源": "calc_from_base" },
+    { "仓库": "上海仓", "冶炼厂": "华北冶炼厂", "品类": "铜", "price_type": "3%增值税", "运费": 300, "报价": null, "报价来源": "unavailable" }
   ]
 }
 ```
 
 ---
 
-## 接口5：上传价格表（OCR识别）
+## 接口5：上传价格表（VLM识别）
 - 方法：`POST`
 - 路由：`/tl/upload_price_table`
 - 传入：图片文件（FormData，支持批量）
-- 输出：OCR识别的原始冶炼厂名、品类名、价格，供前端展示修改后传给接口5b
+- 输出：每张图的全量识别数据（`full_data`）+ 映射后的前端可编辑条目（`items`）
 - 支持格式：jpg、png、bmp、webp
 - 逻辑说明：
   1. 后端为每张图片生成UUID文件名，保存到 `uploads/price_tables/` 目录
-  2. 调用 RapidOCR 对每张图片进行文字识别，提取工厂名、日期、品类+价格
-  3. 直接返回识别原文，不做任何匹配，匹配逻辑在接口5b中处理
+  2. 调用千问VLM对每张图片进行全量识别，提取公司名、日期、表头、各行价格、备注等完整信息
+  3. 将识别结果映射为前端可编辑的 `items` 列表（`冶炼厂名/品类名/各税率价格`）
+  4. `full_data` 由前端保留，确认后原样回传给接口5b存档，不需要前端解析
 - 模拟请求（FormData）：
 ```
-file: [图片文件1, 图片文件2]
+file: [报价单1.jpg]
 ```
 - 模拟返回JSON：
 ```json
 {
   "code": 200,
   "data": {
-    "items": [
-      { "冶炼厂名": "山西亿晨环保科技有限公司", "品类名": "电动车", "价格": 9350 },
-      { "冶炼厂名": "山西亿晨环保科技有限公司", "品类名": "摩托车", "价格": 8600 }
-    ],
     "details": [
       {
         "image": "报价单1.jpg",
-        "factory_name": "山西亿晨环保科技有限公司",
-        "date": "2026-03-24",
+        "success": true,
+        "full_data": {
+          "company_name": "山西亿晨环保科技有限公司",
+          "doc_title": "废铅酸蓄电池回收价格报价表",
+          "execution_date": "2026年03月24日",
+          "quote_date": "2026-03-24",
+          "price_column_type": "1_3_percent",
+          "headers": ["电池名称", "含1%普票单价", "含3%专票单价", "质检标准"],
+          "rows": [
+            { "index": 1, "category": "电动车电池", "price_1pct_vat": 9550, "price_3pct_vat": 9737, "remark": "控水" }
+          ],
+          "footer_notes": ["价格随市场波动每日更新"],
+          "raw_full_text": "..."
+        },
         "items": [
-          { "冶炼厂名": "山西亿晨环保科技有限公司", "品类名": "电动车", "价格": 9350 },
-          { "冶炼厂名": "山西亿晨环保科技有限公司", "品类名": "摩托车", "价格": 8600 }
+          { "冶炼厂名": "山西亿晨环保科技有限公司", "冶炼厂id": null, "品类名": "电动车电池", "品类id": null, "价格": null, "价格_1pct增值税": 9550, "价格_3pct增值税": 9737, "价格_13pct增值税": null, "普通发票价格": null, "反向发票价格": null }
         ]
       }
     ]
@@ -156,21 +179,31 @@ file: [图片文件1, 图片文件2]
 ## 接口5b：确认价格表写入
 - 方法：`POST`
 - 路由：`/tl/confirm_price_table`
-- 传入：报价日期、报价明细列表（冶炼厂名/id、品类名/id、价格）
+- 传入：报价日期、full_data（可选，VLM全量数据原样回传）、报价明细列表（前端确认/修改后）
 - 输出：写入状态
 - 逻辑说明：
-  1. 前端根据接口5返回结果确认/修正后调用此接口
+  1. 前端对接口5返回的 `items` 确认/修正后，连同原始 `full_data` 一起提交
   2. `冶炼厂id` 为 null 时：按名称查 `dict_factories`，存在则复用，不存在则自动新建
   3. `品类id` 为 null 时：按名称查 `dict_categories.row_id`，存在则复用，不存在则自动新建
-  4. 以 `(报价日期, 冶炼厂id, 品类row_id)` 为唯一键写入 `quote_details`，已存在则更新价格
+  4. `full_data` 存入 `quote_table_metadata` 表（按 `factory_id + quote_date` 唯一键，已存在则更新）
+  5. 每条明细以 `(报价日期, 冶炼厂id, 品类row_id)` 为唯一键写入 `quote_details`，已存在则更新价格，并关联 `metadata_id`
 - 模拟请求JSON：
 ```json
 {
   "报价日期": "2026-03-24",
+  "full_data": {
+    "company_name": "山西亿晨环保科技有限公司",
+    "execution_date": "2026年03月24日",
+    "quote_date": "2026-03-24",
+    "source_image": "报价单1.jpg",
+    "headers": ["电池名称", "含1%普票单价", "含3%专票单价"],
+    "rows": [...],
+    "footer_notes": ["价格随市场波动每日更新"],
+    "raw_full_text": "..."
+  },
   "数据": [
-    { "冶炼厂名": "山西亿晨环保科技有限公司", "冶炼厂id": 1, "品类名": "电动车", "品类id": 3, "价格": 9350 },
-    { "冶炼厂名": "山西亿晨环保科技有限公司", "冶炼厂id": 1, "品类名": "摩托车", "品类id": null, "价格": 8600 },
-    { "冶炼厂名": "未知工厂", "冶炼厂id": null, "品类名": "电动车", "品类id": 3, "价格": 9100 }
+    { "冶炼厂名": "山西亿晨环保科技有限公司", "冶炼厂id": 1, "品类名": "电动车电池", "品类id": 3, "价格": null, "价格_1pct增值税": 9550, "价格_3pct增值税": 9737, "价格_13pct增值税": null, "普通发票价格": null, "反向发票价格": null },
+    { "冶炼厂名": "山西亿晨环保科技有限公司", "冶炼厂id": 1, "品类名": "摩托车电池", "品类id": null, "价格": null, "价格_1pct增值税": 8500, "价格_3pct增值税": 8665, "价格_13pct增值税": null, "普通发票价格": null, "反向发票价格": null }
   ]
 }
 ```
@@ -255,6 +288,70 @@ file: [图片文件1, 图片文件2]
 
 ---
 
+## 接口T1：获取税率表
+- 方法：`GET`
+- 路由：`/tl/get_tax_rates`
+- 传入（Query参数）：`factory_ids`（可选，逗号分隔的冶炼厂ID，不传则返回全部）
+- 输出：税率记录列表
+- 数据来源：`factory_tax_rates` 表
+- 逻辑说明：每个冶炼厂对每种税率（1pct/3pct/13pct）存一行，由用户手动维护，用于比价表中的税率换算
+- 模拟请求：`GET /tl/get_tax_rates?factory_ids=201,202`
+- 模拟返回JSON：
+```json
+{
+  "code": 200,
+  "data": [
+    { "id": 1, "factory_id": 201, "factory_name": "华北冶炼厂", "tax_type": "1pct", "tax_rate": 0.01 },
+    { "id": 2, "factory_id": 201, "factory_name": "华北冶炼厂", "tax_type": "3pct", "tax_rate": 0.03 },
+    { "id": 3, "factory_id": 202, "factory_name": "华东冶炼厂", "tax_type": "3pct", "tax_rate": 0.03 }
+  ]
+}
+```
+
+---
+
+## 接口T2：批量设置税率
+- 方法：`POST`
+- 路由：`/tl/upsert_tax_rates`
+- 传入：税率列表（冶炼厂id、税率类型、税率值）
+- 输出：状态提示
+- 逻辑说明：存在则更新，不存在则插入（upsert）；`tax_rate` 为小数，如 `0.03` 表示3%；`tax_type` 有效值为 `1pct`/`3pct`/`13pct`
+- 模拟请求JSON：
+```json
+{
+  "items": [
+    { "factory_id": 201, "tax_type": "1pct", "tax_rate": 0.01 },
+    { "factory_id": 201, "tax_type": "3pct", "tax_rate": 0.03 },
+    { "factory_id": 202, "tax_type": "3pct", "tax_rate": 0.03 }
+  ]
+}
+```
+- 模拟返回JSON：
+```json
+{
+  "code": 200,
+  "msg": "已保存 3 条税率记录"
+}
+```
+
+---
+
+## 接口T3：删除税率记录
+- 方法：`DELETE`
+- 路由：`/tl/delete_tax_rate`
+- 传入（Query参数）：`factory_id`、`tax_type`
+- 输出：状态提示
+- 模拟请求：`DELETE /tl/delete_tax_rate?factory_id=201&tax_type=3pct`
+- 模拟返回JSON：
+```json
+{
+  "code": 200,
+  "msg": "删除成功"
+}
+```
+
+---
+
 ## 接口A7：采购建议
 - 方法：`POST`
 - 路由：`/tl/get_purchase_suggestion`
@@ -300,6 +397,23 @@ file: [图片文件1, 图片文件2]
 - 传入：username、password
 - 输出：JWT token、用户信息
 - 逻辑说明：校验账号密码，成功返回 JWT token 及用户基本信息；失败返回 401
+- 模拟请求JSON：
+```json
+{ "username": "admin", "password": "123456" }
+```
+- 模拟返回JSON（成功）：
+```json
+{
+  "code": 200,
+  "msg": "登录成功",
+  "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "user": { "id": 1, "username": "admin", "real_name": "管理员", "role": "admin", "phone": "13800138001", "email": "admin@example.com" }
+}
+```
+- 模拟返回JSON（失败）：
+```json
+{ "detail": "账号或密码错误" }
+```
 
 ---
 
@@ -320,23 +434,6 @@ file: [图片文件1, 图片文件2]
 - 模拟返回JSON（账号重复）：
 ```json
 { "code": 400, "msg": "账号已存在" }
-```
-- 模拟请求JSON：
-```json
-{ "username": "admin", "password": "123456" }
-```
-- 模拟返回JSON（成功）：
-```json
-{
-  "code": 200,
-  "msg": "登录成功",
-  "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
-  "user": { "id": 1, "username": "admin", "real_name": "管理员", "role": "admin", "phone": "13800138001", "email": "admin@example.com" }
-}
-```
-- 模拟返回JSON（失败）：
-```json
-{ "detail": "账号或密码错误" }
 ```
 
 ---
@@ -439,3 +536,4 @@ file: [图片文件1, 图片文件2]
 4. 错误状态码：`400`（参数校验失败）、`401`（未登录）、`403`（权限不足）、`404`（资源不存在）、`500`（服务器内部错误）
 5. 数据库连接使用 `autocommit=True`，写操作自动提交
 6. LLM 配置通过环境变量注入：`LLM_API_KEY`、`LLM_BASE_URL`、`LLM_MODEL`
+7. VLM 配置通过环境变量注入：`VLM_API_KEY`、`VLM_BASE_URL`、`VLM_MODEL`（默认 `qwen-vl-max-latest`）
