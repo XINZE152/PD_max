@@ -44,7 +44,12 @@ class ConfirmPriceTableItem(BaseModel):
     冶炼厂id: Optional[int] = Field(None, description="冶炼厂ID，null则自动新建")
     品类名: str = Field(..., description="品类名称（OCR识别或前端修改后）")
     品类id: Optional[int] = Field(None, description="品类分组ID，null则自动新建")
-    价格: float = Field(..., description="单价（元/吨）")
+    价格: float = Field(..., description="普通价单价（元/吨）")
+    价格_1pct增值税: Optional[float] = Field(None, description="1%增值税价格（元/吨）")
+    价格_3pct增值税: Optional[float] = Field(None, description="3%增值税价格（元/吨）")
+    价格_13pct增值税: Optional[float] = Field(None, description="13%增值税价格（元/吨）")
+    普通发票价格: Optional[float] = Field(None, description="普通发票价格（元/吨）")
+    反向发票价格: Optional[float] = Field(None, description="反向发票价格（元/吨）")
 
 
 class ConfirmPriceTableRequest(BaseModel):

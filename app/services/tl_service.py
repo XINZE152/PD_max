@@ -111,6 +111,7 @@ class TLService:
         warehouse_ids: List[int],
         smelter_ids: List[int],
         category_ids: List[int],
+        tax_type: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         if not warehouse_ids or not smelter_ids or not category_ids:
             return []
@@ -166,13 +167,26 @@ class TLService:
                     row_id_to_cat: Dict[int, int] = {row[0]: row[1] for row in cur.fetchall()}
                     row_ids = list(row_id_to_cat.keys())
 
+                    tax_type_map = {
+                        None: ("unit_price", "普通价"),
+                        "1pct": ("price_1pct_vat", "1%增值税"),
+                        "3pct": ("price_3pct_vat", "3%增值税"),
+                        "13pct": ("price_13pct_vat", "13%增值税"),
+                        "normal_invoice": ("price_normal_invoice", "普通发票"),
+                        "reverse_invoice": ("price_reverse_invoice", "反向发票"),
+                    }
+                    if tax_type not in tax_type_map:
+                        raise ValueError(f"不支持的税率类型: {tax_type}")
+
+                    price_column, tax_type_name = tax_type_map[tax_type]
+
                     # 最新报价：每个(冶炼厂, row_id)取最新日期，结果映射回 category_id
                     price_map: Dict[tuple, float] = {}
                     if row_ids:
                         ri_placeholders = ",".join(["%s"] * len(row_ids))
                         cur.execute(
                             f"""
-                            SELECT factory_id, category_id, unit_price
+                            SELECT factory_id, category_id, {price_column}
                             FROM quote_details
                             WHERE factory_id IN ({sm_placeholders})
                               AND category_id IN ({ri_placeholders})
@@ -187,7 +201,7 @@ class TLService:
                         )
                         for fid_r, rid, price in cur.fetchall():
                             cid = row_id_to_cat.get(rid)
-                            if cid is not None:
+                            if cid is not None and price is not None:
                                 price_map[(fid_r, cid)] = float(price)
 
                     # 组合结果
@@ -201,6 +215,7 @@ class TLService:
                                 "仓库": wname,
                                 "冶炼厂": fname,
                                 "品类": cat_name,
+                                "税率类型": tax_type_name,
                                 "运费": float(freight) if freight is not None else None,
                                 "报价": price_map.get((fid, cid)),
                             })
@@ -363,13 +378,30 @@ class TLService:
                         # 3. 写入明细，相同(日期+冶炼厂+品类)则更新价格
                         cur.execute(
                             "INSERT INTO quote_details "
-                            "(quote_date, factory_id, category_id, raw_category_name, unit_price) "
-                            "VALUES (%s, %s, %s, %s, %s) "
+                            "(quote_date, factory_id, category_id, raw_category_name, unit_price, "
+                            "price_1pct_vat, price_3pct_vat, price_13pct_vat, price_normal_invoice, price_reverse_invoice) "
+                            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
                             "ON DUPLICATE KEY UPDATE "
                             "unit_price = VALUES(unit_price), "
+                            "price_1pct_vat = VALUES(price_1pct_vat), "
+                            "price_3pct_vat = VALUES(price_3pct_vat), "
+                            "price_13pct_vat = VALUES(price_13pct_vat), "
+                            "price_normal_invoice = VALUES(price_normal_invoice), "
+                            "price_reverse_invoice = VALUES(price_reverse_invoice), "
                             "raw_category_name = VALUES(raw_category_name), "
                             "updated_at = CURRENT_TIMESTAMP",
-                            (quote_dt, item["冶炼厂id"], item["品类id"], item["品类名"], item["价格"]),
+                            (
+                                quote_dt,
+                                item["冶炼厂id"],
+                                item["品类id"],
+                                item["品类名"],
+                                item["价格"],
+                                item.get("价格_1pct增值税"),
+                                item.get("价格_3pct增值税"),
+                                item.get("价格_13pct增值税"),
+                                item.get("普通发票价格"),
+                                item.get("反向发票价格"),
+                            ),
                         )
                         if cur.rowcount == 1:
                             inserted += 1

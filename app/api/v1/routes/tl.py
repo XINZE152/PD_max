@@ -88,8 +88,11 @@ def get_comparison(
             warehouse_ids=body.选中仓库id列表,
             smelter_ids=body.冶炼厂id列表,
             category_ids=body.品类id列表,
+            tax_type=body.税率类型,
         )
         return {"code": 200, "data": data}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
