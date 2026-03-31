@@ -1,9 +1,11 @@
 from contextlib import contextmanager
+import logging
 
 import pymysql
 
 from app import config
 
+logger = logging.getLogger(__name__)
 
 def get_mysql_config() -> dict:
     return {
@@ -47,7 +49,7 @@ def create_database_if_not_exists():
                 f"CREATE DATABASE IF NOT EXISTS `{config.MYSQL_DATABASE}` "
                 f"CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
             )
-            print(f"数据库 '{config.MYSQL_DATABASE}' 检查/创建完成")
+            logger.info("数据库 '%s' 检查/创建完成", config.MYSQL_DATABASE)
     finally:
         connection.close()
 
@@ -231,7 +233,7 @@ def create_tables() -> None:
             for statement in TABLE_STATEMENTS:
                 cursor.execute(statement)
         connection.commit()
-        print("所有数据表创建完成")
+        logger.info("所有数据表创建完成")
     finally:
         connection.close()
 
@@ -252,7 +254,7 @@ def init_default_data() -> None:
                 "(1, '默认冶炼厂', 1)"
             )
         connection.commit()
-        print("默认数据初始化完成")
+        logger.info("默认数据初始化完成")
     finally:
         connection.close()
 

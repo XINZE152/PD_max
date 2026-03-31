@@ -18,8 +18,6 @@ except ImportError:
         def __call__(self, img):
             raise ImportError("请先安装 rapidocr_onnxruntime: pip install rapidocr_onnxruntime")
 
-# 配置日志
-logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(name)s:%(message)s')
 logger = logging.getLogger(__name__)
 
 class BatteryQuoteItem:
