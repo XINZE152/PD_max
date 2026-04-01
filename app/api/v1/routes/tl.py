@@ -4,7 +4,9 @@ TL比价模块路由
 包含接口：
   0. POST /tl/add_warehouse            - 添加仓库（不存在则新建）
   1. GET  /tl/get_warehouses           - 获取仓库列表
+  1b.POST /tl/update_warehouse         - 修改仓库信息
   1c.DELETE /tl/delete_warehouse        - 删除仓库（软删除）
+  1d.POST /tl/add_smelter              - 新建冶炼厂
   2. GET  /tl/get_smelters             - 获取冶炼厂列表
   3. GET  /tl/get_categories           - 获取品类列表
   4. POST /tl/get_comparison           - 获取比价表
@@ -24,6 +26,7 @@ from app.models.tl import (
     CategoryMappingItem,
     ConfirmPriceTableRequest,
     AddWarehouseRequest,
+    UpdateWarehouseRequest,
     AddSmelterRequest,
     UpdateSmelterRequest,
     PurchaseSuggestionRequest,
@@ -60,6 +63,25 @@ def get_warehouses(service: TLService = Depends(get_tl_service)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ===================== 接口1b：修改仓库 =====================
+
+@router.post("/update_warehouse", summary="修改仓库信息")
+def update_warehouse(
+    body: UpdateWarehouseRequest,
+    service: TLService = Depends(get_tl_service),
+):
+    try:
+        return service.update_warehouse(
+            warehouse_id=body.仓库id,
+            name=body.仓库名,
+            is_active=body.is_active,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ===================== 接口1c：删除仓库 =====================
 
 @router.delete("/delete_warehouse", summary="删除仓库（软删除）")
@@ -75,7 +97,7 @@ def delete_warehouse(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ===================== 接口1b：新建冶炼厂 =====================
+# ===================== 接口1d：新建冶炼厂 =====================
 
 @router.post("/add_smelter", summary="新建冶炼厂")
 def add_smelter(

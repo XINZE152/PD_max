@@ -19,6 +19,13 @@ class AddWarehouseRequest(BaseModel):
     仓库名: str = Field(..., description="仓库名称")
 
 
+class UpdateWarehouseRequest(BaseModel):
+    """修改仓库请求体"""
+    仓库id: int = Field(..., description="仓库ID")
+    仓库名: Optional[str] = Field(None, description="仓库名称（可选）")
+    is_active: Optional[bool] = Field(None, description="是否启用（可选）")
+
+
 class AddSmelterRequest(BaseModel):
     """新建冶炼厂请求体"""
     冶炼厂名: str = Field(..., description="冶炼厂名称")

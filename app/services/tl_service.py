@@ -94,6 +94,54 @@ class TLService:
             logger.error(f"获取仓库列表失败: {e}")
             raise
 
+    # ==================== 接口1b：修改仓库 ====================
+
+    def update_warehouse(
+        self,
+        warehouse_id: int,
+        name: Optional[str] = None,
+        is_active: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        if name is None and is_active is None:
+            raise ValueError("至少需要提供一个待修改字段：仓库名 或 is_active")
+
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT id FROM dict_warehouses WHERE id = %s", (warehouse_id,))
+                    if not cur.fetchone():
+                        raise ValueError(f"仓库 id={warehouse_id} 不存在")
+
+                    updates = []
+                    params: List[Any] = []
+
+                    if name is not None:
+                        cur.execute(
+                            "SELECT id FROM dict_warehouses WHERE name = %s AND id <> %s",
+                            (name, warehouse_id),
+                        )
+                        if cur.fetchone():
+                            raise ValueError(f"仓库名 '{name}' 已存在")
+                        updates.append("name = %s")
+                        params.append(name)
+
+                    if is_active is not None:
+                        updates.append("is_active = %s")
+                        params.append(1 if is_active else 0)
+
+                    params.append(warehouse_id)
+                    cur.execute(
+                        f"UPDATE dict_warehouses SET {', '.join(updates)} WHERE id = %s",
+                        tuple(params),
+                    )
+
+            return {"code": 200, "msg": "仓库信息修改成功"}
+        except ValueError:
+            raise
+        except Exception as e:
+            logger.error(f"修改仓库失败: {e}")
+            raise
+
     # ==================== 接口1c：删除仓库（软删除） ====================
 
     def delete_warehouse(self, warehouse_id: int) -> Dict[str, Any]:
