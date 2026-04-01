@@ -158,32 +158,52 @@ class EngineContainer:
     ocr_reader: Optional[Any] = None
     ai_semaphore: Optional[asyncio.Semaphore] = None
     cleanup_task: Optional[asyncio.Task] = None
+    _runtime_lock: Optional[asyncio.Lock] = None
 
 
 async def startup_ai_detection() -> None:
-    if EngineContainer.instance is not None:
+    """仅注册任务表、并发与 GC；EasyOCR / 推理引擎在首次请求时再加载，避免阻塞 HTTP 端口监听。"""
+    if EngineContainer.registry is not None:
         return
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    logger.info("Initializing AI detection runtime on %s", device)
-    try:
-        import easyocr
-    except ModuleNotFoundError as exc:
-        raise RuntimeError(
-            "Missing dependency 'easyocr'. Run `uv sync` or `pip install easyocr`."
-        ) from exc
-
-    EngineContainer.ocr_reader = await run_in_threadpool(
-        easyocr.Reader,
-        ["ch_sim", "en"],
-        gpu=(device == "cuda"),
-    )
-    EngineContainer.instance = await run_in_threadpool(InferenceEngineAPI, "config.yaml")
+    EngineContainer._runtime_lock = asyncio.Lock()
     EngineContainer.registry = MemoryTaskRegistry()
     EngineContainer.ai_semaphore = asyncio.Semaphore(MAX_CONCURRENT_AI_TASKS)
-    EngineContainer.cleanup_task = asyncio.create_task(cleanup_daemon(EngineContainer.registry))
+    EngineContainer.cleanup_task = asyncio.create_task(
+        cleanup_daemon(EngineContainer.registry)
+    )
+    logger.info(
+        "AI detection registry ready (EasyOCR/engine load deferred until first AI request)"
+    )
 
-    logger.info("AI detection runtime initialized")
+
+async def ensure_ai_detection_runtime() -> None:
+    if EngineContainer.instance is not None and EngineContainer.ocr_reader is not None:
+        return
+
+    if EngineContainer._runtime_lock is None:
+        EngineContainer._runtime_lock = asyncio.Lock()
+
+    async with EngineContainer._runtime_lock:
+        if EngineContainer.instance is not None and EngineContainer.ocr_reader is not None:
+            return
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        logger.info("Loading AI detection runtime on %s (first use; may download EasyOCR models)", device)
+        try:
+            import easyocr
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "Missing dependency 'easyocr'. Run `uv sync` or `pip install easyocr`."
+            ) from exc
+
+        EngineContainer.ocr_reader = await run_in_threadpool(
+            easyocr.Reader,
+            ["ch_sim", "en"],
+            gpu=(device == "cuda"),
+        )
+        EngineContainer.instance = await run_in_threadpool(InferenceEngineAPI, "config.yaml")
+        logger.info("AI detection runtime ready")
 
 
 async def shutdown_ai_detection() -> None:
@@ -200,9 +220,11 @@ async def shutdown_ai_detection() -> None:
     EngineContainer.ocr_reader = None
     EngineContainer.ai_semaphore = None
     EngineContainer.cleanup_task = None
+    EngineContainer._runtime_lock = None
 
 
-def get_engine() -> InferenceEngineAPI:
+async def get_engine() -> InferenceEngineAPI:
+    await ensure_ai_detection_runtime()
     if not EngineContainer.instance:
         raise HTTPException(status_code=503, detail="Engine unavailable")
     return EngineContainer.instance
@@ -214,7 +236,8 @@ def get_registry() -> AbstractTaskRegistry:
     return EngineContainer.registry
 
 
-def get_ocr_reader() -> Any:
+async def get_ocr_reader() -> Any:
+    await ensure_ai_detection_runtime()
     if not EngineContainer.ocr_reader:
         raise HTTPException(status_code=503, detail="OCR unavailable")
     return EngineContainer.ocr_reader

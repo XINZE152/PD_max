@@ -24,6 +24,7 @@ test_ocr.py                  # OCR功能测试脚本
 | # | 方法 | 路由 | 说明 |
 |---|------|------|------|
 | 1 | GET | `/tl/get_warehouses` | 获取仓库列表 |
+| 1c | DELETE | `/tl/delete_warehouse` | 删除仓库（软删除） |
 | 1b | POST | `/tl/add_smelter` | 新建冶炼厂 |
 | 2 | GET | `/tl/get_smelters` | 获取冶炼厂列表 |
 | 2b | POST | `/tl/update_smelter` | 修改冶炼厂信息 |

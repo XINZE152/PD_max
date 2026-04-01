@@ -113,8 +113,7 @@ class ConfirmPriceTableRequest(BaseModel):
 
 
 class DemandItem(BaseModel):
-    """A7 单条需求"""
-    smelter_id: int = Field(..., description="冶炼厂ID")
+    """A7 单条需求（冶炼厂由后端默认取全部启用冶炼厂，前端不传）"""
     category_id: int = Field(..., description="品类分组ID")
     demand: float = Field(..., description="需求吨数")
 
@@ -122,7 +121,7 @@ class DemandItem(BaseModel):
 class PurchaseSuggestionRequest(BaseModel):
     """A7 采购建议请求体"""
     warehouse_ids: List[int] = Field(..., description="仓库ID列表")
-    demands: List[DemandItem] = Field(..., description="需求列表")
+    demands: List[DemandItem] = Field(..., description="需求列表（仅品类与吨数）")
     price_type: Optional[str] = Field(None, description="价格类型：None=普通价, 1pct/3pct/13pct/normal_invoice/reverse_invoice")
 
 

@@ -94,6 +94,30 @@ class TLService:
             logger.error(f"获取仓库列表失败: {e}")
             raise
 
+    # ==================== 接口1c：删除仓库（软删除） ====================
+
+    def delete_warehouse(self, warehouse_id: int) -> Dict[str, Any]:
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT id FROM dict_warehouses WHERE id = %s AND is_active = 1",
+                        (warehouse_id,),
+                    )
+                    if not cur.fetchone():
+                        raise ValueError(f"仓库 id={warehouse_id} 不存在或已删除")
+
+                    cur.execute(
+                        "UPDATE dict_warehouses SET is_active = 0 WHERE id = %s",
+                        (warehouse_id,),
+                    )
+            return {"code": 200, "msg": "仓库已删除"}
+        except ValueError:
+            raise
+        except Exception as e:
+            logger.error(f"删除仓库失败: {e}")
+            raise
+
     # ==================== 接口2：获取冶炼厂列表 ====================
 
     def get_smelters(self) -> List[Dict[str, Any]]:
@@ -936,9 +960,9 @@ class TLService:
         price_type: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        根据仓库列表和需求（冶炼厂+品类+吨数），查询最新运费和报价，
-        整理结构化数据后调用 Claude 生成各仓库发车建议表。
-        同一仓库发出的货物可混装，尽量整车发。
+        根据仓库列表和需求（品类+吨数），查询最新运费和报价。
+        冶炼厂默认取 dict_factories 中全部启用冶炼厂，无需前端传入。
+        整理结构化数据后调用 LLM 生成各仓库发车建议表。
         price_type: 目标税率类型，None=普通价, 1pct/3pct/13pct/normal_invoice/reverse_invoice
         """
         if not warehouse_ids or not demands:
@@ -961,15 +985,21 @@ class TLService:
         target_col, price_type_name = PRICE_COL_MAP[price_type]
         target_tax = VAT_TAX_TYPE_MAP.get(price_type)
 
-        smelter_ids = list({d["smelter_id"] for d in demands})
         category_ids = list({d["category_id"] for d in demands})
-
-        wh_ph = ",".join(["%s"] * len(warehouse_ids))
-        sm_ph = ",".join(["%s"] * len(smelter_ids))
-        cat_ph = ",".join(["%s"] * len(category_ids))
 
         with get_conn() as conn:
             with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id FROM dict_factories WHERE is_active = 1 ORDER BY id"
+                )
+                smelter_ids = [r[0] for r in cur.fetchall()]
+                if not smelter_ids:
+                    raise ValueError("没有可用的冶炼厂，请先在 dict_factories 中维护启用冶炼厂")
+
+                wh_ph = ",".join(["%s"] * len(warehouse_ids))
+                sm_ph = ",".join(["%s"] * len(smelter_ids))
+                cat_ph = ",".join(["%s"] * len(category_ids))
+
                 # 仓库名称
                 cur.execute(
                     f"SELECT id, name FROM dict_warehouses WHERE id IN ({wh_ph})",
@@ -1125,44 +1155,44 @@ class TLService:
             for cid in category_ids:
                 price_map[(fid, cid)] = resolve_price(fid, cid)
 
-        # 构造结构化数据：以需求为主体，报价统一（不含仓库），各仓库运费嵌套对比
+        # 构造结构化数据：每条需求 × 全部冶炼厂，报价与各仓库运费对比
         demand_rows = []
         raw = []
         for d in demands:
-            fid = d["smelter_id"]
             cid = d["category_id"]
-            fname = factory_name_map.get(fid, f"冶炼厂{fid}")
-            cat_name = cat_name_map.get(cid, f"品类{cid}")
-            price = price_map.get((fid, cid))
             demand_tons = d["demand"]
+            for fid in smelter_ids:
+                fname = factory_name_map.get(fid, f"冶炼厂{fid}")
+                cat_name = cat_name_map.get(cid, f"品类{cid}")
+                price = price_map.get((fid, cid))
 
-            warehouse_options = []
-            for wid in warehouse_ids:
-                wname = warehouse_name_map.get(wid, f"仓库{wid}")
-                freight = freight_map.get((wid, fid))
-                total_cost = (price + freight) if (price is not None and freight is not None) else None
-                warehouse_options.append({
-                    "仓库": wname,
-                    "运费(元/吨)": freight,
-                    "综合成本(元/吨)": total_cost,
-                })
-                raw.append({
+                warehouse_options = []
+                for wid in warehouse_ids:
+                    wname = warehouse_name_map.get(wid, f"仓库{wid}")
+                    freight = freight_map.get((wid, fid))
+                    total_cost = (price + freight) if (price is not None and freight is not None) else None
+                    warehouse_options.append({
+                        "仓库": wname,
+                        "运费(元/吨)": freight,
+                        "综合成本(元/吨)": total_cost,
+                    })
+                    raw.append({
+                        "冶炼厂": fname,
+                        "品类": cat_name,
+                        "需求吨数": demand_tons,
+                        "报价(元/吨)": price,
+                        "仓库": wname,
+                        "运费(元/吨)": freight,
+                        "综合成本(元/吨)": total_cost,
+                    })
+
+                demand_rows.append({
                     "冶炼厂": fname,
                     "品类": cat_name,
-                    "需求吨数": demand_tons,
+                    "需求吨数(吨)": demand_tons,
                     "报价(元/吨)": price,
-                    "仓库": wname,
-                    "运费(元/吨)": freight,
-                    "综合成本(元/吨)": total_cost,
+                    "各仓库运费对比": warehouse_options,
                 })
-
-            demand_rows.append({
-                "冶炼厂": fname,
-                "品类": cat_name,
-                "需求吨数(吨)": demand_tons,
-                "报价(元/吨)": price,
-                "各仓库运费对比": warehouse_options,
-            })
 
         # 构造 prompt，调用 Claude
         import json

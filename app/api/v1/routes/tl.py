@@ -4,6 +4,7 @@ TL比价模块路由
 包含接口：
   0. POST /tl/add_warehouse            - 添加仓库（不存在则新建）
   1. GET  /tl/get_warehouses           - 获取仓库列表
+  1c.DELETE /tl/delete_warehouse        - 删除仓库（软删除）
   2. GET  /tl/get_smelters             - 获取冶炼厂列表
   3. GET  /tl/get_categories           - 获取品类列表
   4. POST /tl/get_comparison           - 获取比价表
@@ -55,6 +56,21 @@ def get_warehouses(service: TLService = Depends(get_tl_service)):
     try:
         data = service.get_warehouses()
         return {"code": 200, "data": data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ===================== 接口1c：删除仓库 =====================
+
+@router.delete("/delete_warehouse", summary="删除仓库（软删除）")
+def delete_warehouse(
+    warehouse_id: int,
+    service: TLService = Depends(get_tl_service),
+):
+    try:
+        return service.delete_warehouse(warehouse_id=warehouse_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
