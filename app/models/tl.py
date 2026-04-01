@@ -31,6 +31,11 @@ class AddSmelterRequest(BaseModel):
     冶炼厂名: str = Field(..., description="冶炼厂名称")
 
 
+class UploadVarietyRequest(BaseModel):
+    """上传品种（单条，与上传运费相同可传列表批量）"""
+    品种名: str = Field(..., description="品种名称，写入 dict_categories")
+
+
 class UpdateSmelterRequest(BaseModel):
     """修改冶炼厂请求体"""
     冶炼厂id: int = Field(..., description="冶炼厂ID")

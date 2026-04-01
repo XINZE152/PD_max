@@ -291,6 +291,90 @@ class TLService:
             logger.error(f"获取品类列表失败: {e}")
             raise
 
+    # ==================== 接口3b：上传品种 ====================
+
+    def upload_variety(self, items: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        批量维护品种（dict_categories）：不存在则新建分组并 is_main=1；
+        名称已存在且启用则跳过；已存在但停用则恢复启用。
+        """
+        if not items:
+            raise ValueError("品种数据不能为空")
+
+        seen: set[str] = set()
+        names: List[str] = []
+        for item in items:
+            raw = item.get("品种名")
+            if raw is None:
+                continue
+            n = str(raw).strip()
+            if not n:
+                continue
+            if len(n) > 50:
+                raise ValueError(f"品种名长度不能超过50字符: {n[:30]}…")
+            if n in seen:
+                continue
+            seen.add(n)
+            names.append(n)
+
+        if not names:
+            raise ValueError("无有效的品种名")
+
+        created = existed = reactivated = 0
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    for n in names:
+                        cur.execute(
+                            "SELECT row_id, category_id, is_active "
+                            "FROM dict_categories WHERE name = %s",
+                            (n,),
+                        )
+                        row = cur.fetchone()
+                        if row:
+                            _rid, _cid, is_active = row
+                            if is_active == 1:
+                                existed += 1
+                            else:
+                                cur.execute(
+                                    "UPDATE dict_categories SET is_active = 1 WHERE row_id = %s",
+                                    (_rid,),
+                                )
+                                reactivated += 1
+                        else:
+                            cur.execute(
+                                "SELECT COALESCE(MAX(category_id), 0) + 1 FROM dict_categories"
+                            )
+                            new_cat_id = cur.fetchone()[0]
+                            cur.execute(
+                                "INSERT INTO dict_categories "
+                                "(category_id, name, is_main, is_active) "
+                                "VALUES (%s, %s, 1, 1)",
+                                (new_cat_id, n),
+                            )
+                            created += 1
+
+            parts = []
+            if created:
+                parts.append(f"新建 {created} 个")
+            if existed:
+                parts.append(f"已存在 {existed} 个")
+            if reactivated:
+                parts.append(f"恢复启用 {reactivated} 个")
+            msg = "、".join(parts) if parts else "无变更"
+            return {
+                "code": 200,
+                "msg": f"品种已处理：{msg}",
+                "新建": created,
+                "已存在": existed,
+                "恢复启用": reactivated,
+            }
+        except ValueError:
+            raise
+        except Exception as e:
+            logger.error(f"上传品种失败: {e}")
+            raise
+
     # ==================== 接口4：获取比价表 ====================
     def get_comparison(
         self,

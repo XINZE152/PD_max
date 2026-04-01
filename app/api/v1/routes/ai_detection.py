@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
@@ -10,19 +12,20 @@ from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import cv2
 import numpy as np
-import torch
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 from PIL import Image, ImageDraw, ImageFont
 
-from app.ai_detection.inference_api import InferenceEngineAPI
 from app.config import UPLOAD_DIR
+
+if TYPE_CHECKING:
+    from app.ai_detection.inference_api import InferenceEngineAPI
 
 logger = logging.getLogger(__name__)
 
@@ -188,6 +191,8 @@ async def ensure_ai_detection_runtime() -> None:
         if EngineContainer.instance is not None and EngineContainer.ocr_reader is not None:
             return
 
+        import torch
+
         device = "cuda" if torch.cuda.is_available() else "cpu"
         logger.info("Loading AI detection runtime on %s (first use; may download EasyOCR models)", device)
         try:
@@ -202,6 +207,8 @@ async def ensure_ai_detection_runtime() -> None:
             ["ch_sim", "en"],
             gpu=(device == "cuda"),
         )
+        from app.ai_detection.inference_api import InferenceEngineAPI
+
         EngineContainer.instance = await run_in_threadpool(InferenceEngineAPI, "config.yaml")
         logger.info("AI detection runtime ready")
 

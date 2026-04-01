@@ -9,6 +9,7 @@ TL比价模块路由
   1d.POST /tl/add_smelter              - 新建冶炼厂
   2. GET  /tl/get_smelters             - 获取冶炼厂列表
   3. GET  /tl/get_categories           - 获取品类列表
+  3b.POST /tl/upload_variety           - 上传品种（批量写入 dict_categories）
   4. POST /tl/get_comparison           - 获取比价表
   5. POST /tl/upload_price_table       - 上传价格表（OCR识别，返回原始识别结果）
   5b.POST /tl/confirm_price_table      - 确认写入报价数据（自动新建缺失冶炼厂/品类）
@@ -34,6 +35,7 @@ from app.models.tl import (
     AddWarehouseRequest,
     UpdateWarehouseRequest,
     AddSmelterRequest,
+    UploadVarietyRequest,
     UpdateSmelterRequest,
     PurchaseSuggestionRequest,
     VlmFullData,
@@ -187,6 +189,23 @@ def get_categories(service: TLService = Depends(get_tl_service)):
     try:
         data = service.get_categories()
         return {"code": 200, "data": data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ===================== 接口3b：上传品种 =====================
+
+@router.post("/upload_variety", summary="上传品种")
+def upload_variety(
+    body: List[UploadVarietyRequest],
+    service: TLService = Depends(get_tl_service),
+):
+    """批量提交品种名：新建品类分组、已存在则跳过、停用则恢复启用（与报价确认时新建品类规则一致）。"""
+    try:
+        items = [item.model_dump() for item in body]
+        return service.upload_variety(items)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
