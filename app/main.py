@@ -37,34 +37,31 @@ app.include_router(api_router)
 async def log_http_requests(request: Request, call_next):
     start_time = time.perf_counter()
     client_host = request.client.host if request.client else "-"
-    query = request.url.query or "-"
-    user_agent = request.headers.get("user-agent", "-")
+    path = request.url.path
+    if request.url.query:
+        path = f"{path}?{request.url.query}"
 
     try:
         response = await call_next(request)
     except Exception:
         elapsed_ms = (time.perf_counter() - start_time) * 1000
         access_logger.exception(
-            "REQ %s %s query=%s client=%s ua=%s status=500 duration_ms=%.2f",
+            "%s %s 500 %.0fms %s",
             request.method,
-            request.url.path,
-            query,
-            client_host,
-            user_agent,
+            path,
             elapsed_ms,
+            client_host,
         )
         raise
 
     elapsed_ms = (time.perf_counter() - start_time) * 1000
     access_logger.info(
-        "REQ %s %s query=%s client=%s ua=%s status=%s duration_ms=%.2f",
+        "%s %s %s %.0fms %s",
         request.method,
-        request.url.path,
-        query,
-        client_host,
-        user_agent,
+        path,
         response.status_code,
         elapsed_ms,
+        client_host,
     )
     return response
 

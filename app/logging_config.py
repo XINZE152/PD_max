@@ -11,6 +11,20 @@ from app.paths import PROJECT_ROOT
 _handlers_installed = False
 
 
+def _short_logger_name(name: str) -> str:
+    """日志里只保留模块短名，避免 app.services.xxx 占满一行。"""
+    n = name[4:] if name.startswith("app.") else name
+    return n.rsplit(".", 1)[-1]
+
+
+class _CompactFormatter(logging.Formatter):
+    """asctime 不含毫秒；每条：时间 级别 短logger名 消息。"""
+
+    def format(self, record: logging.LogRecord) -> str:
+        record.log_short = _short_logger_name(record.name)
+        return super().format(record)
+
+
 def _parse_log_level(value: str) -> int:
     level_name = (value or "INFO").upper().strip()
     return getattr(logging, level_name, logging.INFO)
@@ -56,8 +70,9 @@ def setup_logging() -> None:
     if _handlers_installed:
         return
 
-    formatter = logging.Formatter(
-        "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+    formatter = _CompactFormatter(
+        fmt="%(asctime)s %(levelname)s %(log_short)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
     )
 
     if _env_flag("LOG_ENABLE_CONSOLE", default=True):
@@ -84,9 +99,15 @@ def setup_logging() -> None:
         root_logger.addHandler(stream_handler)
 
     _handlers_installed = True
+
+    # 第三方 HTTP 客户端默认 INFO 会刷屏，一般只需告警以上
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+
     cfg = logging.getLogger(__name__)
     cfg.info(
-        "日志初始化完成 | stderr=%s | 文件=%s",
-        any(isinstance(h, logging.StreamHandler) for h in root_logger.handlers),
-        log_file or "（无）",
+        "日志就绪 console=%s file=%s",
+        _env_flag("LOG_ENABLE_CONSOLE", default=True),
+        log_file or "-",
     )
