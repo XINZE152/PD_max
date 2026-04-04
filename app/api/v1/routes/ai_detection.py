@@ -24,6 +24,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from PIL import Image, ImageDraw, ImageFont
 
 from app.config import UPLOAD_DIR
+from app.ai_detection.runtime_assets import get_easyocr_reader_kwargs
 
 if TYPE_CHECKING:
     from app.ai_detection.inference_api import InferenceEngineAPI
@@ -228,16 +229,18 @@ async def startup_ai_detection() -> None:
 
 def _create_easyocr_reader(use_gpu: bool):
     """
-    EasyOCR 首次运行会从 GitHub 下载检测/识别模型；网络不稳时易触发 RemoteDisconnected。
-    短暂重试可缓解偶发断连；离线可把模型放到 EASYOCR_MODULE_PATH/model/ 并保证与 easyocr 版本匹配。
+    EasyOCR 首次运行可能从网络拉取模型；网络不稳时易触发 RemoteDisconnected。
+    短暂重试可缓解偶发断连。模型目录等见 runtime_assets（AI_EASYOCR_MODEL_DIR 等）；
+    若设置 EASYOCR_MODULE_PATH，则覆盖为 {path}/model/。
     """
     import easyocr
 
-    model_dir = os.getenv("EASYOCR_MODULE_PATH", "").strip() or None
-    kwargs: Dict[str, Any] = {"gpu": use_gpu, "verbose": False}
+    kwargs: Dict[str, Any] = dict(get_easyocr_reader_kwargs(gpu=use_gpu, verbose=False))
+    model_dir = os.getenv("EASYOCR_MODULE_PATH", "").strip()
     if model_dir:
-        kwargs["model_storage_directory"] = os.path.join(model_dir, "model")
-        Path(kwargs["model_storage_directory"]).mkdir(parents=True, exist_ok=True)
+        mdir = os.path.join(model_dir, "model")
+        Path(mdir).mkdir(parents=True, exist_ok=True)
+        kwargs["model_storage_directory"] = mdir
 
     last_err: Optional[BaseException] = None
     for attempt in range(3):
@@ -362,17 +365,14 @@ class DetectionService:
 class DetectionDomainServiceV3:
     def __init__(
         self,
-        engine: InferenceEngineAPI,
         registry: AbstractTaskRegistry,
-        ocr_reader: Any,
         semaphore: asyncio.Semaphore,
     ):
-        self.engine = engine
         self.registry = registry
-        self.ocr_reader = ocr_reader
         self.semaphore = semaphore
 
-    def _easyocr_auto_detect(self, image_path: str) -> List[BBoxDTO]:
+    @staticmethod
+    def _easyocr_auto_detect(image_path: str, ocr_reader: Any) -> List[BBoxDTO]:
         img_cv2 = cv2.imdecode(np.fromfile(image_path, dtype=np.uint8), cv2.IMREAD_COLOR)
         if img_cv2 is None:
             return []
@@ -380,7 +380,7 @@ class DetectionDomainServiceV3:
         gray = cv2.cvtColor(img_cv2, cv2.COLOR_BGR2GRAY)
         blurred = cv2.medianBlur(gray, 3)
 
-        ocr_results = self.ocr_reader.readtext(
+        ocr_results = ocr_reader.readtext(
             blurred,
             adjust_contrast=0.5,
             mag_ratio=2.0,
@@ -414,10 +414,16 @@ class DetectionDomainServiceV3:
         await self.registry.update_task(task_id, status=TaskStatusEnum.PROCESSING)
 
         try:
+            await ensure_ai_detection_runtime()
+            engine = EngineContainer.instance
+            ocr_reader = EngineContainer.ocr_reader
+            if not engine or not ocr_reader:
+                raise RuntimeError("AI detection runtime unavailable")
+
             if bbox:
                 bbox_list = [bbox.x1, bbox.y1, bbox.x2, bbox.y2]
                 async with self.semaphore:
-                    res_str = await run_in_threadpool(self.engine.predict, image_path, bbox_list)
+                    res_str = await run_in_threadpool(engine.predict, image_path, bbox_list)
 
                 res_dict = json.loads(res_str)
                 if res_dict.get("result") == "错误":
@@ -428,7 +434,7 @@ class DetectionDomainServiceV3:
                 return
 
             async with self.semaphore:
-                bboxes = await run_in_threadpool(self._easyocr_auto_detect, image_path)
+                bboxes = await run_in_threadpool(self._easyocr_auto_detect, image_path, ocr_reader)
 
             if not bboxes:
                 empty_res = {"result": "正常", "confidence": 0.0, "reason": "未发现关键数值或单号区域"}
@@ -440,7 +446,7 @@ class DetectionDomainServiceV3:
                 try:
                     b_list = [b.x1, b.y1, b.x2, b.y2]
                     async with self.semaphore:
-                        res_str = await run_in_threadpool(self.engine.predict, image_path, b_list)
+                        res_str = await run_in_threadpool(engine.predict, image_path, b_list)
 
                     res_dict = json.loads(res_str)
                     if res_dict.get("result") != "错误":
@@ -617,7 +623,7 @@ async def detect_tampering_endpoint(
         '  "task_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"\n'
         "}\n"
         "```\n\n"
-        "**说明**：首次调用会加载 OCR 与模型，可能较慢。\n"
+        "**说明**：若未预加载 OCR 与模型，后台任务会在首次执行时再加载；接口本身会优先返回 `task_id`。\n"
     ),
     response_description="受理后返回 pending 与 task_id",
 )
@@ -630,9 +636,7 @@ async def submit_detection(
         description="可选。指定框 [x1,y1,x2,y2]；不传则自动 OCR 多框检测",
         examples=["[120,80,400,140]"],
     ),
-    engine: InferenceEngineAPI = Depends(get_engine),
     registry: AbstractTaskRegistry = Depends(get_registry),
-    ocr_reader: Any = Depends(get_ocr_reader),
     semaphore: asyncio.Semaphore = Depends(get_ai_semaphore),
 ):
     if file:
@@ -659,7 +663,7 @@ async def submit_detection(
             raise HTTPException(status_code=400, detail="bbox 格式无效，请使用 [x1,y1,x2,y2] 或 x1,y1,x2,y2")
 
     await registry.update_task(task_id, status=TaskStatusEnum.PENDING)
-    service = DetectionDomainServiceV3(engine, registry, ocr_reader, semaphore)
+    service = DetectionDomainServiceV3(registry, semaphore)
     background_tasks.add_task(service.execute_async, task_id, task.image_path, bbox_dto)
     return {"status": "pending", "task_id": task_id}
 
@@ -725,12 +729,10 @@ async def get_result(task_id: str, registry: AbstractTaskRegistry = Depends(get_
 )
 async def get_visualization(
     task_id: str,
-    engine: InferenceEngineAPI = Depends(get_engine),
     registry: AbstractTaskRegistry = Depends(get_registry),
-    ocr_reader: Any = Depends(get_ocr_reader),
     semaphore: asyncio.Semaphore = Depends(get_ai_semaphore),
 ):
-    service = DetectionDomainServiceV3(engine, registry, ocr_reader, semaphore)
+    service = DetectionDomainServiceV3(registry, semaphore)
     try:
         vis_path = await service.generate_visualization(task_id)
         return FileResponse(vis_path, media_type="image/jpeg")

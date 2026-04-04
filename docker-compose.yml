@@ -13,7 +13,10 @@ services:
       - mysql_data:/var/lib/mysql
 
   backend:
-    build: .
+    build:
+      context: .
+      args:
+        PRELOAD_AI_ASSETS: ${PRELOAD_AI_ASSETS:-1}
     container_name: my-backend
     ports:
       - "8000:8000"
@@ -21,6 +24,13 @@ services:
       - mysql
     environment:
       PORT: 8000
+      AI_DETECTION_PRELOAD: ${AI_DETECTION_PRELOAD}
+      AI_MAX_CONCURRENT_TASKS: ${AI_MAX_CONCURRENT_TASKS}
+      AI_GC_MAX_AGE_HOURS: ${AI_GC_MAX_AGE_HOURS}
+      AI_GC_INTERVAL_SECONDS: ${AI_GC_INTERVAL_SECONDS}
+      AI_EASYOCR_MODEL_DIR: ${AI_EASYOCR_MODEL_DIR}
+      AI_EASYOCR_DOWNLOAD_ENABLED: ${AI_EASYOCR_DOWNLOAD_ENABLED}
+      TORCH_HOME: ${TORCH_HOME}
       MYSQL_HOST: mysql
       MYSQL_PORT: 3306
       MYSQL_USER: root

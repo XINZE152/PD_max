@@ -18,6 +18,15 @@ docker compose version
 docker build -t my-backend .
 ```
 
+说明：
+- 当前 Dockerfile 已改为使用 `uv sync` 安装依赖，并通过 `uv run --no-sync app.py` 启动。
+- 构建阶段默认会预下载 EasyOCR 与 ResNet 权重，避免服务器首个请求冷启动时现场下载模型。
+- 若构建机无法联网，可临时关闭预下载：
+
+```bash
+docker build --build-arg PRELOAD_AI_ASSETS=0 -t my-backend .
+```
+
 ---
 
 ## 三、启动（手动传入配置）
@@ -48,6 +57,11 @@ docker run -d \
   --name my-backend \
   --network mynet \
   -p 8000:8000 \
+  -e PORT=8000 \
+  -e AI_DETECTION_PRELOAD=1 \
+  -e AI_EASYOCR_MODEL_DIR=/opt/ai-assets/easyocr \
+  -e AI_EASYOCR_DOWNLOAD_ENABLED=0 \
+  -e TORCH_HOME=/opt/ai-assets/torch \
   -e MYSQL_HOST=mysql-lite \
   -e MYSQL_PORT=3306 \
   -e MYSQL_USER=root \
@@ -180,3 +194,24 @@ docker volume inspect mysql_data
 - 后端 API：http://localhost:8000
 - Swagger 文档：http://localhost:8000/docs
 - ReDoc 文档：http://localhost:8000/redoc
+
+---
+
+## 九、避免 AI 冷启动
+
+若服务器此前出现“首次检测等待 10 分钟以上仍不返回”，通常是容器在运行时下载 EasyOCR / torchvision 权重，或外网访问模型源受限。
+
+推荐配置：
+
+```bash
+export AI_DETECTION_PRELOAD=1
+export AI_EASYOCR_MODEL_DIR=/opt/ai-assets/easyocr
+export AI_EASYOCR_DOWNLOAD_ENABLED=0
+export TORCH_HOME=/opt/ai-assets/torch
+docker compose up -d --build
+```
+
+排查建议：
+- 先看构建日志，确认镜像构建阶段已执行 `scripts/preload_ai_assets.py`
+- 再看容器日志，若仍出现 “may download EasyOCR models”，说明运行时目录没有命中预热缓存
+- 若前面有 Nginx / SLB，仍需将 `proxy_read_timeout` / `proxy_send_timeout` 至少调到 `300s`
