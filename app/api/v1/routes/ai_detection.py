@@ -38,31 +38,76 @@ GC_INTERVAL_SECONDS = int(os.getenv("AI_GC_INTERVAL_SECONDS", "3600"))
 
 
 class TaskStatusEnum(str, Enum):
-    UPLOADED = "UPLOADED"
-    PENDING = "PENDING"
-    PROCESSING = "PROCESSING"
-    COMPLETED = "COMPLETED"
-    FAILED = "FAILED"
-    CANCELED = "CANCELED"
+    """异步任务状态（鉴伪队列）。"""
+
+    UPLOADED = "UPLOADED"  # 图片已落盘
+    PENDING = "PENDING"  # 已排队待处理
+    PROCESSING = "PROCESSING"  # 推理中
+    COMPLETED = "COMPLETED"  # 已完成
+    FAILED = "FAILED"  # 失败
+    CANCELED = "CANCELED"  # 已取消
 
 
 class BBoxDTO(BaseModel):
-    x1: int = Field(ge=0)
-    y1: int = Field(ge=0)
-    x2: int = Field(gt=0)
-    y2: int = Field(gt=0)
+    """检测区域：左上角 (x1,y1)、右下角 (x2,y2)，像素坐标，原点在图像左上角。"""
+
+    x1: int = Field(ge=0, description="区域左上角 x（像素）")
+    y1: int = Field(ge=0, description="区域左上角 y（像素）")
+    x2: int = Field(gt=0, description="区域右下角 x（像素），须大于 x1")
+    y2: int = Field(gt=0, description="区域右下角 y（像素），须大于 y1")
     model_config = ConfigDict(strict=True)
 
 
 class TaskRecordDTO(BaseModel):
-    task_id: str
-    status: TaskStatusEnum
-    created_at: str
-    image_path: Optional[str] = None
-    bbox: Optional[BBoxDTO] = None
-    result: Optional[Dict[str, Any]] = None
-    multi_results: Optional[List[Dict[str, Any]]] = None
-    error_msg: Optional[str] = None
+    """异步鉴伪任务记录（查询结果接口返回体）。"""
+
+    task_id: str = Field(description="任务 ID（UUID）")
+    status: TaskStatusEnum = Field(description="任务状态")
+    created_at: str = Field(description="创建时间（ISO8601）")
+    image_path: Optional[str] = Field(None, description="服务端保存的原图路径（仅调试/内部用）")
+    bbox: Optional[BBoxDTO] = Field(None, description="用户指定的检测框；未传则后台自动 OCR 找数字区域")
+    result: Optional[Dict[str, Any]] = Field(
+        None,
+        description="单框检测结果：含 result / confidence / bbox / reason 等，见接口说明中的输出样例",
+    )
+    multi_results: Optional[List[Dict[str, Any]]] = Field(
+        None,
+        description="多框检测时，每个框一条结果列表；单框成功时一般为 null",
+    )
+    error_msg: Optional[str] = Field(None, description="失败时的错误信息")
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "task_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+                    "status": "COMPLETED",
+                    "created_at": "2026-04-03T10:00:00",
+                    "image_path": "/path/to/uploads/ai_detection_storage/a1b2....jpg",
+                    "bbox": {"x1": 120, "y1": 80, "x2": 400, "y2": 140},
+                    "result": {
+                        "result": "正常",
+                        "confidence": 0.32,
+                        "bbox": [120, 80, 280, 60],
+                        "reason": "未检出明显篡改痕迹",
+                        "original_bbox": [120, 80, 400, 140],
+                    },
+                    "multi_results": None,
+                    "error_msg": None,
+                },
+                {
+                    "task_id": "b2c3d4e5-f6a7-8901-bcde-f12345678901",
+                    "status": "PENDING",
+                    "created_at": "2026-04-03T10:01:00",
+                    "image_path": "/path/to/uploads/ai_detection_storage/b2c3....jpg",
+                    "bbox": None,
+                    "result": None,
+                    "multi_results": None,
+                    "error_msg": None,
+                },
+            ]
+        }
+    )
 
 
 class AbstractTaskRegistry(ABC):
@@ -440,13 +485,67 @@ class DetectionDomainServiceV3:
         return str(vis_path)
 
 
-router = APIRouter(prefix="/ai-detection", tags=["AI鉴伪模块"])
+router = APIRouter(
+    prefix="/ai-detection",
+    tags=["AI鉴伪模块"],
+)
 
 
-@router.post("/api/v1/image-detection/detect")
+_DETECT_RESULT_SCHEMA = (
+    "引擎返回的 `data` / `result` 中单条结构示例：\n"
+    "```json\n"
+    "{\n"
+    '  "result": "正常",\n'
+    '  "confidence": 0.32,\n'
+    '  "bbox": [120, 80, 280, 60],\n'
+    '  "reason": "未检出明显篡改痕迹"\n'
+    "}\n"
+    "```\n"
+    "- **result**：`正常` | `可疑` | `篡改` | `错误`\n"
+    "- **confidence**：综合风险 0~1，越高越可疑\n"
+    "- **bbox**：引擎实际使用的 ROI（x, y, 宽, 高）\n"
+    "- **reason**：中文简要说明；异步任务成功时可能另含 **original_bbox**（用户传入的四点框）\n"
+)
+
+
+@router.post(
+    "/api/v1/image-detection/detect",
+    summary="单图单框鉴伪（同步）",
+    description=(
+        "上传一张图片并指定一个矩形检测区域，**同步**返回鉴伪结果。适合低延迟、单区域场景。\n\n"
+        "**请求方式**：`multipart/form-data`\n\n"
+        "**输入参数**\n"
+        "- **file**：图片文件（如 JPG/PNG）\n"
+        "- **bbox**：字符串。支持 JSON 数组 `[x1,y1,x2,y2]` 或英文逗号分隔 `x1,y1,x2,y2`（均为像素，"
+        "左上角到右下角）\n\n"
+        "**输出说明**\n"
+        "- 成功：`{ \"status\": \"success\", \"data\": { ...引擎结果... } }`\n"
+        "- 业务失败（引擎报「错误」）：HTTP 422，`{ \"status\": \"error\", \"message\": \"...\" }`\n\n"
+        "**输入示例（表单字段）**\n"
+        "- `bbox`: `[100,50,500,200]` 或 `100,50,500,200`\n\n"
+        "**输出示例（成功）**\n"
+        "```json\n"
+        "{\n"
+        '  "status": "success",\n'
+        '  "data": {\n'
+        '    "result": "可疑",\n'
+        '    "confidence": 0.58,\n'
+        '    "bbox": [100, 50, 400, 150],\n'
+        '    "reason": "存在局部边缘拼接/像素涂抹痕迹"\n'
+        "  }\n"
+        "}\n"
+        "```\n\n"
+        + _DETECT_RESULT_SCHEMA
+    ),
+    response_description="成功时为 JSON；引擎判定为错误时返回 422 JSON",
+)
 async def detect_tampering_endpoint(
-    file: UploadFile = File(...),
-    bbox: str = Form(...),
+    file: UploadFile = File(..., description="待检测图片文件"),
+    bbox: str = Form(
+        ...,
+        description="检测框：JSON 数组 [x1,y1,x2,y2] 或逗号分隔的四个整数",
+        examples=["[120,80,400,140]", "120,80,400,140"],
+    ),
     engine: InferenceEngineAPI = Depends(get_engine),
     semaphore: asyncio.Semaphore = Depends(get_ai_semaphore),
 ):
@@ -456,7 +555,7 @@ async def detect_tampering_endpoint(
         if len(bbox_parsed) != 4:
             raise ValueError
     except Exception:
-        raise HTTPException(status_code=400, detail="Invalid bbox format.")
+        raise HTTPException(status_code=400, detail="bbox 格式无效，请使用 [x1,y1,x2,y2] 或 x1,y1,x2,y2")
 
     try:
         res = await DetectionService.process_detection(file, [int(x) for x in bbox_parsed], engine, semaphore)
@@ -465,12 +564,37 @@ async def detect_tampering_endpoint(
         return JSONResponse(status_code=422, content={"status": "error", "message": str(exc)})
 
 
-@router.post("/api/v3/detect", summary="提交检测任务")
+@router.post(
+    "/api/v3/detect",
+    summary="提交鉴伪任务（异步）",
+    description=(
+        "上传图片创建任务，在后台执行鉴伪；立即返回 **task_id**，再通过「查询结果」轮询。\n\n"
+        "**请求方式**：`multipart/form-data`\n\n"
+        "**输入（二选一）**\n"
+        "1. 上传 **file**：新建任务，自动生成 `task_id` 并保存图片。\n"
+        "2. 仅传 **task_id**：对已有任务重新触发排队（一般与上传二选一）。\n\n"
+        "可选 **bbox**：与 v1 相同格式；**不传**则使用 EasyOCR 自动框选图中疑似单号/金额等数字区域，"
+        "对每个框分别推理，结果在 `multi_results` 中。\n\n"
+        "**输出示例（受理成功）**\n"
+        "```json\n"
+        "{\n"
+        '  "status": "pending",\n'
+        '  "task_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"\n'
+        "}\n"
+        "```\n\n"
+        "**说明**：首次调用会加载 OCR 与模型，可能较慢。\n"
+    ),
+    response_description="受理后返回 pending 与 task_id",
+)
 async def submit_detection(
     background_tasks: BackgroundTasks,
-    task_id: Optional[str] = Form(None),
-    file: Optional[UploadFile] = File(None),
-    bbox: Optional[str] = Form(None),
+    task_id: Optional[str] = Form(None, description="已有任务 ID（与 file 二选一）"),
+    file: Optional[UploadFile] = File(None, description="待检测图片；上传则创建新任务"),
+    bbox: Optional[str] = Form(
+        None,
+        description="可选。指定框 [x1,y1,x2,y2]；不传则自动 OCR 多框检测",
+        examples=["[120,80,400,140]"],
+    ),
     engine: InferenceEngineAPI = Depends(get_engine),
     registry: AbstractTaskRegistry = Depends(get_registry),
     ocr_reader: Any = Depends(get_ocr_reader),
@@ -483,11 +607,11 @@ async def submit_detection(
             shutil.copyfileobj(file.file, buffer)
         await registry.create_task(task_id, str(file_path))
     elif not task_id:
-        raise HTTPException(status_code=400, detail="Must provide task_id or file.")
+        raise HTTPException(status_code=400, detail="必须提供上传文件 file，或已有任务的 task_id")
 
     task = await registry.get_task(task_id)
     if not task:
-        raise HTTPException(status_code=404, detail="Task not found.")
+        raise HTTPException(status_code=404, detail="任务不存在")
 
     bbox_dto = None
     if bbox:
@@ -497,7 +621,7 @@ async def submit_detection(
                 raise ValueError
             bbox_dto = BBoxDTO(x1=arr[0], y1=arr[1], x2=arr[2], y2=arr[3])
         except Exception:
-            raise HTTPException(status_code=400, detail="Invalid bbox format.")
+            raise HTTPException(status_code=400, detail="bbox 格式无效，请使用 [x1,y1,x2,y2] 或 x1,y1,x2,y2")
 
     await registry.update_task(task_id, status=TaskStatusEnum.PENDING)
     service = DetectionDomainServiceV3(engine, registry, ocr_reader, semaphore)
@@ -505,15 +629,65 @@ async def submit_detection(
     return {"status": "pending", "task_id": task_id}
 
 
-@router.get("/api/v3/result/{task_id}", response_model=TaskRecordDTO)
+@router.get(
+    "/api/v3/result/{task_id}",
+    response_model=TaskRecordDTO,
+    summary="查询鉴伪任务结果",
+    description=(
+        "根据 **task_id** 查询异步任务状态与结果。\n\n"
+        "**路径参数**：`task_id` — 提交任务时返回的 UUID。\n\n"
+        "**输出说明**\n"
+        "- `status` 为 `COMPLETED` 时：`result`（单框）或 `multi_results`（多框）有值。\n"
+        "- `FAILED` 时查看 `error_msg`。\n"
+        "- `PENDING` / `PROCESSING` 时请稍后重试。\n\n"
+        "**输出示例（多框自动检测）**\n"
+        "```json\n"
+        "{\n"
+        '  "task_id": "...",\n'
+        '  "status": "COMPLETED",\n'
+        '  "created_at": "2026-04-03T10:00:00",\n'
+        '  "result": null,\n'
+        '  "multi_results": [\n'
+        "    {\n"
+        '      "result": "正常",\n'
+        '      "confidence": 0.25,\n'
+        '      "bbox": [10, 20, 100, 30],\n'
+        '      "reason": "未检出明显篡改痕迹",\n'
+        '      "original_bbox": [10, 20, 110, 50]\n'
+        "    }\n"
+        "  ],\n"
+        '  "error_msg": null\n'
+        "}\n"
+        "```\n\n"
+        + _DETECT_RESULT_SCHEMA
+    ),
+    response_description="任务记录 JSON，结构见下方 Schema 与示例",
+)
 async def get_result(task_id: str, registry: AbstractTaskRegistry = Depends(get_registry)):
     task = await registry.get_task(task_id)
     if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
+        raise HTTPException(status_code=404, detail="任务不存在")
     return task
 
 
-@router.get("/api/v3/result/{task_id}/visualization")
+@router.get(
+    "/api/v3/result/{task_id}/visualization",
+    summary="获取鉴伪可视化图",
+    description=(
+        "任务状态为 **COMPLETED** 后，生成并在原图上绘制检测框与风险标签的 JPEG 图。\n\n"
+        "**路径参数**：`task_id`\n\n"
+        "**成功响应**：`image/jpeg` 二进制流（非 JSON）。\n\n"
+        "**失败示例**：HTTP 400，JSON `{\"detail\": \"...\"}`（如任务未完成）。\n"
+    ),
+    response_class=FileResponse,
+    responses={
+        200: {
+            "content": {"image/jpeg": {}},
+            "description": "带框与文字标注的结果图",
+        },
+        400: {"description": "任务未完成或无法生成图"},
+    },
+)
 async def get_visualization(
     task_id: str,
     engine: InferenceEngineAPI = Depends(get_engine),
@@ -529,11 +703,22 @@ async def get_visualization(
         raise HTTPException(status_code=400, detail=str(exc))
 
 
-@router.delete("/api/v3/task/{task_id}")
+@router.delete(
+    "/api/v3/task/{task_id}",
+    summary="取消或删除鉴伪任务",
+    description=(
+        "若任务仍为 **UPLOADED** / **PENDING**，则标记为 **CANCELED**；否则删除任务记录并清理临时图片。\n\n"
+        "**输出示例**\n"
+        "```json\n"
+        "{ \"status\": \"success\" }\n"
+        "```\n"
+    ),
+    response_description="固定返回 success 状态",
+)
 async def cancel_task(task_id: str, registry: AbstractTaskRegistry = Depends(get_registry)):
     task = await registry.get_task(task_id)
     if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
+        raise HTTPException(status_code=404, detail="任务不存在")
 
     if task.status in [TaskStatusEnum.PENDING, TaskStatusEnum.UPLOADED]:
         await registry.update_task(task_id, status=TaskStatusEnum.CANCELED)

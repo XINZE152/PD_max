@@ -165,7 +165,7 @@ TABLE_STATEMENTS = [
         factory_id INT NOT NULL COMMENT '冶炼厂ID',
         category_name VARCHAR(100) NOT NULL COMMENT '品类名称（关联dict_categories.name）',
         metadata_id INT COMMENT '关联报价表元数据ID',
-        unit_price DECIMAL(10, 2) COMMENT '普通单价（元/吨）',
+        unit_price DECIMAL(10, 2) COMMENT '不含税基准价（元/吨）',
         price_1pct_vat DECIMAL(10, 2) COMMENT '1%增值税价格',
         price_3pct_vat DECIMAL(10, 2) COMMENT '3%增值税价格',
         price_13pct_vat DECIMAL(10, 2) COMMENT '13%增值税价格',

@@ -14,6 +14,14 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from app.config import UPLOAD_DIR
 from app.database import get_conn
+from app.price_tax_utils import (
+    derive_vat_prices_from_stated_price,
+    fill_vat_from_exclusive_net,
+    inclusive_from_net,
+    merge_factory_rates,
+    net_from_inclusive,
+    parse_price_basis_from_remark,
+)
 from app.services.vlm_extractor_service import QwenVLFullExtractor, VLMConfig
 
 logger = logging.getLogger(__name__)
@@ -387,9 +395,10 @@ class TLService:
         price_type: 目标税率类型，None=普通价, 1pct/3pct/13pct/normal_invoice/reverse_invoice
         取价逻辑（按优先级）：
           1. 报价表中直接有对应 price_type 的价格 → 直接使用
-          2. 报价表中有普通价(unit_price) + 税率表中有对应税率 → 正向换算
-          3. 报价表中有某已知含税价 + 税率表中有该税率和目标税率 → 先反算不含税，再正向换算
-          4. 以上均无 → None，返回 price_source="unavailable"
+          2. 有不含税 unit_price（基准价）+ 税率表 → 目标含税价 = unit_price × (1+税率)
+          3. 目标是普通价(unit_price) 但列空 → 由已知含1%/3%/13%价反算不含税基准
+          4. 仅有某一档含税价 → 先反算不含税，再换算到目标税率
+          5. 以上均无 → None，返回 price_source="unavailable"
         """
         if not warehouse_ids or not smelter_ids or not category_ids:
             return []
@@ -536,33 +545,34 @@ class TLService:
                         continue
 
                     rates = tax_rate_map.get(fid, {})
+                    merged = merge_factory_rates(rates)
 
                     # 1. 直接有目标列
                     direct = prices.get(target_col)
                     if direct is not None:
                         return direct, "direct"
 
-                    # 2. 目标是含税价，且有不含税基础价 + 目标税率
-                    if target_tax and prices.get("unit_price") is not None and target_tax in rates:
-                        base = prices["unit_price"]
-                        calc = round(base * (1 + rates[target_tax]), 2)
+                    # 2. 不含税 unit_price → 目标税率含税价
+                    if target_tax and prices.get("unit_price") is not None and target_tax in merged:
+                        up = float(prices["unit_price"])
+                        calc = inclusive_from_net(up, merged[target_tax])
                         return calc, "calc_from_base"
 
-                    # 3. 目标是基础价(unit_price)，从已知含税价反算
+                    # 3. 目标为不含税基准，由已知含税价反算
                     if target_col == "unit_price":
                         for col, src_tax in COL_TO_TAX.items():
                             known_price = prices.get(col)
-                            if known_price is not None and src_tax in rates:
-                                base = round(known_price / (1 + rates[src_tax]), 2)
-                                return base, f"calc_from_{src_tax}"
+                            if known_price is not None and src_tax in merged:
+                                net = net_from_inclusive(float(known_price), merged[src_tax])
+                                return round(net, 2), f"calc_from_{src_tax}"
 
-                    # 4. 从其他已知含税价反算不含税，再正向换算
-                    if target_tax and target_tax in rates:
+                    # 4. 从某一档含税价反算不含税，再换算到目标税率
+                    if target_tax and target_tax in merged:
                         for col, src_tax in COL_TO_TAX.items():
                             known_price = prices.get(col)
-                            if known_price is not None and src_tax in rates:
-                                base = round(known_price / (1 + rates[src_tax]), 4)
-                                calc = round(base * (1 + rates[target_tax]), 2)
+                            if known_price is not None and src_tax in merged:
+                                net = net_from_inclusive(float(known_price), merged[src_tax])
+                                calc = inclusive_from_net(net, merged[target_tax])
                                 return calc, f"calc_from_{src_tax}"
 
                 return None, "unavailable"
@@ -780,30 +790,65 @@ class TLService:
             raise
 
     def _map_vlm_to_confirm_items(self, result) -> List[Dict[str, Any]]:
-        """将 VLM 提取结果映射为前端可编辑的确认条目"""
+        """将 VLM 提取结果映射为前端可编辑的确认条目（价格为不含税基准，可由备注推断口径）。"""
         items = []
         factory_name = result.company_name or ""
+        r0 = merge_factory_rates(None)
         for row in result.rows:
-            # 根据价格列类型，确定主价格字段
-            price_general = row.price_general
-            price_1pct = row.price_1pct_vat
-            price_3pct = row.price_3pct_vat
-            price_13pct = row.price_13pct_vat
             price_normal = row.price_normal_invoice
             price_reverse = row.price_reverse_invoice
 
-            # 对于单价列类型，price_general 填入 unit_price
-            unit_price = price_general
+            if row.exclusive_net is not None:
+                net_f = round(float(row.exclusive_net), 2)
+                basis = getattr(row, "price_basis", None) or parse_price_basis_from_remark(
+                    row.remark
+                )
+                fp1 = float(row.price_1pct_vat) if row.price_1pct_vat is not None else None
+                fp3 = float(row.price_3pct_vat) if row.price_3pct_vat is not None else None
+                fp13 = float(row.price_13pct_vat) if row.price_13pct_vat is not None else None
+            else:
+                basis = parse_price_basis_from_remark(row.remark)
+                pg = row.price_general
+                if pg is not None:
+                    net_f, t1, t3, t13 = derive_vat_prices_from_stated_price(
+                        float(pg), basis, None
+                    )
+                    net_f = round(net_f, 2)
+                    fp1 = float(row.price_1pct_vat) if row.price_1pct_vat is not None else t1
+                    fp3 = float(row.price_3pct_vat) if row.price_3pct_vat is not None else t3
+                    fp13 = float(row.price_13pct_vat) if row.price_13pct_vat is not None else t13
+                elif row.price_3pct_vat is not None:
+                    net_f = round(net_from_inclusive(float(row.price_3pct_vat), r0["3pct"]), 2)
+                    f1, f3, f13 = fill_vat_from_exclusive_net(net_f, r0)
+                    fp1 = float(row.price_1pct_vat) if row.price_1pct_vat is not None else f1
+                    fp3 = float(row.price_3pct_vat)
+                    fp13 = float(row.price_13pct_vat) if row.price_13pct_vat is not None else f13
+                elif row.price_13pct_vat is not None:
+                    net_f = round(net_from_inclusive(float(row.price_13pct_vat), r0["13pct"]), 2)
+                    f1, f3, f13 = fill_vat_from_exclusive_net(net_f, r0)
+                    fp1 = float(row.price_1pct_vat) if row.price_1pct_vat is not None else f1
+                    fp3 = float(row.price_3pct_vat) if row.price_3pct_vat is not None else f3
+                    fp13 = float(row.price_13pct_vat)
+                elif row.price_1pct_vat is not None:
+                    net_f = round(net_from_inclusive(float(row.price_1pct_vat), r0["1pct"]), 2)
+                    f1, f3, f13 = fill_vat_from_exclusive_net(net_f, r0)
+                    fp1 = float(row.price_1pct_vat)
+                    fp3 = float(row.price_3pct_vat) if row.price_3pct_vat is not None else f3
+                    fp13 = float(row.price_13pct_vat) if row.price_13pct_vat is not None else f13
+                else:
+                    net_f, fp1, fp3, fp13 = None, None, None, None
 
             items.append({
                 "冶炼厂名": factory_name,
                 "冶炼厂id": None,
                 "品类名": row.category,
                 "品类id": None,
-                "价格": float(unit_price) if unit_price is not None else None,
-                "价格_1pct增值税": float(price_1pct) if price_1pct is not None else None,
-                "价格_3pct增值税": float(price_3pct) if price_3pct is not None else None,
-                "价格_13pct增值税": float(price_13pct) if price_13pct is not None else None,
+                "价格": net_f,
+                "价格口径": basis,
+                "备注": row.remark or None,
+                "价格_1pct增值税": fp1,
+                "价格_3pct增值税": fp3,
+                "价格_13pct增值税": fp13,
                 "普通发票价格": float(price_normal) if price_normal is not None else None,
                 "反向发票价格": float(price_reverse) if price_reverse is not None else None,
             })
@@ -923,6 +968,37 @@ class TLService:
                                 )
                                 row = cur.fetchone()
                                 metadata_id = row[0] if row else None
+
+                    # 3b. 不含税基准「价格」→ 补全未填的含1%/3%/13%（按冶炼厂税率表）
+                    factory_ids = list({item["冶炼厂id"] for item in items})
+                    tax_by_fid: Dict[int, Dict[str, float]] = {}
+                    if factory_ids:
+                        fph = ",".join(["%s"] * len(factory_ids))
+                        cur.execute(
+                            f"SELECT factory_id, tax_type, tax_rate FROM factory_tax_rates "
+                            f"WHERE factory_id IN ({fph})",
+                            tuple(factory_ids),
+                        )
+                        for fid, ttype, tr in cur.fetchall():
+                            tax_by_fid.setdefault(int(fid), {})[str(ttype)] = float(tr)
+                    for item in items:
+                        base = item.get("价格")
+                        fid = item.get("冶炼厂id")
+                        if base is None or fid is None:
+                            continue
+                        merged = merge_factory_rates(tax_by_fid.get(int(fid)))
+                        if (
+                            item.get("价格_1pct增值税") is None
+                            or item.get("价格_3pct增值税") is None
+                            or item.get("价格_13pct增值税") is None
+                        ):
+                            f1, f3, f13 = fill_vat_from_exclusive_net(float(base), merged)
+                            if item.get("价格_1pct增值税") is None:
+                                item["价格_1pct增值税"] = f1
+                            if item.get("价格_3pct增值税") is None:
+                                item["价格_3pct增值税"] = f3
+                            if item.get("价格_13pct增值税") is None:
+                                item["价格_13pct增值税"] = f13
 
                     # 4. 写入明细，相同(日期+冶炼厂+品类名)则更新价格
                     for item in items:
@@ -1560,7 +1636,6 @@ class TLService:
         }
 
         def resolve_price(fid: int, cat_id: int) -> Optional[float]:
-            # 找该 category_id 下的所有品类名称，取第一个有报价的
             cat_names = cat_id_to_names.get(cat_id, [])
             for cat_name in cat_names:
                 prices = raw_price_map.get((fid, cat_name), {})
@@ -1568,31 +1643,28 @@ class TLService:
                     continue
 
                 rates = tax_rate_map.get(fid, {})
+                merged = merge_factory_rates(rates)
 
-                # 1. 直接有目标列
                 direct = prices.get(target_col)
                 if direct is not None:
                     return direct
 
-                # 2. 目标是含税价，且有不含税基础价 + 目标税率
-                if target_tax and prices.get("unit_price") is not None and target_tax in rates:
-                    base = prices["unit_price"]
-                    return round(base * (1 + rates[target_tax]), 2)
+                if target_tax and prices.get("unit_price") is not None and target_tax in merged:
+                    return inclusive_from_net(float(prices["unit_price"]), merged[target_tax])
 
-                # 3. 目标是基础价，从已知含税价反算
                 if target_col == "unit_price":
                     for col, src_tax in COL_TO_TAX.items():
                         known_price = prices.get(col)
-                        if known_price is not None and src_tax in rates:
-                            return round(known_price / (1 + rates[src_tax]), 2)
+                        if known_price is not None and src_tax in merged:
+                            net = net_from_inclusive(float(known_price), merged[src_tax])
+                            return round(net, 2)
 
-            # 4. 从其他已知含税价反算
-            if target_tax and target_tax in rates:
-                for col, src_tax in COL_TO_TAX.items():
-                    known_price = prices.get(col)
-                    if known_price is not None and src_tax in rates:
-                        base = round(known_price / (1 + rates[src_tax]), 4)
-                        return round(base * (1 + rates[target_tax]), 2)
+                if target_tax and target_tax in merged:
+                    for col, src_tax in COL_TO_TAX.items():
+                        known_price = prices.get(col)
+                        if known_price is not None and src_tax in merged:
+                            net = net_from_inclusive(float(known_price), merged[src_tax])
+                            return inclusive_from_net(net, merged[target_tax])
 
             return None
 

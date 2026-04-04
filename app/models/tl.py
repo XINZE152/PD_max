@@ -75,6 +75,8 @@ class VlmPriceRow(BaseModel):
     price_general: Optional[int] = Field(None, description="通用单价")
     unit: str = Field("元/吨", description="单位")
     remark: str = Field("", description="备注")
+    price_basis: str = Field("ex_vat", description="价格口径：ex_vat不含税/incl_1pct/incl_3pct/incl_13pct")
+    exclusive_net: Optional[int] = Field(None, description="推算的不含税基准（元/吨）")
 
 
 class VlmFullData(BaseModel):
@@ -109,7 +111,12 @@ class ConfirmPriceTableItem(BaseModel):
     冶炼厂id: Optional[int] = Field(None, description="冶炼厂ID，null则自动新建")
     品类名: str = Field(..., description="品类名称（OCR识别或前端修改后）")
     品类id: Optional[int] = Field(None, description="品类分组ID，null则自动新建")
-    价格: Optional[float] = Field(None, description="普通价单价（元/吨）")
+    价格: Optional[float] = Field(None, description="不含税基准价（元/吨）")
+    价格口径: Optional[str] = Field(
+        None,
+        description="表中报价含义：ex_vat不含税、incl_1pct、incl_3pct、incl_13pct；确认时可不传，将按备注推断",
+    )
+    备注: Optional[str] = Field(None, description="行备注（识别或手工维护，用于推断价格口径）")
     价格_1pct增值税: Optional[float] = Field(None, description="1%增值税价格（元/吨）")
     价格_3pct增值税: Optional[float] = Field(None, description="3%增值税价格（元/吨）")
     价格_13pct增值税: Optional[float] = Field(None, description="13%增值税价格（元/吨）")
