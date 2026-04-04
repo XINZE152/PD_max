@@ -10,7 +10,15 @@ class ComparisonRequest(BaseModel):
     品类id列表: List[int] = Field(..., description="品类ID列表")
     price_type: Optional[str] = Field(
         None,
-        description="目标税率类型：null=普通价、1pct=1%增值税、3pct=3%增值税、13pct=13%增值税、normal_invoice=普通发票、reverse_invoice=反向发票"
+        description=(
+            "比价取价口径：null=普通价(不含税)、1pct/3pct/13pct=对应含税列（会折合为不含税参与展示与利润）、"
+            "normal_invoice/reverse_invoice=表中数值按不含税使用"
+        ),
+    )
+    吨数: float = Field(
+        1.0,
+        gt=0,
+        description="吨数；每条线路利润=报价×吨数−运费×吨数（报价与运费均为元/吨）；不传时默认 1",
     )
 
 

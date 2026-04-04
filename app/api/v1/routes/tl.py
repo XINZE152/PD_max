@@ -220,13 +220,18 @@ def get_comparison(
     service: TLService = Depends(get_tl_service),
 ):
     try:
-        data = service.get_comparison(
+        out = service.get_comparison(
             warehouse_ids=body.选中仓库id列表,
             smelter_ids=body.冶炼厂id列表,
             category_ids=body.品类id列表,
             price_type=body.price_type,
+            tons=body.吨数,
         )
-        return {"code": 200, "data": data}
+        return {
+            "code": 200,
+            "data": out["明细"],
+            "冶炼厂利润排行": out["冶炼厂利润排行"],
+        }
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:

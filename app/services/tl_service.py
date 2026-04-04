@@ -395,9 +395,14 @@ class TLService:
         smelter_ids: List[int],
         category_ids: List[int],
         price_type: Optional[str] = None,
-    ) -> List[Dict[str, Any]]:
+        tons: float = 1.0,
+    ) -> Dict[str, Any]:
         """
         price_type: 目标税率类型，None=普通价, 1pct/3pct/13pct/normal_invoice/reverse_invoice
+        吨数: 每条明细 利润 = 报价(元/吨)×吨数 − 运费(元/吨)×吨数；无报价按 0 计。
+        **报价与利润一律按不含税价（元/吨）**：若所选口径为含 1%/3%/13% 增值税价，先除以 (1+税率) 再展示并计入利润；
+        普通价/普票/反向发票列按表中数值视为不含税。
+        返回 明细 + 冶炼厂利润排行（各厂利润为明细利润之和，降序）。
         取价逻辑（按优先级）：
           1. 报价表中直接有对应 price_type 的价格 → 直接使用
           2. 有不含税 unit_price（基准价）+ 税率表 → 目标含税价 = unit_price × (1+税率)
@@ -406,7 +411,7 @@ class TLService:
           5. 以上均无 → None，返回 price_source="unavailable"
         """
         if not warehouse_ids or not smelter_ids or not category_ids:
-            return []
+            return {"明细": [], "冶炼厂利润排行": []}
 
         # price_type → (quote_details列名, 展示名)
         PRICE_COL_MAP = {
@@ -477,7 +482,7 @@ class TLService:
                         cat_id_to_names.setdefault(cat_id, []).append(name)
 
                     if not cat_id_to_names:
-                        return []
+                        return {"明细": [], "冶炼厂利润排行": []}
 
                     # 所有品类名称（用于查询价格表）
                     all_cat_names = [name for names in cat_id_to_names.values() for name in names]
@@ -582,25 +587,65 @@ class TLService:
 
                 return None, "unavailable"
 
-            # 组合结果
-            result = []
+            # 组合结果；利润 = 不含税报价(元/吨)×吨数 − 运费(元/吨)×吨数
+            t = float(tons)
+            result: List[Dict[str, Any]] = []
             for (wid, fid), (wname, fname, freight) in freight_map.items():
                 for cid in category_ids:
                     cat_name = cat_map.get(cid)
                     if cat_name is None:
                         continue
                     price, source = resolve_price(fid, cid)
+                    merged = merge_factory_rates(tax_rate_map.get(fid, {}))
+                    if price is not None and target_tax and target_tax in merged:
+                        p_net = round(
+                            net_from_inclusive(float(price), merged[target_tax]), 2
+                        )
+                    elif price is not None:
+                        p_net = float(price)
+                    else:
+                        p_net = None
+
+                    p = float(p_net) if p_net is not None else 0.0
+                    fr = float(freight) if freight is not None else 0.0
+                    profit = round(p * t - fr * t, 2)
 
                     result.append({
+                        "仓库id": wid,
+                        "冶炼厂id": fid,
+                        "品类id": cid,
                         "仓库": wname,
                         "冶炼厂": fname,
                         "品类": cat_name,
                         "price_type": price_type_name,
-                        "运费": float(freight) if freight is not None else 0.0,
-                        "报价": price if price is not None else 0.0,
+                        "吨数": t,
+                        "运费": fr,
+                        "报价": p_net if source != "unavailable" else None,
                         "报价来源": source,
+                        "利润": profit,
                     })
-            return result
+
+            # 按冶炼厂汇总利润，从高到低
+            agg: Dict[int, Dict[str, Any]] = {}
+            for row in result:
+                sfid = int(row["冶炼厂id"])
+                if sfid not in agg:
+                    agg[sfid] = {
+                        "冶炼厂id": sfid,
+                        "冶炼厂": row["冶炼厂"],
+                        "利润": 0.0,
+                    }
+                agg[sfid]["利润"] += float(row["利润"])
+
+            ranking = sorted(
+                (
+                    {**v, "利润": round(v["利润"], 2)}
+                    for v in agg.values()
+                ),
+                key=lambda x: x["利润"],
+                reverse=True,
+            )
+            return {"明细": result, "冶炼厂利润排行": ranking}
 
         except Exception as e:
             logger.error(f"获取比价表失败: {e}")
