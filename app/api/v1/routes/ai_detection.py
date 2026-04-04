@@ -513,6 +513,9 @@ _DETECT_RESULT_SCHEMA = (
     summary="单图单框鉴伪（同步）",
     description=(
         "上传一张图片并指定一个矩形检测区域，**同步**返回鉴伪结果。适合低延迟、单区域场景。\n\n"
+        "**网关 504**：经 Nginx/负载均衡时，**首次**调用可能因加载 EasyOCR 与模型耗时 1～数分钟，"
+        "超过代理默认超时（常见 60s）会返回 **504**。处理办法：① 反向代理调大 `proxy_read_timeout`（建议 ≥300s）；"
+        "② 后端设 `AI_DETECTION_PRELOAD=1` 在启动时预加载；③ 或改用异步接口 `POST .../api/v3/detect` 再轮询结果。\n\n"
         "**请求方式**：`multipart/form-data`\n\n"
         "**输入参数**\n"
         "- **file**：图片文件（如 JPG/PNG）\n"

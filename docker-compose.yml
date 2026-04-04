@@ -20,6 +20,7 @@ services:
     depends_on:
       - mysql
     environment:
+      PORT: 8000
       MYSQL_HOST: mysql
       MYSQL_PORT: 3306
       MYSQL_USER: root

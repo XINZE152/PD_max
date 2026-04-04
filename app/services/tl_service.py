@@ -26,6 +26,11 @@ from app.services.vlm_extractor_service import QwenVLFullExtractor, VLMConfig
 
 logger = logging.getLogger(__name__)
 
+
+class PurchaseSuggestionLLMError(Exception):
+    """采购建议接口调用上游大模型失败（由路由映射为 HTTP 502）。"""
+
+
 PRICE_TABLE_UPLOAD_DIR = Path(UPLOAD_DIR) / "price_tables"
 PRICE_TABLE_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -1713,10 +1718,17 @@ class TLService:
                     "各仓库运费对比": warehouse_options,
                 })
 
-        # 构造 prompt，调用 Claude
+        # 构造 prompt，调用大模型（OpenAI 兼容协议）
         import json
         from openai import OpenAI
         from app import config as app_config
+
+        if not (app_config.LLM_API_KEY or "").strip():
+            raise ValueError(
+                "未配置文本大模型密钥，无法生成采购建议。请设置 LLM_API_KEY；若与报价图识别共用阿里云百炼，"
+                "也可只配 VLM_API_KEY（或 DASHSCOPE_API_KEY / QWEN_API_KEY），"
+                "此时默认使用百炼兼容端点与 qwen-plus。其它厂商请显式配置 LLM_API_KEY、LLM_BASE_URL、LLM_MODEL。"
+            )
 
         client = OpenAI(api_key=app_config.LLM_API_KEY, base_url=app_config.LLM_BASE_URL)
         data_str = json.dumps(demand_rows, ensure_ascii=False, indent=2)
@@ -1731,12 +1743,27 @@ class TLService:
 4. 数据缺失的在备注注明
 5. 纯文本，简洁"""
 
-        resp = client.chat.completions.create(
-            model=app_config.LLM_MODEL,
-            max_tokens=2048,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        suggestion = resp.choices[0].message.content
+        try:
+            resp = client.chat.completions.create(
+                model=app_config.LLM_MODEL,
+                max_tokens=2048,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            suggestion = resp.choices[0].message.content
+        except Exception as exc:
+            err_text = str(exc).lower()
+            status = getattr(exc, "status_code", None)
+            logger.exception("采购建议大模型调用失败")
+            if status == 403 or ("403" in str(exc) and "forbidden" in err_text):
+                raise PurchaseSuggestionLLMError(
+                    "大模型服务端拒绝请求（HTTP 403）。常见原因：API Key 无效或无权访问该模型、"
+                    "LLM_BASE_URL 与密钥不属于同一服务商、控制台 IP 白名单未放行当前服务器、"
+                    "套餐/配额或地域策略限制。请在部署环境检查 LLM_API_KEY、LLM_BASE_URL、LLM_MODEL，"
+                    "并登录模型服务商控制台核对权限与网络策略。"
+                ) from exc
+            raise PurchaseSuggestionLLMError(
+                f"大模型调用失败，无法生成建议正文。原始错误：{exc}"
+            ) from exc
 
         return {"code": 200, "data": {"suggestion": suggestion, "raw": raw}}
 

@@ -42,7 +42,7 @@ from app.models.tl import (
     TaxRateItem,
     TaxRateUpsertRequest,
 )
-from app.services.tl_service import TLService, get_tl_service
+from app.services.tl_service import PurchaseSuggestionLLMError, TLService, get_tl_service
 
 router = APIRouter(prefix="/tl", tags=["TL比价模块"])
 
@@ -435,6 +435,8 @@ def get_purchase_suggestion(
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except PurchaseSuggestionLLMError as e:
+        raise HTTPException(status_code=502, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
