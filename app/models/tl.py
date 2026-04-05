@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -18,7 +18,16 @@ class ComparisonRequest(BaseModel):
     吨数: float = Field(
         1.0,
         gt=0,
-        description="吨数；每条线路利润=报价×吨数−运费×吨数（报价与运费均为元/吨）；不传时默认 1",
+        description="吨数；按吨计费时总运费=每吨运费×吨数；按车计费时车数=向上取整(吨数/每车吨数)（至少1车），总运费=每车运费×车数",
+    )
+    运费计价方式: Literal["per_ton", "per_truck"] = Field(
+        "per_ton",
+        description="per_ton：运费字段为每吨单价（元/吨）；per_truck：运费字段为每车单价（元/车），默认每车35吨",
+    )
+    每车吨数: float = Field(
+        35.0,
+        gt=0,
+        description="按车计费时一车折合吨数；车数=向上取整(吨数/每车吨数)，至少1车",
     )
 
 

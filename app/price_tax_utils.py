@@ -9,7 +9,7 @@
 冶炼厂 `factory_tax_rates` 覆盖默认税率。
 """
 import re
-from typing import Dict, Literal, Optional, Tuple
+from typing import Dict, Literal, Optional, Tuple, Any
 
 PriceBasis = Literal["ex_vat", "incl_1pct", "incl_3pct", "incl_13pct"]
 
@@ -116,3 +116,39 @@ def fill_vat_from_exclusive_net(
         inclusive_from_net(n, r["3pct"]),
         inclusive_from_net(n, r["13pct"]),
     )
+
+
+def derive_net_and_vat_from_quote_row(
+    prices: Dict[str, Any],
+    merged_rates: Dict[str, float],
+) -> Optional[Tuple[float, float, float, float]]:
+    """
+    从 quote_details 一行（各列可能只填部分）反推统一的不含税基准与各档含税价。
+    返回 (基准不含税, 含1%价, 含3%价, 含13%价)；无法推算时 None。
+
+    优先级：unit_price → 13%/3%/1% 含税列（按厂税率反算不含税）→ 普票/反向发票列（按不含税理解）。
+    """
+    if prices.get("unit_price") is not None:
+        net = float(prices["unit_price"])
+        p1, p3, p13 = fill_vat_from_exclusive_net(net, merged_rates)
+        return round(net, 2), p1, p3, p13
+
+    for col, tax_key in (
+        ("price_13pct_vat", "13pct"),
+        ("price_3pct_vat", "3pct"),
+        ("price_1pct_vat", "1pct"),
+    ):
+        v = prices.get(col)
+        if v is not None and tax_key in merged_rates:
+            net = net_from_inclusive(float(v), merged_rates[tax_key])
+            p1, p3, p13 = fill_vat_from_exclusive_net(net, merged_rates)
+            return round(net, 4), p1, p3, p13
+
+    for col in ("price_normal_invoice", "price_reverse_invoice"):
+        v = prices.get(col)
+        if v is not None:
+            net = float(v)
+            p1, p3, p13 = fill_vat_from_exclusive_net(net, merged_rates)
+            return round(net, 2), p1, p3, p13
+
+    return None

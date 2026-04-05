@@ -226,6 +226,8 @@ def get_comparison(
             category_ids=body.品类id列表,
             price_type=body.price_type,
             tons=body.吨数,
+            freight_mode=body.运费计价方式,
+            tons_per_truck=body.每车吨数,
         )
         return {
             "code": 200,

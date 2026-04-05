@@ -5,6 +5,7 @@ TL比价模块服务层
 import hashlib
 import io
 import logging
+import math
 import os
 import uuid
 from datetime import date, datetime
@@ -15,6 +16,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from app.config import UPLOAD_DIR
 from app.database import get_conn
 from app.price_tax_utils import (
+    derive_net_and_vat_from_quote_row,
     derive_vat_prices_from_stated_price,
     fill_vat_from_exclusive_net,
     inclusive_from_net,
@@ -396,13 +398,16 @@ class TLService:
         category_ids: List[int],
         price_type: Optional[str] = None,
         tons: float = 1.0,
+        freight_mode: str = "per_ton",
+        tons_per_truck: float = 35.0,
     ) -> Dict[str, Any]:
         """
         price_type: 目标税率类型，None=普通价, 1pct/3pct/13pct/normal_invoice/reverse_invoice
-        吨数: 每条明细 利润 = 报价(元/吨)×吨数 − 运费(元/吨)×吨数；无报价按 0 计。
-        **报价与利润一律按不含税价（元/吨）**：若所选口径为含 1%/3%/13% 增值税价，先除以 (1+税率) 再展示并计入利润；
-        普通价/普票/反向发票列按表中数值视为不含税。
-        返回 明细 + 冶炼厂利润排行（各厂利润为明细利润之和，降序）。
+        吨数 t: 报价侧按吨计价；运费侧 per_ton 时总运费=每吨运费×t；per_truck 时车数=向上取整(t/每车吨数)（至少1车），总运费=每车运费×车数。
+        **展示用「报价」**：仍按所选 price_type 折合为不含税（元/吨）后写入 `报价`，`利润`=该不含税报价×t−总运费。
+        同时按表中已有列统一反推 `基准价`（不含税）、`含1%税价`、`含3%税价`（与 OCR 按税点入库、再换算一致）；
+        `利润_基准`=基准价×t−总运费，`利润_含3%`=含3%税价×t−总运费。
+        明细与冶炼厂排行按 `利润_含3%`（合计）从高到低排序。
         取价逻辑（按优先级）：
           1. 报价表中直接有对应 price_type 的价格 → 直接使用
           2. 有不含税 unit_price（基准价）+ 税率表 → 目标含税价 = unit_price × (1+税率)
@@ -427,6 +432,8 @@ class TLService:
 
         if price_type not in PRICE_COL_MAP:
             raise ValueError(f"不支持的 price_type: {price_type}")
+        if freight_mode not in ("per_ton", "per_truck"):
+            raise ValueError(f"不支持的运费计价方式: {freight_mode}，应为 per_ton 或 per_truck")
 
         target_col, price_type_name = PRICE_COL_MAP[price_type]
         target_tax = VAT_TAX_TYPE_MAP.get(price_type)  # None 表示不需要税率换算
@@ -587,8 +594,16 @@ class TLService:
 
                 return None, "unavailable"
 
-            # 组合结果；利润 = 不含税报价(元/吨)×吨数 − 运费(元/吨)×吨数
+            def pick_quote_row(fid: int, cat_id: int) -> Optional[Dict[str, Optional[float]]]:
+                for cn in cat_id_to_names.get(cat_id, []):
+                    row = raw_price_map.get((fid, cn), {})
+                    if row:
+                        return row
+                return None
+
+            # 组合结果；总运费 per_ton=运费单价×吨数；per_truck=每车运费×车数
             t = float(tons)
+            tp_truck = float(tons_per_truck) if tons_per_truck and tons_per_truck > 0 else 35.0
             result: List[Dict[str, Any]] = []
             for (wid, fid), (wname, fname, freight) in freight_map.items():
                 for cid in category_ids:
@@ -608,9 +623,32 @@ class TLService:
 
                     p = float(p_net) if p_net is not None else 0.0
                     fr = float(freight) if freight is not None else 0.0
-                    profit = round(p * t - fr * t, 2)
+                    if freight_mode == "per_truck":
+                        # 车数 = 吨数/每车吨数 **向上取整**，不足一车按一车计（与 max(1,·) 一致）
+                        n_trucks = max(1, math.ceil(t / tp_truck))
+                        freight_cost_total = round(fr * n_trucks, 2)
+                    else:
+                        n_trucks = None
+                        freight_cost_total = round(fr * t, 2)
 
-                    result.append({
+                    profit = round(p * t - freight_cost_total, 2)
+
+                    qrow = pick_quote_row(fid, cid)
+                    breakdown = (
+                        derive_net_and_vat_from_quote_row(qrow, merged) if qrow else None
+                    )
+                    if breakdown:
+                        base_net, p1_vat, p3_vat, _p13 = breakdown
+                        profit_base = round(base_net * t - freight_cost_total, 2)
+                        profit_3 = round(p3_vat * t - freight_cost_total, 2)
+                    else:
+                        base_net = None
+                        p1_vat = None
+                        p3_vat = None
+                        profit_base = None
+                        profit_3 = None
+
+                    rec: Dict[str, Any] = {
                         "仓库id": wid,
                         "冶炼厂id": fid,
                         "品类id": cid,
@@ -619,13 +657,29 @@ class TLService:
                         "品类": cat_name,
                         "price_type": price_type_name,
                         "吨数": t,
+                        "运费计价方式": freight_mode,
                         "运费": fr,
+                        "总运费": freight_cost_total,
                         "报价": p_net if source != "unavailable" else None,
                         "报价来源": source,
+                        "基准价": base_net,
+                        "含1%税价": p1_vat,
+                        "含3%税价": p3_vat,
                         "利润": profit,
-                    })
+                        "利润_基准": profit_base,
+                        "利润_含3%": profit_3,
+                    }
+                    if freight_mode == "per_truck":
+                        rec["车数"] = n_trucks
+                        rec["每车吨数"] = tp_truck
+                    result.append(rec)
 
-            # 按冶炼厂汇总利润，从高到低
+            result.sort(
+                key=lambda r: r["利润_含3%"] if r["利润_含3%"] is not None else float("-inf"),
+                reverse=True,
+            )
+
+            # 按冶炼厂汇总；排行按 利润_含3% 合计从高到低
             agg: Dict[int, Dict[str, Any]] = {}
             for row in result:
                 sfid = int(row["冶炼厂id"])
@@ -634,15 +688,26 @@ class TLService:
                         "冶炼厂id": sfid,
                         "冶炼厂": row["冶炼厂"],
                         "利润": 0.0,
+                        "利润_含3%合计": 0.0,
+                        "利润_基准合计": 0.0,
                     }
                 agg[sfid]["利润"] += float(row["利润"])
+                if row["利润_含3%"] is not None:
+                    agg[sfid]["利润_含3%合计"] += float(row["利润_含3%"])
+                if row["利润_基准"] is not None:
+                    agg[sfid]["利润_基准合计"] += float(row["利润_基准"])
 
             ranking = sorted(
                 (
-                    {**v, "利润": round(v["利润"], 2)}
+                    {
+                        **v,
+                        "利润": round(v["利润"], 2),
+                        "利润_含3%合计": round(v["利润_含3%合计"], 2),
+                        "利润_基准合计": round(v["利润_基准合计"], 2),
+                    }
                     for v in agg.values()
                 ),
-                key=lambda x: x["利润"],
+                key=lambda x: x["利润_含3%合计"],
                 reverse=True,
             )
             return {"明细": result, "冶炼厂利润排行": ranking}
