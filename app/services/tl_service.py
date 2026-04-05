@@ -4,6 +4,7 @@ TL比价模块服务层
 """
 import hashlib
 import io
+import json
 import logging
 import math
 import os
@@ -15,6 +16,14 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from app.config import UPLOAD_DIR
 from app.database import get_conn
+from app.models.tl import OPTIMAL_PRICE_BASIS_ALLOWED
+from app.quote_price_sources import (
+    API_KEY_TO_DB,
+    merge_sources_after_fill,
+    normalize_client_sources,
+    SOURCE_DERIVED,
+    SOURCE_ORIGINAL,
+)
 from app.price_tax_utils import (
     derive_net_and_vat_from_quote_row,
     derive_vat_prices_from_stated_price,
@@ -27,6 +36,36 @@ from app.price_tax_utils import (
 from app.services.vlm_extractor_service import QwenVLFullExtractor, VLMConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _unit_for_optimal_price_basis(
+    basis: str,
+    breakdown: Optional[Tuple[float, float, float, float]],
+    qrow: Optional[Dict[str, Optional[float]]],
+) -> Optional[float]:
+    """
+    最优价用的单价（元/吨）：base/1pct/3pct/13pct 来自统一反推 breakdown；
+    普票、反向发票取表中对应列。
+    """
+    if basis == "base":
+        return breakdown[0] if breakdown else None
+    if basis == "1pct":
+        return breakdown[1] if breakdown else None
+    if basis == "3pct":
+        return breakdown[2] if breakdown else None
+    if basis == "13pct":
+        return breakdown[3] if breakdown else None
+    if basis == "normal_invoice":
+        if not qrow:
+            return None
+        v = qrow.get("price_normal_invoice")
+        return float(v) if v is not None else None
+    if basis == "reverse_invoice":
+        if not qrow:
+            return None
+        v = qrow.get("price_reverse_invoice")
+        return float(v) if v is not None else None
+    return None
 
 
 class PurchaseSuggestionLLMError(Exception):
@@ -47,6 +86,60 @@ def _cell_json(v: Any) -> Any:
     if isinstance(v, date):
         return v.isoformat()
     return v
+
+
+def _json_cell_to_dict(val: Any) -> Optional[Dict[str, Any]]:
+    """解析库表 JSON 列（或已解析的 dict）为字典。"""
+    if val is None:
+        return None
+    if isinstance(val, dict):
+        return val
+    if isinstance(val, (bytes, bytearray)):
+        val = val.decode("utf-8")
+    if isinstance(val, str):
+        s = val.strip()
+        if not s:
+            return None
+        return json.loads(s)
+    return None
+
+
+def _apply_factory_tax_rates_to_quote_item(
+    item: Dict[str, Any],
+    tax_by_fid: Dict[int, Dict[str, float]],
+) -> bool:
+    """
+    确认写入前：按系统为冶炼厂保存的税率（factory_tax_rates ∪ 默认）统一落库。
+
+    - 若识别/前端给出的是**不含税基准**（「价格」有值）→ 用合并税率**正算**含1%/3%/13%价。
+    - 若仅有**含税价**列（1%/3%/13% 之一）→ 用对应税率**反算**不含税基准，再**正算**三档含税（顺序：优先 13% 列 → 3% → 1%）。
+
+    与图片识别一致：图上可能是基准也可能是含税；最终以本函数 + 系统税率为准写入 quote_details。
+    """
+    fid = item.get("冶炼厂id")
+    if fid is None:
+        return False
+    merged = merge_factory_rates(tax_by_fid.get(int(fid)))
+
+    net: Optional[float] = None
+    if item.get("价格") is not None:
+        net = float(item["价格"])
+    elif item.get("价格_13pct增值税") is not None and "13pct" in merged:
+        net = net_from_inclusive(float(item["价格_13pct增值税"]), merged["13pct"])
+    elif item.get("价格_3pct增值税") is not None and "3pct" in merged:
+        net = net_from_inclusive(float(item["价格_3pct增值税"]), merged["3pct"])
+    elif item.get("价格_1pct增值税") is not None and "1pct" in merged:
+        net = net_from_inclusive(float(item["价格_1pct增值税"]), merged["1pct"])
+
+    if net is None:
+        return False
+
+    item["价格"] = round(float(net), 2)
+    f1, f3, f13 = fill_vat_from_exclusive_net(float(item["价格"]), merged)
+    item["价格_1pct增值税"] = f1
+    item["价格_3pct增值税"] = f3
+    item["价格_13pct增值税"] = f13
+    return True
 
 
 class TLService:
@@ -400,6 +493,8 @@ class TLService:
         tons: float = 1.0,
         freight_mode: str = "per_ton",
         tons_per_truck: float = 35.0,
+        optimal_basis_list: Optional[List[str]] = None,
+        optimal_sort_basis: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         price_type: 目标税率类型，None=普通价, 1pct/3pct/13pct/normal_invoice/reverse_invoice
@@ -407,7 +502,8 @@ class TLService:
         **展示用「报价」**：仍按所选 price_type 折合为不含税（元/吨）后写入 `报价`，`利润`=该不含税报价×t−总运费。
         同时按表中已有列统一反推 `基准价`（不含税）、`含1%税价`、`含3%税价`（与 OCR 按税点入库、再换算一致）；
         `利润_基准`=基准价×t−总运费，`利润_含3%`=含3%税价×t−总运费。
-        明细与冶炼厂排行按 `利润_含3%`（合计）从高到低排序。
+        **最优价各口径利润**：由 optimal_basis_list 指定（如 base、1pct、3pct、13pct、普票列等），每条明细返回 `最优价各口径利润` 字典；
+        明细与冶炼厂排行按 optimal_sort_basis（默认列表首项）对应利润从高到低排序。
         取价逻辑（按优先级）：
           1. 报价表中直接有对应 price_type 的价格 → 直接使用
           2. 有不含税 unit_price（基准价）+ 税率表 → 目标含税价 = unit_price × (1+税率)
@@ -416,7 +512,23 @@ class TLService:
           5. 以上均无 → None，返回 price_source="unavailable"
         """
         if not warehouse_ids or not smelter_ids or not category_ids:
-            return {"明细": [], "冶炼厂利润排行": []}
+            return {
+                "明细": [],
+                "冶炼厂利润排行": [],
+                "最优价排序口径": (optimal_sort_basis or (optimal_basis_list or ["3pct"])[0]),
+            }
+
+        bases = list(optimal_basis_list or ["3pct"])
+        sort_basis = optimal_sort_basis if optimal_sort_basis is not None else bases[0]
+        for b in bases:
+            if b not in OPTIMAL_PRICE_BASIS_ALLOWED:
+                raise ValueError(
+                    f"不支持的最优价计税口径: {b!r}，允许：{sorted(OPTIMAL_PRICE_BASIS_ALLOWED)}"
+                )
+        if sort_basis not in bases:
+            raise ValueError(
+                f"最优价排序口径 {sort_basis!r} 须在最优价计税口径列表中，当前为 {bases}"
+            )
 
         # price_type → (quote_details列名, 展示名)
         PRICE_COL_MAP = {
@@ -489,7 +601,11 @@ class TLService:
                         cat_id_to_names.setdefault(cat_id, []).append(name)
 
                     if not cat_id_to_names:
-                        return {"明细": [], "冶炼厂利润排行": []}
+                        return {
+                            "明细": [],
+                            "冶炼厂利润排行": [],
+                            "最优价排序口径": sort_basis,
+                        }
 
                     # 所有品类名称（用于查询价格表）
                     all_cat_names = [name for names in cat_id_to_names.values() for name in names]
@@ -648,6 +764,13 @@ class TLService:
                         profit_base = None
                         profit_3 = None
 
+                    optimal_profits: Dict[str, Optional[float]] = {}
+                    for b in bases:
+                        u = _unit_for_optimal_price_basis(b, breakdown, qrow)
+                        optimal_profits[b] = (
+                            round(u * t - freight_cost_total, 2) if u is not None else None
+                        )
+
                     rec: Dict[str, Any] = {
                         "仓库id": wid,
                         "冶炼厂id": fid,
@@ -668,6 +791,7 @@ class TLService:
                         "利润": profit,
                         "利润_基准": profit_base,
                         "利润_含3%": profit_3,
+                        "最优价各口径利润": optimal_profits,
                     }
                     if freight_mode == "per_truck":
                         rec["车数"] = n_trucks
@@ -675,11 +799,15 @@ class TLService:
                     result.append(rec)
 
             result.sort(
-                key=lambda r: r["利润_含3%"] if r["利润_含3%"] is not None else float("-inf"),
+                key=lambda r: (
+                    r["最优价各口径利润"][sort_basis]
+                    if r["最优价各口径利润"].get(sort_basis) is not None
+                    else float("-inf")
+                ),
                 reverse=True,
             )
 
-            # 按冶炼厂汇总；排行按 利润_含3% 合计从高到低
+            # 按冶炼厂汇总；排行按「最优价排序口径」对应利润合计从高到低
             agg: Dict[int, Dict[str, Any]] = {}
             for row in result:
                 sfid = int(row["冶炼厂id"])
@@ -690,12 +818,18 @@ class TLService:
                         "利润": 0.0,
                         "利润_含3%合计": 0.0,
                         "利润_基准合计": 0.0,
+                        "最优价口径合计": {b: 0.0 for b in bases},
                     }
                 agg[sfid]["利润"] += float(row["利润"])
                 if row["利润_含3%"] is not None:
                     agg[sfid]["利润_含3%合计"] += float(row["利润_含3%"])
                 if row["利润_基准"] is not None:
                     agg[sfid]["利润_基准合计"] += float(row["利润_基准"])
+                op = row["最优价各口径利润"]
+                for b in bases:
+                    pv = op.get(b)
+                    if pv is not None:
+                        agg[sfid]["最优价口径合计"][b] += float(pv)
 
             ranking = sorted(
                 (
@@ -704,13 +838,20 @@ class TLService:
                         "利润": round(v["利润"], 2),
                         "利润_含3%合计": round(v["利润_含3%合计"], 2),
                         "利润_基准合计": round(v["利润_基准合计"], 2),
+                        "最优价口径合计": {
+                            b: round(v["最优价口径合计"][b], 2) for b in bases
+                        },
                     }
                     for v in agg.values()
                 ),
-                key=lambda x: x["利润_含3%合计"],
+                key=lambda x: x["最优价口径合计"][sort_basis],
                 reverse=True,
             )
-            return {"明细": result, "冶炼厂利润排行": ranking}
+            return {
+                "明细": result,
+                "冶炼厂利润排行": ranking,
+                "最优价排序口径": sort_basis,
+            }
 
         except Exception as e:
             logger.error(f"获取比价表失败: {e}")
@@ -905,13 +1046,14 @@ class TLService:
             raise
 
     def _map_vlm_to_confirm_items(self, result) -> List[Dict[str, Any]]:
-        """将 VLM 提取结果映射为前端可编辑的确认条目（价格为不含税基准，可由备注推断口径）。"""
+        """将 VLM 结果映射为确认条目：图上可能是基准价或含税价（多列/备注）。此处仅带出 OCR 显式列与预览用不含税/反算（默认税率占位）；确认写入时用冶炼厂系统税率做「基准↔含税」双向统一。"""
         items = []
         factory_name = result.company_name or ""
-        r0 = merge_factory_rates(None)
+        defaults = merge_factory_rates(None)
         for row in result.rows:
             price_normal = row.price_normal_invoice
             price_reverse = row.price_reverse_invoice
+            src: Dict[str, str] = {}
 
             if row.exclusive_net is not None:
                 net_f = round(float(row.exclusive_net), 2)
@@ -921,37 +1063,77 @@ class TLService:
                 fp1 = float(row.price_1pct_vat) if row.price_1pct_vat is not None else None
                 fp3 = float(row.price_3pct_vat) if row.price_3pct_vat is not None else None
                 fp13 = float(row.price_13pct_vat) if row.price_13pct_vat is not None else None
+                src["unit_price"] = SOURCE_ORIGINAL
+                if fp1 is not None:
+                    src["price_1pct_vat"] = SOURCE_ORIGINAL
+                if fp3 is not None:
+                    src["price_3pct_vat"] = SOURCE_ORIGINAL
+                if fp13 is not None:
+                    src["price_13pct_vat"] = SOURCE_ORIGINAL
             else:
                 basis = parse_price_basis_from_remark(row.remark)
                 pg = row.price_general
                 if pg is not None:
-                    net_f, t1, t3, t13 = derive_vat_prices_from_stated_price(
+                    net_f, _, _, _ = derive_vat_prices_from_stated_price(
                         float(pg), basis, None
                     )
                     net_f = round(net_f, 2)
-                    fp1 = float(row.price_1pct_vat) if row.price_1pct_vat is not None else t1
-                    fp3 = float(row.price_3pct_vat) if row.price_3pct_vat is not None else t3
-                    fp13 = float(row.price_13pct_vat) if row.price_13pct_vat is not None else t13
+                    fp1 = float(row.price_1pct_vat) if row.price_1pct_vat is not None else None
+                    fp3 = float(row.price_3pct_vat) if row.price_3pct_vat is not None else None
+                    fp13 = float(row.price_13pct_vat) if row.price_13pct_vat is not None else None
+                    src["unit_price"] = SOURCE_DERIVED
+                    if fp1 is not None:
+                        src["price_1pct_vat"] = SOURCE_ORIGINAL
+                    if fp3 is not None:
+                        src["price_3pct_vat"] = SOURCE_ORIGINAL
+                    if fp13 is not None:
+                        src["price_13pct_vat"] = SOURCE_ORIGINAL
                 elif row.price_3pct_vat is not None:
-                    net_f = round(net_from_inclusive(float(row.price_3pct_vat), r0["3pct"]), 2)
-                    f1, f3, f13 = fill_vat_from_exclusive_net(net_f, r0)
-                    fp1 = float(row.price_1pct_vat) if row.price_1pct_vat is not None else f1
+                    net_f = round(
+                        net_from_inclusive(float(row.price_3pct_vat), defaults["3pct"]), 2
+                    )
+                    fp1 = float(row.price_1pct_vat) if row.price_1pct_vat is not None else None
                     fp3 = float(row.price_3pct_vat)
-                    fp13 = float(row.price_13pct_vat) if row.price_13pct_vat is not None else f13
+                    fp13 = float(row.price_13pct_vat) if row.price_13pct_vat is not None else None
+                    src["unit_price"] = SOURCE_DERIVED
+                    src["price_3pct_vat"] = SOURCE_ORIGINAL
+                    if fp1 is not None:
+                        src["price_1pct_vat"] = SOURCE_ORIGINAL
+                    if fp13 is not None:
+                        src["price_13pct_vat"] = SOURCE_ORIGINAL
                 elif row.price_13pct_vat is not None:
-                    net_f = round(net_from_inclusive(float(row.price_13pct_vat), r0["13pct"]), 2)
-                    f1, f3, f13 = fill_vat_from_exclusive_net(net_f, r0)
-                    fp1 = float(row.price_1pct_vat) if row.price_1pct_vat is not None else f1
-                    fp3 = float(row.price_3pct_vat) if row.price_3pct_vat is not None else f3
+                    net_f = round(
+                        net_from_inclusive(float(row.price_13pct_vat), defaults["13pct"]), 2
+                    )
+                    fp1 = float(row.price_1pct_vat) if row.price_1pct_vat is not None else None
+                    fp3 = float(row.price_3pct_vat) if row.price_3pct_vat is not None else None
                     fp13 = float(row.price_13pct_vat)
+                    src["unit_price"] = SOURCE_DERIVED
+                    src["price_13pct_vat"] = SOURCE_ORIGINAL
+                    if fp1 is not None:
+                        src["price_1pct_vat"] = SOURCE_ORIGINAL
+                    if fp3 is not None:
+                        src["price_3pct_vat"] = SOURCE_ORIGINAL
                 elif row.price_1pct_vat is not None:
-                    net_f = round(net_from_inclusive(float(row.price_1pct_vat), r0["1pct"]), 2)
-                    f1, f3, f13 = fill_vat_from_exclusive_net(net_f, r0)
+                    net_f = round(
+                        net_from_inclusive(float(row.price_1pct_vat), defaults["1pct"]), 2
+                    )
                     fp1 = float(row.price_1pct_vat)
-                    fp3 = float(row.price_3pct_vat) if row.price_3pct_vat is not None else f3
-                    fp13 = float(row.price_13pct_vat) if row.price_13pct_vat is not None else f13
+                    fp3 = float(row.price_3pct_vat) if row.price_3pct_vat is not None else None
+                    fp13 = float(row.price_13pct_vat) if row.price_13pct_vat is not None else None
+                    src["unit_price"] = SOURCE_DERIVED
+                    src["price_1pct_vat"] = SOURCE_ORIGINAL
+                    if fp3 is not None:
+                        src["price_3pct_vat"] = SOURCE_ORIGINAL
+                    if fp13 is not None:
+                        src["price_13pct_vat"] = SOURCE_ORIGINAL
                 else:
                     net_f, fp1, fp3, fp13 = None, None, None, None
+
+            if price_normal is not None:
+                src["price_normal_invoice"] = SOURCE_ORIGINAL
+            if price_reverse is not None:
+                src["price_reverse_invoice"] = SOURCE_ORIGINAL
 
             items.append({
                 "冶炼厂名": factory_name,
@@ -966,6 +1148,7 @@ class TLService:
                 "价格_13pct增值税": fp13,
                 "普通发票价格": float(price_normal) if price_normal is not None else None,
                 "反向发票价格": float(price_reverse) if price_reverse is not None else None,
+                "价格字段来源": src,
             })
         return items
 
@@ -1033,7 +1216,6 @@ class TLService:
                         # 取第一条 item 的冶炼厂id作为元数据的 factory_id
                         factory_id_for_meta = items[0].get("冶炼厂id") if items else None
                         if factory_id_for_meta:
-                            import json as _json
                             cur.execute(
                                 """
                                 INSERT INTO quote_table_metadata
@@ -1064,11 +1246,11 @@ class TLService:
                                     full_data.get("subtitle", ""),
                                     full_data.get("valid_period", ""),
                                     full_data.get("price_unit", "元/吨"),
-                                    _json.dumps(full_data.get("headers", []), ensure_ascii=False),
-                                    _json.dumps(full_data.get("footer_notes", []), ensure_ascii=False),
+                                    json.dumps(full_data.get("headers", []), ensure_ascii=False),
+                                    json.dumps(full_data.get("footer_notes", []), ensure_ascii=False),
                                     full_data.get("footer_notes_raw", ""),
                                     full_data.get("brand_specifications", ""),
-                                    _json.dumps(full_data.get("policies", {}), ensure_ascii=False),
+                                    json.dumps(full_data.get("policies", {}), ensure_ascii=False),
                                     full_data.get("raw_full_text", ""),
                                     full_data.get("source_image", full_data.get("file_name", "")),
                                 ),
@@ -1084,7 +1266,7 @@ class TLService:
                                 row = cur.fetchone()
                                 metadata_id = row[0] if row else None
 
-                    # 3b. 不含税基准「价格」→ 补全未填的含1%/3%/13%（按冶炼厂税率表）
+                    # 3b. 按冶炼厂 factory_tax_rates（与默认合并）统一计算「价格」与含1%/3%/13%价（覆盖上传预览推算）
                     factory_ids = list({item["冶炼厂id"] for item in items})
                     tax_by_fid: Dict[int, Dict[str, float]] = {}
                     if factory_ids:
@@ -1096,34 +1278,40 @@ class TLService:
                         )
                         for fid, ttype, tr in cur.fetchall():
                             tax_by_fid.setdefault(int(fid), {})[str(ttype)] = float(tr)
+                    snapshots = [{k: it.get(k) for k in API_KEY_TO_DB} for it in items]
+
+                    applied_factory_tax: List[bool] = []
                     for item in items:
-                        base = item.get("价格")
-                        fid = item.get("冶炼厂id")
-                        if base is None or fid is None:
-                            continue
-                        merged = merge_factory_rates(tax_by_fid.get(int(fid)))
-                        if (
-                            item.get("价格_1pct增值税") is None
-                            or item.get("价格_3pct增值税") is None
-                            or item.get("价格_13pct增值税") is None
-                        ):
-                            f1, f3, f13 = fill_vat_from_exclusive_net(float(base), merged)
-                            if item.get("价格_1pct增值税") is None:
-                                item["价格_1pct增值税"] = f1
-                            if item.get("价格_3pct增值税") is None:
-                                item["价格_3pct增值税"] = f3
-                            if item.get("价格_13pct增值税") is None:
-                                item["价格_13pct增值税"] = f13
+                        applied_factory_tax.append(
+                            _apply_factory_tax_rates_to_quote_item(item, tax_by_fid)
+                        )
+
+                    final_sources_list: List[Dict[str, str]] = []
+                    for item, snap, tax_applied in zip(items, snapshots, applied_factory_tax):
+                        client_src = normalize_client_sources(item.get("价格字段来源"))
+                        merged_src = merge_sources_after_fill(item, snap, client_src)
+                        if tax_applied:
+                            merged_src["price_1pct_vat"] = SOURCE_DERIVED
+                            merged_src["price_3pct_vat"] = SOURCE_DERIVED
+                            merged_src["price_13pct_vat"] = SOURCE_DERIVED
+                            merged_src["unit_price"] = (
+                                SOURCE_ORIGINAL
+                                if snap.get("价格") is not None
+                                else SOURCE_DERIVED
+                            )
+                        final_sources_list.append(merged_src)
 
                     # 4. 写入明细，相同(日期+冶炼厂+品类名)则更新价格
-                    for item in items:
+                    written_sources: List[Dict[str, Any]] = []
+                    for item, final_src in zip(items, final_sources_list):
+                        src_json = json.dumps(final_src, ensure_ascii=False) if final_src else None
                         cur.execute(
                             """
                             INSERT INTO quote_details
                             (quote_date, factory_id, category_name, metadata_id,
                              unit_price, price_1pct_vat, price_3pct_vat, price_13pct_vat,
-                             price_normal_invoice, price_reverse_invoice)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                             price_normal_invoice, price_reverse_invoice, price_field_sources)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                             ON DUPLICATE KEY UPDATE
                                 metadata_id = VALUES(metadata_id),
                                 unit_price = VALUES(unit_price),
@@ -1132,6 +1320,7 @@ class TLService:
                                 price_13pct_vat = VALUES(price_13pct_vat),
                                 price_normal_invoice = VALUES(price_normal_invoice),
                                 price_reverse_invoice = VALUES(price_reverse_invoice),
+                                price_field_sources = VALUES(price_field_sources),
                                 updated_at = CURRENT_TIMESTAMP
                             """,
                             (
@@ -1145,16 +1334,25 @@ class TLService:
                                 item.get("价格_13pct增值税"),
                                 item.get("普通发票价格"),
                                 item.get("反向发票价格"),
+                                src_json,
                             ),
                         )
                         if cur.rowcount == 1:
                             inserted += 1
                         else:
                             updated += 1
+                        written_sources.append(
+                            {
+                                "冶炼厂id": item["冶炼厂id"],
+                                "品类名": item["品类名"],
+                                "价格字段来源": final_src,
+                            }
+                        )
 
             return {
                 "code": 200,
                 "msg": f"写入成功：新增 {inserted} 条，更新 {updated} 条",
+                "明细价格来源": written_sources,
             }
 
         except ValueError:
@@ -1466,6 +1664,7 @@ class TLService:
                                qd.price_13pct_vat AS `价格_13pct增值税`,
                                qd.price_normal_invoice AS `普通发票价格`,
                                qd.price_reverse_invoice AS `反向发票价格`,
+                               qd.price_field_sources AS `价格字段来源`,
                                qd.created_at AS `创建时间`,
                                qd.updated_at AS `更新时间`
                         {base_from}
@@ -1475,10 +1674,15 @@ class TLService:
                         tuple(params) + (page_size, offset),
                     )
                     cols = [d[0] for d in cur.description]
-                    rows = [
-                        {c: _cell_json(v) for c, v in zip(cols, r)}
-                        for r in cur.fetchall()
-                    ]
+                    rows = []
+                    for r in cur.fetchall():
+                        row: Dict[str, Any] = {}
+                        for c, v in zip(cols, r):
+                            if c == "价格字段来源":
+                                row[c] = _json_cell_to_dict(v)
+                            else:
+                                row[c] = _cell_json(v)
+                        rows.append(row)
             if response_format == "table":
                 rows = [
                     {

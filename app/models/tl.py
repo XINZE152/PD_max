@@ -1,6 +1,10 @@
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+OPTIMAL_PRICE_BASIS_ALLOWED = frozenset(
+    {"base", "1pct", "3pct", "13pct", "normal_invoice", "reverse_invoice"}
+)
 
 
 class ComparisonRequest(BaseModel):
@@ -29,6 +33,42 @@ class ComparisonRequest(BaseModel):
         gt=0,
         description="按车计费时一车折合吨数；车数=向上取整(吨数/每车吨数)，至少1车",
     )
+    最优价计税口径列表: List[str] = Field(
+        default_factory=lambda: ["3pct"],
+        description=(
+            "最优价（单价×吨数−总运费）按哪些口径各算一份。"
+            "base=不含税基准；1pct/3pct/13pct=对应含税单价；"
+            "normal_invoice/reverse_invoice=表中对应列单价（元/吨）。可多选，重复项会去重保序。"
+        ),
+    )
+    最优价排序口径: Optional[str] = Field(
+        None,
+        description="明细与冶炼厂排行按该口径下的利润从高到低排序；须出现在最优价计税口径列表中；省略则用列表第一项",
+    )
+
+    @field_validator("最优价计税口径列表", mode="after")
+    @classmethod
+    def _normalize_optimal_basis_list(cls, v: List[str]) -> List[str]:
+        order_unique: List[str] = []
+        seen = set()
+        for x in v:
+            if x not in OPTIMAL_PRICE_BASIS_ALLOWED:
+                raise ValueError(
+                    f"不支持的最优价计税口径: {x!r}，允许：{sorted(OPTIMAL_PRICE_BASIS_ALLOWED)}"
+                )
+            if x not in seen:
+                seen.add(x)
+                order_unique.append(x)
+        return order_unique if order_unique else ["3pct"]
+
+    @model_validator(mode="after")
+    def _validate_optimal_sort_basis(self) -> "ComparisonRequest":
+        sk = self.最优价排序口径
+        if sk is not None and sk not in self.最优价计税口径列表:
+            raise ValueError(
+                f"最优价排序口径 {sk!r} 须为最优价计税口径列表中的一项，当前列表={self.最优价计税口径列表}"
+            )
+        return self
 
 
 class AddWarehouseRequest(BaseModel):
@@ -149,6 +189,14 @@ class ConfirmPriceTableItem(BaseModel):
     价格_13pct增值税: Optional[float] = Field(None, description="13%增值税价格（元/吨）")
     普通发票价格: Optional[float] = Field(None, description="普通发票价格（元/吨）")
     反向发票价格: Optional[float] = Field(None, description="反向发票价格（元/吨）")
+    价格字段来源: Optional[Dict[str, str]] = Field(
+        None,
+        description=(
+            "各价格列来源：键为库列名（unit_price, price_1pct_vat, price_3pct_vat, price_13pct_vat, "
+            "price_normal_invoice, price_reverse_invoice）或与上传接口一致的中文键（价格、价格_1pct增值税 等）；"
+            "值为「原数据」或「换算」。上传识别返回的 items 中若带此字段可原样回传；确认写入时含1%/3%/13%价会按冶炼厂税率表重算并标为「换算」（不含税列按是否本次提交原值标原数据/换算）。"
+        ),
+    )
 
 
 class ConfirmPriceTableRequest(BaseModel):

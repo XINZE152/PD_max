@@ -13,11 +13,13 @@ from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
+from functools import partial
+
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
@@ -25,6 +27,13 @@ from PIL import Image, ImageDraw, ImageFont
 
 from app.config import UPLOAD_DIR
 from app.ai_detection.easyocr_download_patch import patch_easyocr_download
+from app.ai_detection.history_db import (
+    HISTORY_RETENTION_DAYS,
+    get_ai_detection_history_image_path,
+    insert_ai_detection_history,
+    list_ai_detection_history,
+    purge_ai_detection_history_older_than,
+)
 from app.ai_detection.runtime_assets import get_easyocr_reader_kwargs
 
 if TYPE_CHECKING:
@@ -196,6 +205,17 @@ async def cleanup_daemon(registry: AbstractTaskRegistry):
 
             if tasks_to_delete:
                 logger.info("GC removed %s expired AI detection task(s)", len(tasks_to_delete))
+
+            try:
+                purged = await run_in_threadpool(purge_ai_detection_history_older_than)
+                if purged:
+                    logger.info(
+                        "AI detection DB history purge removed %s row(s) older than %s day(s)",
+                        purged,
+                        HISTORY_RETENTION_DAYS,
+                    )
+            except Exception:
+                logger.exception("AI detection DB history purge failed")
         except asyncio.CancelledError:
             logger.info("AI detection GC daemon stopped")
             break
@@ -346,8 +366,12 @@ class DetectionService:
         bbox_list: List[int],
         engine: InferenceEngineAPI,
         semaphore: asyncio.Semaphore,
-    ) -> Dict[str, Any]:
-        tmp_path = None
+        *,
+        retain_temp_for_history: bool = False,
+    ) -> Tuple[Dict[str, Any], Optional[str]]:
+        """成功时若 retain_temp_for_history=True，返回 (结果, 临时图路径)，由调用方在归档后删除临时文件。"""
+        tmp_path: Optional[str] = None
+        keep_tmp = False
         try:
             with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
                 tmp.write(await file.read())
@@ -359,9 +383,11 @@ class DetectionService:
             result_dict = json.loads(result_str)
             if result_dict.get("result") == "错误":
                 raise ValueError(result_dict.get("reason", "Unknown engine internal error."))
-            return result_dict
+            if retain_temp_for_history:
+                keep_tmp = True
+            return result_dict, (tmp_path if retain_temp_for_history else None)
         finally:
-            if tmp_path and os.path.exists(tmp_path):
+            if tmp_path and os.path.exists(tmp_path) and not keep_tmp:
                 os.remove(tmp_path)
 
 
@@ -415,6 +441,7 @@ class DetectionDomainServiceV3:
             return
 
         await self.registry.update_task(task_id, status=TaskStatusEnum.PROCESSING)
+        stored_name = Path(image_path).name
 
         try:
             await ensure_ai_detection_runtime()
@@ -434,6 +461,14 @@ class DetectionDomainServiceV3:
 
                 res_dict["original_bbox"] = bbox_list
                 await self.registry.update_task(task_id, status=TaskStatusEnum.COMPLETED, result=res_dict)
+                await self._persist_history(
+                    task_id=task_id,
+                    original_filename=stored_name,
+                    bbox=bbox.model_dump(),
+                    status="COMPLETED",
+                    result=res_dict,
+                    source_image_path=image_path,
+                )
                 return
 
             async with self.semaphore:
@@ -442,6 +477,14 @@ class DetectionDomainServiceV3:
             if not bboxes:
                 empty_res = {"result": "正常", "confidence": 0.0, "reason": "未发现关键数值或单号区域"}
                 await self.registry.update_task(task_id, status=TaskStatusEnum.COMPLETED, result=empty_res)
+                await self._persist_history(
+                    task_id=task_id,
+                    original_filename=stored_name,
+                    bbox={"auto_ocr": True, "note": "no_numeric_regions"},
+                    status="COMPLETED",
+                    result=empty_res,
+                    source_image_path=image_path,
+                )
                 return
 
             all_results = []
@@ -459,10 +502,26 @@ class DetectionDomainServiceV3:
                     logger.warning("Task %s single bbox failed: %s", task_id, exc)
 
             await self.registry.update_task(task_id, status=TaskStatusEnum.COMPLETED, multi_results=all_results)
+            await self._persist_history(
+                task_id=task_id,
+                original_filename=stored_name,
+                bbox={"auto_ocr": True, "box_count": len(all_results)},
+                status="COMPLETED",
+                multi_results=all_results,
+                source_image_path=image_path,
+            )
 
         except Exception as exc:
             logger.exception("Task %s failed", task_id)
             await self.registry.update_task(task_id, status=TaskStatusEnum.FAILED, error_msg=str(exc))
+            await self._persist_history(
+                task_id=task_id,
+                original_filename=stored_name,
+                bbox=bbox.model_dump() if bbox else None,
+                status="FAILED",
+                error_msg=str(exc),
+                source_image_path=image_path,
+            )
 
     async def generate_visualization(self, task_id: str) -> str:
         task = await self.registry.get_task(task_id)
@@ -524,6 +583,42 @@ class DetectionDomainServiceV3:
 
         await run_in_threadpool(draw_bboxes)
         return str(vis_path)
+
+    async def _persist_history(
+        self,
+        *,
+        task_id: str,
+        original_filename: str,
+        bbox: Optional[Any],
+        status: str,
+        result: Optional[Dict[str, Any]] = None,
+        multi_results: Optional[List[Dict[str, Any]]] = None,
+        error_msg: Optional[str] = None,
+        source_image_path: Optional[str] = None,
+    ) -> None:
+        try:
+            if error_msg:
+                outcome: Dict[str, Any] = {"error_msg": error_msg}
+            elif multi_results is not None:
+                outcome = {"multi_results": multi_results}
+            elif result is not None:
+                outcome = {"result": result}
+            else:
+                outcome = {}
+            await run_in_threadpool(
+                partial(
+                    insert_ai_detection_history,
+                    mode="async_v3",
+                    task_id=task_id,
+                    original_filename=original_filename,
+                    bbox=bbox,
+                    status=status,
+                    outcome=outcome,
+                    source_image_path=source_image_path,
+                ),
+            )
+        except Exception:
+            logger.exception("AI detection history async persist failed task=%s", task_id)
 
 
 router = APIRouter(
@@ -601,11 +696,85 @@ async def detect_tampering_endpoint(
     except Exception:
         raise HTTPException(status_code=400, detail="bbox 格式无效，请使用 [x1,y1,x2,y2] 或 x1,y1,x2,y2")
 
+    tmp_history_path: Optional[str] = None
     try:
-        res = await DetectionService.process_detection(file, [int(x) for x in bbox_parsed], engine, semaphore)
+        res, tmp_history_path = await DetectionService.process_detection(
+            file,
+            [int(x) for x in bbox_parsed],
+            engine,
+            semaphore,
+            retain_temp_for_history=True,
+        )
+        try:
+            await run_in_threadpool(
+                partial(
+                    insert_ai_detection_history,
+                    mode="sync_v1",
+                    task_id=None,
+                    original_filename=file.filename,
+                    bbox=list(int(x) for x in bbox_parsed),
+                    status="COMPLETED",
+                    outcome={"result": res},
+                    source_image_path=tmp_history_path,
+                ),
+            )
+        except Exception:
+            logger.exception("AI detection sync history persist failed")
         return {"status": "success", "data": res}
     except ValueError as exc:
         return JSONResponse(status_code=422, content={"status": "error", "message": str(exc)})
+    finally:
+        if tmp_history_path and os.path.exists(tmp_history_path):
+            try:
+                os.remove(tmp_history_path)
+            except OSError:
+                pass
+
+
+@router.get(
+    "/api/v1/history",
+    summary="鉴伪检测历史记录",
+    description=(
+        "分页返回最近 **7 天**（可用环境变量 `AI_DETECTION_HISTORY_DAYS` 调整）内的检测记录；"
+        "每次查询前会清理超过保留期的数据。\n\n"
+        "**查询参数**：`page`（默认 1）、`page_size`（默认 20，最大 200）。\n\n"
+        "**单条字段**：`id`、`created_at`、`mode`（sync_v1 | async_v3）、`task_id`、`original_filename`、"
+        "`bbox`、`status`（COMPLETED | FAILED）、`outcome`（含 `result` / `multi_results` / `error_msg`）、"
+        "`image_url`（有归档图时为 `GET /ai-detection/api/v1/history/{id}/image` 的路径前缀，否则为 null）。\n"
+    ),
+)
+async def list_detection_history(
+    page: int = Query(1, ge=1, description="页码，从 1 开始"),
+    page_size: int = Query(20, ge=1, le=200, description="每页条数"),
+):
+    total, rows = await run_in_threadpool(
+        partial(list_ai_detection_history, page=page, page_size=page_size),
+    )
+    return {
+        "status": "success",
+        "retention_days": HISTORY_RETENTION_DAYS,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "list": rows,
+    }
+
+
+@router.get(
+    "/api/v1/history/{record_id}/image",
+    summary="鉴伪历史归档图",
+    description="返回该条历史记录对应的上传原图（JPEG）。无归档或记录不存在时返回 404。",
+    response_class=FileResponse,
+)
+async def get_detection_history_image(record_id: int):
+    path = await run_in_threadpool(get_ai_detection_history_image_path, record_id)
+    if path is None:
+        raise HTTPException(status_code=404, detail="记录不存在或未归档图片")
+    return FileResponse(
+        path,
+        media_type="image/jpeg",
+        filename=path.name,
+    )
 
 
 @router.post(

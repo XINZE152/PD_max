@@ -228,11 +228,14 @@ def get_comparison(
             tons=body.吨数,
             freight_mode=body.运费计价方式,
             tons_per_truck=body.每车吨数,
+            optimal_basis_list=body.最优价计税口径列表,
+            optimal_sort_basis=body.最优价排序口径,
         )
         return {
             "code": 200,
             "data": out["明细"],
             "冶炼厂利润排行": out["冶炼厂利润排行"],
+            "最优价排序口径": out["最优价排序口径"],
         }
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

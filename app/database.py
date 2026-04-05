@@ -171,6 +171,7 @@ TABLE_STATEMENTS = [
         price_13pct_vat DECIMAL(10, 2) COMMENT '13%增值税价格',
         price_normal_invoice DECIMAL(10, 2) COMMENT '普通发票价格',
         price_reverse_invoice DECIMAL(10, 2) COMMENT '反向发票价格',
+        price_field_sources JSON NULL COMMENT '各价格字段来源：键为列名，值为原数据/换算',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         CONSTRAINT fk_detail_factory FOREIGN KEY (factory_id) REFERENCES dict_factories (id) ON UPDATE CASCADE ON DELETE RESTRICT,
@@ -221,7 +222,68 @@ TABLE_STATEMENTS = [
         UNIQUE KEY uk_demand_category (demand_id, category_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='冶炼厂需求明细表（预留）';
     """,
+    # 图片鉴伪检测历史（保留策略由应用层按天数清理）
+    """
+    CREATE TABLE IF NOT EXISTS ai_detection_history (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间（UTC）',
+        mode VARCHAR(24) NOT NULL COMMENT 'sync_v1=同步单框 | async_v3=异步任务',
+        task_id VARCHAR(64) NULL COMMENT '异步任务 UUID，同步为空',
+        original_filename VARCHAR(512) NULL COMMENT '上传原始文件名',
+        bbox JSON NULL COMMENT '检测框或自动模式说明',
+        status VARCHAR(32) NOT NULL COMMENT 'COMPLETED | FAILED',
+        outcome_json JSON NOT NULL COMMENT '结果摘要：result / multi_results / error_msg',
+        stored_image VARCHAR(255) NULL COMMENT '归档图文件名（置于 ai_detection_history_images/）',
+        INDEX idx_ai_hist_created (created_at),
+        INDEX idx_ai_hist_task (task_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='AI图片鉴伪历史记录';
+    """,
 ]
+
+
+def ensure_quote_details_price_field_sources_column() -> None:
+    """已有库升级：为 quote_details 增加 price_field_sources（新建库已由 CREATE TABLE 包含）。"""
+    config_dict = get_mysql_config()
+    connection = pymysql.connect(**config_dict)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT COUNT(*) FROM information_schema.columns "
+                "WHERE table_schema = DATABASE() AND table_name = 'quote_details' "
+                "AND column_name = 'price_field_sources'"
+            )
+            if cursor.fetchone()[0] == 0:
+                cursor.execute(
+                    "ALTER TABLE quote_details ADD COLUMN price_field_sources JSON NULL "
+                    "COMMENT '各价格字段来源：键为列名，值为原数据/换算' "
+                    "AFTER price_reverse_invoice"
+                )
+                logger.info("已为 quote_details 添加 price_field_sources 列")
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def ensure_ai_detection_history_stored_image_column() -> None:
+    """已有库升级：为 ai_detection_history 增加 stored_image（新建库已由 CREATE TABLE 包含）。"""
+    config_dict = get_mysql_config()
+    connection = pymysql.connect(**config_dict)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT COUNT(*) FROM information_schema.columns "
+                "WHERE table_schema = DATABASE() AND table_name = 'ai_detection_history' "
+                "AND column_name = 'stored_image'"
+            )
+            if cursor.fetchone()[0] == 0:
+                cursor.execute(
+                    "ALTER TABLE ai_detection_history ADD COLUMN stored_image VARCHAR(255) NULL "
+                    "COMMENT '归档图文件名' AFTER outcome_json"
+                )
+                logger.info("已为 ai_detection_history 添加 stored_image 列")
+        connection.commit()
+    finally:
+        connection.close()
 
 
 def create_tables() -> None:
@@ -236,6 +298,14 @@ def create_tables() -> None:
         logger.info("所有数据表创建完成")
     finally:
         connection.close()
+    try:
+        ensure_quote_details_price_field_sources_column()
+    except Exception:
+        logger.exception("检查/添加 quote_details.price_field_sources 失败")
+    try:
+        ensure_ai_detection_history_stored_image_column()
+    except Exception:
+        logger.exception("检查/添加 ai_detection_history.stored_image 失败")
 
 
 def init_default_data() -> None:

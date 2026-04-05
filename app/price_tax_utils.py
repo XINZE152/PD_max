@@ -1,12 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-报价含税换算（与 quote_details、比价一致）：
+报价含税换算（与 quote_details、比价、确认写入一致）。
 
-- **unit_price / 接口「价格」**：**不含税基准价**。
-- **单列报价**：表内数字按 **备注** 解析为「不含税 / 含1% / 含3% / 含13%」口径；**无备注或无法识别时默认按不含税**。
-- 含 1%/3%/13% 价由不含税基准 × (1+税率) 推算；若表中数字本身是含税价，先除以 (1+税率) 还原不含税，再推算其它档。
+**图片来源**：识别结果可能是**不含税基准价**，也可能是某一档**含税价**（多列或单列+备注推断口径）。
 
-冶炼厂 `factory_tax_rates` 覆盖默认税率。
+**系统税率**：以 `factory_tax_rates` 与默认 1%/3%/13% **合并**（`merge_factory_rates`）为权威税率。
+
+**双向推算**（均用上述合并税率）：
+- 已知**不含税基准** → 含税价 = 基准 × (1 + 对应税率)，补全含 1%/3%/13% 各列（`fill_vat_from_exclusive_net`）。
+- 已知某一档**含税价** → 不含税基准 = 含税价 ÷ (1 + 该档税率)（`net_from_inclusive`），再由此基准正算其余档含税价。
+
+**入库时机**：`confirm_price_table` 在确认写入时按冶炼厂执行上述统一换算；上传/VLM 仅带回识别字段与预览占位，最终以确认时系统税率为准。
 """
 import re
 from typing import Dict, Literal, Optional, Tuple, Any
@@ -123,10 +127,10 @@ def derive_net_and_vat_from_quote_row(
     merged_rates: Dict[str, float],
 ) -> Optional[Tuple[float, float, float, float]]:
     """
-    从 quote_details 一行（各列可能只填部分）反推统一的不含税基准与各档含税价。
+    从库表一行得到统一「基准 + 含1%/3%/13%」：支持「已有基准正算含税」或「仅有含税列先反算基准再正算其余档」。
     返回 (基准不含税, 含1%价, 含3%价, 含13%价)；无法推算时 None。
 
-    优先级：unit_price → 13%/3%/1% 含税列（按厂税率反算不含税）→ 普票/反向发票列（按不含税理解）。
+    取数优先级：unit_price（基准）→ 13%/3%/1% 含税列（用合并税率反算基准）→ 普票/反向发票列（按不含税理解后再正算三档）。
     """
     if prices.get("unit_price") is not None:
         net = float(prices["unit_price"])
