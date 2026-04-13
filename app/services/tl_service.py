@@ -38,6 +38,23 @@ from app.services.vlm_extractor_service import QwenVLFullExtractor, VLMConfig
 logger = logging.getLogger(__name__)
 
 
+def _comparison_quote_calendar_date() -> date:
+    """
+    比价使用的「当天」报价日期（仅取 quote_details 中该日的行，不取历史上传）。
+    默认按 Asia/Shanghai 日历日；可通过环境变量 QUOTE_COMPARISON_TZ 设为其它 IANA 时区（如 UTC）。
+    """
+    tz_name = (os.getenv("QUOTE_COMPARISON_TZ") or "Asia/Shanghai").strip() or "Asia/Shanghai"
+    try:
+        from zoneinfo import ZoneInfo
+
+        return datetime.now(ZoneInfo(tz_name)).date()
+    except Exception:
+        logger.warning(
+            "QUOTE_COMPARISON_TZ=%r 无效，比价日期回退为服务器本地当天", tz_name
+        )
+        return date.today()
+
+
 def _unit_for_optimal_price_basis(
     basis: str,
     breakdown: Optional[Tuple[float, float, float, float]],
@@ -510,6 +527,9 @@ class TLService:
           3. 目标是普通价(unit_price) 但列空 → 由已知含1%/3%/13%价反算不含税基准
           4. 仅有某一档含税价 → 先反算不含税，再换算到目标税率
           5. 以上均无 → None，返回 price_source="unavailable"
+
+        **报价日期**：仅使用「当天」`quote_details`（默认按 `Asia/Shanghai` 日历日，见 `QUOTE_COMPARISON_TZ`），
+        历史上传的其它日期不参与比价。
         """
         if not warehouse_ids or not smelter_ids or not category_ids:
             return {
@@ -620,7 +640,8 @@ class TLService:
                     for fid, ttype, rate in cur.fetchall():
                         tax_rate_map.setdefault(fid, {})[ttype] = float(rate)
 
-                    # 最新报价（通过品类名称查询）
+                    # 仅「当天」报价（不按历史 MAX(quote_date)）；无当日行则该品类无报价
+                    quote_day = _comparison_quote_calendar_date()
                     cur.execute(
                         f"""
                         SELECT factory_id, category_name,
@@ -629,14 +650,9 @@ class TLService:
                         FROM quote_details
                         WHERE factory_id IN ({sm_ph})
                           AND category_name IN ({cn_ph})
-                          AND quote_date = (
-                              SELECT MAX(qd2.quote_date)
-                              FROM quote_details qd2
-                              WHERE qd2.factory_id  = quote_details.factory_id
-                                AND qd2.category_name = quote_details.category_name
-                          )
+                          AND quote_date = %s
                         """,
-                        tuple(smelter_ids) + tuple(all_cat_names),
+                        tuple(smelter_ids) + tuple(all_cat_names) + (quote_day,),
                     )
                     # raw_price_map: {(factory_id, category_name): {col: value}}
                     col_names = ["unit_price", "price_1pct_vat", "price_3pct_vat",
