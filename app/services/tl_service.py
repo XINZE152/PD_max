@@ -1537,6 +1537,8 @@ class TLService:
         """
         解析运费矩阵：第 1 行表头为「库房」+ 冶炼厂名称；自第 2 行起首列为库房名，对应列填运费。
         与 upload_freight 相同写入 freight_rates（当日生效）；空单元格跳过。
+        表头或首列出现库中不存在的冶炼厂、库房名称时，自动写入 dict_factories / dict_warehouses
+       （与 add_smelter / add_warehouse 一致；若名称已存在但已停用则恢复启用）。
         """
         if not content:
             raise ValueError("文件内容为空")
@@ -1578,25 +1580,70 @@ class TLService:
                 raise ValueError("表头为空")
 
             factory_by_col: Dict[int, Tuple[str, int]] = {}
+            stats = {
+                "new_wh": 0,
+                "new_fa": 0,
+                "re_wh": 0,
+                "re_fa": 0,
+            }
+
             with get_conn() as conn:
                 with conn.cursor() as cur:
-                    cur.execute(
-                        "SELECT id, name FROM dict_factories WHERE is_active = 1"
-                    )
-                    name_to_fid = {str(r[1]).strip(): int(r[0]) for r in cur.fetchall()}
+
+                    def _ensure_warehouse_id(name: str) -> int:
+                        cur.execute(
+                            "SELECT id, is_active FROM dict_warehouses WHERE name = %s",
+                            (name,),
+                        )
+                        row = cur.fetchone()
+                        if row:
+                            wid, act = int(row[0]), row[1]
+                            if act != 1:
+                                cur.execute(
+                                    "UPDATE dict_warehouses SET is_active = 1 WHERE id = %s",
+                                    (wid,),
+                                )
+                                stats["re_wh"] += 1
+                            return wid
+                        cur.execute(
+                            "INSERT INTO dict_warehouses (name, is_active) VALUES (%s, 1)",
+                            (name,),
+                        )
+                        stats["new_wh"] += 1
+                        return int(cur.lastrowid)
+
+                    def _ensure_factory_id(name: str) -> int:
+                        cur.execute(
+                            "SELECT id, is_active FROM dict_factories WHERE name = %s",
+                            (name,),
+                        )
+                        row = cur.fetchone()
+                        if row:
+                            fid, act = int(row[0]), row[1]
+                            if act != 1:
+                                cur.execute(
+                                    "UPDATE dict_factories SET is_active = 1 WHERE id = %s",
+                                    (fid,),
+                                )
+                                stats["re_fa"] += 1
+                            return fid
+                        cur.execute(
+                            "INSERT INTO dict_factories (name, is_active) VALUES (%s, 1)",
+                            (name,),
+                        )
+                        stats["new_fa"] += 1
+                        return int(cur.lastrowid)
 
                     for col_idx in range(1, len(headers)):
                         h = headers[col_idx]
                         if not h:
                             continue
-                        fid = name_to_fid.get(h)
-                        if fid is None:
-                            continue
-                        factory_by_col[col_idx + 1] = (h, fid)  # 1-based column for messages
+                        fid = _ensure_factory_id(h)
+                        factory_by_col[col_idx + 1] = (h, fid)
 
                     if not factory_by_col:
                         raise ValueError(
-                            "表头中未匹配到任何启用中的冶炼厂名称，请与系统冶炼厂名称完全一致"
+                            "表头从第 2 列起至少需要一列冶炼厂名称（表头不能为空）"
                         )
 
                     today = date.today().isoformat()
@@ -1616,15 +1663,11 @@ class TLService:
                             skipped_rows += 1
                             continue
                         wh_name = str(wh_cell).strip()
-                        cur.execute(
-                            "SELECT id FROM dict_warehouses WHERE name = %s AND is_active = 1",
-                            (wh_name,),
-                        )
-                        wh_row = cur.fetchone()
-                        if not wh_row:
-                            errors.append(f"第{ridx}行：库房「{wh_name}」不存在或未启用")
+                        try:
+                            wid = _ensure_warehouse_id(wh_name)
+                        except Exception as ex:
+                            errors.append(f"第{ridx}行：库房「{wh_name}」未能写入字典：{ex}")
                             continue
-                        wid = int(wh_row[0])
 
                         for col_idx, (fname, fid) in factory_by_col.items():
                             if col_idx - 1 >= len(row):
@@ -1646,10 +1689,21 @@ class TLService:
                             written += 1
 
             msg = f"已写入 {written} 条运费（生效日期 {today}）"
+            extra = []
+            if stats["new_wh"] or stats["re_wh"]:
+                extra.append(f"库房新建 {stats['new_wh']}、恢复启用 {stats['re_wh']}")
+            if stats["new_fa"] or stats["re_fa"]:
+                extra.append(f"冶炼厂新建 {stats['new_fa']}、恢复启用 {stats['re_fa']}")
+            if extra:
+                msg += "；" + "；".join(extra)
             return {
                 "code": 200,
                 "msg": msg,
                 "写入条数": written,
+                "新建库房数": stats["new_wh"],
+                "恢复启用库房数": stats["re_wh"],
+                "新建冶炼厂数": stats["new_fa"],
+                "恢复启用冶炼厂数": stats["re_fa"],
                 "跳过空单元格数": skipped_cells,
                 "跳过空行数": skipped_rows,
                 "错误明细": errors if errors else None,
