@@ -238,6 +238,78 @@ TABLE_STATEMENTS = [
         INDEX idx_ai_hist_task (task_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='AI图片鉴伪历史记录';
     """,
+    # 智能送货量预测（与 intelligent_prediction ORM 表名一致）
+    """
+    CREATE TABLE IF NOT EXISTS pd_ip_delivery_records (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '主键',
+        regional_manager VARCHAR(255) NOT NULL COMMENT '大区经理',
+        smelter VARCHAR(100) DEFAULT NULL COMMENT '冶炼厂',
+        warehouse VARCHAR(255) NOT NULL COMMENT '仓库',
+        delivery_date DATE NOT NULL COMMENT '送货日期',
+        product_variety VARCHAR(255) NOT NULL COMMENT '品种',
+        weight DECIMAL(18,4) NOT NULL COMMENT '重量',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+        INDEX idx_ip_delivery_date (delivery_date),
+        INDEX idx_ip_warehouse (warehouse),
+        INDEX idx_ip_product_variety (product_variety),
+        INDEX idx_ip_regional_manager (regional_manager),
+        INDEX idx_ip_smelter (smelter)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='智能预测-送货历史';
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS pd_ip_prediction_batches (
+        id CHAR(36) NOT NULL PRIMARY KEY COMMENT '批次UUID字符串',
+        status VARCHAR(32) NOT NULL DEFAULT 'pending' COMMENT '状态',
+        celery_task_id VARCHAR(255) DEFAULT NULL COMMENT 'Celery任务ID',
+        error_message TEXT COMMENT '错误信息',
+        export_file_path VARCHAR(1024) DEFAULT NULL COMMENT '导出Excel路径',
+        meta JSON DEFAULT NULL COMMENT '请求元数据',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+        completed_at TIMESTAMP NULL DEFAULT NULL COMMENT '完成时间',
+        INDEX idx_ip_batch_status (status),
+        INDEX idx_ip_batch_celery (celery_task_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='智能预测-批次任务';
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS pd_ip_prediction_results (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '主键',
+        batch_id CHAR(36) DEFAULT NULL COMMENT '批次ID',
+        regional_manager VARCHAR(255) DEFAULT NULL COMMENT '大区经理',
+        warehouse VARCHAR(255) NOT NULL COMMENT '仓库',
+        product_variety VARCHAR(255) NOT NULL COMMENT '品种',
+        smelter VARCHAR(100) DEFAULT NULL COMMENT '冶炼厂',
+        target_date DATE NOT NULL COMMENT '预测目标日',
+        predicted_weight DECIMAL(18,4) NOT NULL COMMENT '预测重量',
+        confidence VARCHAR(32) NOT NULL DEFAULT 'medium' COMMENT '信心',
+        warnings JSON DEFAULT NULL COMMENT '警告列表',
+        provider_used VARCHAR(64) DEFAULT NULL COMMENT '供应商',
+        latency_ms DECIMAL(12,4) DEFAULT NULL COMMENT '延迟毫秒',
+        cost_usd DECIMAL(12,6) DEFAULT NULL COMMENT '成本美元',
+        raw_response_excerpt TEXT COMMENT '原始摘要/解析备注',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+        INDEX idx_ip_res_batch (batch_id),
+        INDEX idx_ip_res_warehouse (warehouse),
+        INDEX idx_ip_res_variety (product_variety),
+        INDEX idx_ip_res_smelter (smelter),
+        INDEX idx_ip_res_target_date (target_date),
+        CONSTRAINT fk_ip_res_batch FOREIGN KEY (batch_id) REFERENCES pd_ip_prediction_batches(id) ON DELETE SET NULL
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='智能预测-结果明细';
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS pd_ip_operation_audit (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '主键',
+        user_id BIGINT DEFAULT NULL COMMENT '用户ID',
+        user_label VARCHAR(255) DEFAULT NULL COMMENT '用户标识或姓名',
+        action VARCHAR(64) NOT NULL COMMENT '操作类型',
+        resource VARCHAR(128) DEFAULT NULL COMMENT '资源简述',
+        detail JSON DEFAULT NULL COMMENT '详情JSON',
+        client_ip VARCHAR(64) DEFAULT NULL COMMENT '客户端IP',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+        INDEX idx_ip_audit_action (action),
+        INDEX idx_ip_audit_created (created_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='智能预测-操作审计';
+    """,
 ]
 
 
@@ -259,6 +331,64 @@ def ensure_quote_details_price_field_sources_column() -> None:
                     "AFTER price_reverse_invoice"
                 )
                 logger.info("已为 quote_details 添加 price_field_sources 列")
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def ensure_pd_ip_prediction_results_smelter_column() -> None:
+    """已有库升级：为 pd_ip_prediction_results 补全 smelter（新建库已由 CREATE TABLE 包含）。"""
+    config_dict = get_mysql_config()
+    connection = pymysql.connect(**config_dict)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SHOW TABLES LIKE 'pd_ip_prediction_results'")
+            if cursor.fetchone() is None:
+                return
+            cursor.execute("SHOW COLUMNS FROM pd_ip_prediction_results LIKE 'smelter'")
+            if cursor.fetchone() is not None:
+                return
+            cursor.execute(
+                "ALTER TABLE pd_ip_prediction_results "
+                "ADD COLUMN smelter VARCHAR(100) DEFAULT NULL COMMENT '冶炼厂' "
+                "AFTER product_variety"
+            )
+            try:
+                cursor.execute(
+                    "ALTER TABLE pd_ip_prediction_results ADD INDEX idx_ip_res_smelter (smelter)"
+                )
+            except Exception:
+                pass
+            logger.info("已为 pd_ip_prediction_results 添加 smelter 列")
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def ensure_pd_ip_delivery_records_smelter_column() -> None:
+    """已有库升级：为 pd_ip_delivery_records 补全 smelter。"""
+    config_dict = get_mysql_config()
+    connection = pymysql.connect(**config_dict)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SHOW TABLES LIKE 'pd_ip_delivery_records'")
+            if cursor.fetchone() is None:
+                return
+            cursor.execute("SHOW COLUMNS FROM pd_ip_delivery_records LIKE 'smelter'")
+            if cursor.fetchone() is not None:
+                return
+            cursor.execute(
+                "ALTER TABLE pd_ip_delivery_records "
+                "ADD COLUMN smelter VARCHAR(100) DEFAULT NULL COMMENT '冶炼厂' "
+                "AFTER regional_manager"
+            )
+            try:
+                cursor.execute(
+                    "ALTER TABLE pd_ip_delivery_records ADD INDEX idx_ip_smelter (smelter)"
+                )
+            except Exception:
+                pass
+            logger.info("已为 pd_ip_delivery_records 添加 smelter 列")
         connection.commit()
     finally:
         connection.close()
@@ -306,6 +436,14 @@ def create_tables() -> None:
         ensure_ai_detection_history_stored_image_column()
     except Exception:
         logger.exception("检查/添加 ai_detection_history.stored_image 失败")
+    try:
+        ensure_pd_ip_delivery_records_smelter_column()
+    except Exception:
+        logger.exception("检查/添加 pd_ip_delivery_records.smelter 失败")
+    try:
+        ensure_pd_ip_prediction_results_smelter_column()
+    except Exception:
+        logger.exception("检查/添加 pd_ip_prediction_results.smelter 失败")
 
 
 def init_default_data() -> None:
