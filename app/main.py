@@ -4,11 +4,13 @@ import time
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 import app.config as app_config  # noqa: F401 — 加载项目根 .env（副作用）
 from app.api.v1.router import api_router
 from app.database import create_tables, init_default_data
 from app.logging_config import setup_logging
+from app.intelligent_prediction.exceptions import BusinessException
 
 setup_logging()
 logger = logging.getLogger(__name__)
@@ -30,6 +32,15 @@ if _cors_origins:
         )
 
 app.include_router(api_router)
+
+
+@app.exception_handler(BusinessException)
+async def business_exception_handler(request: Request, exc: BusinessException) -> JSONResponse:
+    _ = request
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"code": exc.code, "message": exc.message, "details": exc.details},
+    )
 
 
 @app.middleware("http")
@@ -94,6 +105,47 @@ async def on_startup():
     else:
         logger.info("AI 鉴伪模块已关闭（AI_DETECTION_ENABLED=0），不注册 /ai-detection 路由、不加载模型")
 
+    if app_config.INTELLIGENT_PREDICTION_ENABLED:
+        try:
+            from app.intelligent_prediction.services.cache_manager import get_cache_manager
+
+            await get_cache_manager().redis.connect()
+        except Exception:
+            logger.exception("智能預測 Redis 預連線失敗（不影響主服務）")
+        from app.intelligent_prediction.settings import settings as ip_settings
+
+        if ip_settings.intelligent_prediction_schedule_enabled:
+            from apscheduler.schedulers.background import BackgroundScheduler
+            from apscheduler.triggers.cron import CronTrigger
+
+            from app.intelligent_prediction.services.scheduled_prediction import (
+                run_scheduled_intelligent_prediction_sync,
+            )
+
+            sched = BackgroundScheduler(timezone="Asia/Shanghai")
+            sched.add_job(
+                func=run_scheduled_intelligent_prediction_sync,
+                trigger=CronTrigger(
+                    hour=ip_settings.intelligent_prediction_schedule_cron_hour,
+                    minute=ip_settings.intelligent_prediction_schedule_cron_minute,
+                ),
+                id="intelligent_prediction_schedule",
+                replace_existing=True,
+            )
+            sched.start()
+            app.state.ip_prediction_scheduler = sched
+            logger.info(
+                "智能預測定時任務已啟用：cron %s:%s",
+                ip_settings.intelligent_prediction_schedule_cron_hour,
+                ip_settings.intelligent_prediction_schedule_cron_minute,
+            )
+        else:
+            app.state.ip_prediction_scheduler = None
+    else:
+        logger.info(
+            "智能預測模組已關閉（INTELLIGENT_PREDICTION_ENABLED=0），不註冊相關路由"
+        )
+
 
 @app.on_event("shutdown")
 async def on_shutdown():
@@ -101,6 +153,16 @@ async def on_shutdown():
         from app.api.v1.routes.ai_detection import shutdown_ai_detection
 
         await shutdown_ai_detection()
+    if app_config.INTELLIGENT_PREDICTION_ENABLED:
+        sched = getattr(app.state, "ip_prediction_scheduler", None)
+        if sched is not None:
+            sched.shutdown(wait=False)
+        try:
+            from app.intelligent_prediction.services.cache_manager import get_cache_manager
+
+            await get_cache_manager().redis.close()
+        except Exception:
+            pass
 
 
 def _warn_insecure_defaults() -> None:

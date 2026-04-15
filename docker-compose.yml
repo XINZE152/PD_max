@@ -12,6 +12,12 @@ services:
     volumes:
       - mysql_data:/var/lib/mysql
 
+  redis:
+    image: redis:7-alpine
+    container_name: pd-max-redis
+    ports:
+      - "6379:6379"
+
   backend:
     build:
       context: .
@@ -22,6 +28,7 @@ services:
       - "8000:8000"
     depends_on:
       - mysql
+      - redis
     environment:
       PORT: 8000
       AI_DETECTION_PRELOAD: ${AI_DETECTION_PRELOAD}
@@ -45,6 +52,9 @@ services:
       VLM_API_KEY: ${VLM_API_KEY}
       VLM_BASE_URL: ${VLM_BASE_URL}
       VLM_MODEL: ${VLM_MODEL}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      CELERY_BROKER_URL: ${CELERY_BROKER_URL:-redis://redis:6379/1}
+      CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND:-redis://redis:6379/2}
 
 volumes:
   mysql_data:
