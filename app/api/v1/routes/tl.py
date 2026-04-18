@@ -84,7 +84,12 @@ def add_warehouse(
     service: TLService = Depends(get_tl_service),
 ):
     try:
-        return service.add_warehouse(name=body.仓库名)
+        return service.add_warehouse(
+            name=body.仓库名,
+            address=body.地址,
+            warehouse_type=body.类型,
+            color_config=body.颜色配置,
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -114,11 +119,9 @@ def update_warehouse(
     service: TLService = Depends(get_tl_service),
 ):
     try:
-        return service.update_warehouse(
-            warehouse_id=body.仓库id,
-            name=body.仓库名,
-            is_active=body.is_active,
-        )
+        patch = body.model_dump(exclude_unset=True)
+        warehouse_id = patch.pop("仓库id")
+        return service.update_warehouse(warehouse_id=warehouse_id, patch=patch)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -148,7 +151,7 @@ def add_smelter(
     service: TLService = Depends(get_tl_service),
 ):
     try:
-        return service.add_smelter(name=body.冶炼厂名)
+        return service.add_smelter(name=body.冶炼厂名, address=body.地址)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -172,11 +175,9 @@ def update_smelter(
     service: TLService = Depends(get_tl_service),
 ):
     try:
-        return service.update_smelter(
-            smelter_id=body.冶炼厂id,
-            name=body.冶炼厂名,
-            is_active=body.is_active,
-        )
+        patch = body.model_dump(exclude_unset=True)
+        smelter_id = patch.pop("冶炼厂id")
+        return service.update_smelter(smelter_id=smelter_id, patch=patch)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:

@@ -120,6 +120,34 @@ def _json_cell_to_dict(val: Any) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _strip_optional_str(v: Optional[str]) -> Optional[str]:
+    if v is None:
+        return None
+    t = str(v).strip()
+    return t if t else None
+
+
+def _color_config_to_json_str(val: Any) -> Optional[str]:
+    if val is None:
+        return None
+    return json.dumps(val, ensure_ascii=False)
+
+
+def _color_config_from_db(val: Any) -> Any:
+    if val is None:
+        return None
+    if isinstance(val, (dict, list)):
+        return val
+    if isinstance(val, (bytes, bytearray)):
+        val = val.decode("utf-8")
+    if isinstance(val, str):
+        s = val.strip()
+        if not s:
+            return None
+        return json.loads(s)
+    return val
+
+
 def _apply_factory_tax_rates_to_quote_item(
     item: Dict[str, Any],
     tax_by_fid: Dict[int, Dict[str, float]],
@@ -162,7 +190,16 @@ class TLService:
 
     # ==================== 接口0：添加仓库 ====================
 
-    def add_warehouse(self, name: str) -> Dict[str, Any]:
+    def add_warehouse(
+        self,
+        name: str,
+        address: Optional[str] = None,
+        warehouse_type: Optional[str] = None,
+        color_config: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        addr = _strip_optional_str(address)
+        wtype = _strip_optional_str(warehouse_type)
+        cc_json = _color_config_to_json_str(color_config) if color_config is not None else None
         try:
             with get_conn() as conn:
                 with conn.cursor() as cur:
@@ -173,10 +210,20 @@ class TLService:
                     row = cur.fetchone()
                     if row:
                         return {"code": 200, "msg": "仓库已存在", "仓库id": row[0], "新建": False}
-                    cur.execute(
-                        "INSERT INTO dict_warehouses (name, is_active) VALUES (%s, 1)",
-                        (name,),
-                    )
+                    if cc_json is None:
+                        cur.execute(
+                            "INSERT INTO dict_warehouses "
+                            "(name, address, warehouse_type, color_config, is_active) "
+                            "VALUES (%s, %s, %s, NULL, 1)",
+                            (name, addr, wtype),
+                        )
+                    else:
+                        cur.execute(
+                            "INSERT INTO dict_warehouses "
+                            "(name, address, warehouse_type, color_config, is_active) "
+                            "VALUES (%s, %s, %s, CAST(%s AS JSON), 1)",
+                            (name, addr, wtype, cc_json),
+                        )
                     return {"code": 200, "msg": "仓库新建成功", "仓库id": cur.lastrowid, "新建": True}
         except Exception as e:
             logger.error(f"添加仓库失败: {e}")
@@ -184,7 +231,8 @@ class TLService:
 
     # ==================== 接口0b：新建冶炼厂 ====================
 
-    def add_smelter(self, name: str) -> Dict[str, Any]:
+    def add_smelter(self, name: str, address: Optional[str] = None) -> Dict[str, Any]:
+        addr = _strip_optional_str(address)
         try:
             with get_conn() as conn:
                 with conn.cursor() as cur:
@@ -204,8 +252,8 @@ class TLService:
                         return {"code": 200, "msg": "冶炼厂已恢复启用", "冶炼厂id": smelter_id, "新建": False}
 
                     cur.execute(
-                        "INSERT INTO dict_factories (name, is_active) VALUES (%s, 1)",
-                        (name,),
+                        "INSERT INTO dict_factories (name, address, is_active) VALUES (%s, %s, 1)",
+                        (name, addr),
                     )
                     return {"code": 200, "msg": "冶炼厂新建成功", "冶炼厂id": cur.lastrowid, "新建": True}
         except Exception as e:
@@ -225,28 +273,34 @@ class TLService:
             with get_conn() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
-                        f"SELECT id AS `仓库id`, name AS `仓库名` "
+                        f"SELECT id AS `仓库id`, name AS `仓库名`, "
+                        f"address AS `地址`, warehouse_type AS `类型`, color_config AS `颜色配置` "
                         f"FROM dict_warehouses WHERE {where_sql} "
                         "ORDER BY id",
                         tuple(params),
                     )
                     columns = [desc[0] for desc in cur.description]
                     rows = cur.fetchall()
-                    return [dict(zip(columns, row)) for row in rows]
+                    out: List[Dict[str, Any]] = []
+                    for row in rows:
+                        rec = dict(zip(columns, row))
+                        if "颜色配置" in rec:
+                            rec["颜色配置"] = _color_config_from_db(rec.get("颜色配置"))
+                        out.append(rec)
+                    return out
         except Exception as e:
             logger.error(f"获取仓库列表失败: {e}")
             raise
 
     # ==================== 接口1b：修改仓库 ====================
 
-    def update_warehouse(
-        self,
-        warehouse_id: int,
-        name: Optional[str] = None,
-        is_active: Optional[bool] = None,
-    ) -> Dict[str, Any]:
-        if name is None and is_active is None:
-            raise ValueError("至少需要提供一个待修改字段：仓库名 或 is_active")
+    def update_warehouse(self, warehouse_id: int, patch: Dict[str, Any]) -> Dict[str, Any]:
+        allowed = {"仓库名", "is_active", "地址", "类型", "颜色配置"}
+        keys = set(patch.keys()) & allowed
+        if not keys:
+            raise ValueError(
+                "至少需要提供一个待修改字段：仓库名、is_active、地址、类型、颜色配置 之一"
+            )
 
         try:
             with get_conn() as conn:
@@ -255,10 +309,14 @@ class TLService:
                     if not cur.fetchone():
                         raise ValueError(f"仓库 id={warehouse_id} 不存在")
 
-                    updates = []
+                    updates: List[str] = []
                     params: List[Any] = []
 
-                    if name is not None:
+                    if "仓库名" in patch:
+                        name = patch["仓库名"]
+                        if name is None or str(name).strip() == "":
+                            raise ValueError("仓库名不能为空")
+                        name = str(name).strip()
                         cur.execute(
                             "SELECT id FROM dict_warehouses WHERE name = %s AND id <> %s",
                             (name, warehouse_id),
@@ -268,9 +326,30 @@ class TLService:
                         updates.append("name = %s")
                         params.append(name)
 
-                    if is_active is not None:
+                    if "is_active" in patch and patch["is_active"] is not None:
                         updates.append("is_active = %s")
-                        params.append(1 if is_active else 0)
+                        params.append(1 if patch["is_active"] else 0)
+
+                    if "地址" in patch:
+                        addr = patch["地址"]
+                        updates.append("address = %s")
+                        params.append(_strip_optional_str(addr) if addr is not None else None)
+
+                    if "类型" in patch:
+                        wt = patch["类型"]
+                        updates.append("warehouse_type = %s")
+                        params.append(_strip_optional_str(wt) if wt is not None else None)
+
+                    if "颜色配置" in patch:
+                        cc = patch["颜色配置"]
+                        if cc is None:
+                            updates.append("color_config = NULL")
+                        else:
+                            updates.append("color_config = CAST(%s AS JSON)")
+                            params.append(_color_config_to_json_str(cc))
+
+                    if not updates:
+                        raise ValueError("没有有效的修改项")
 
                     params.append(warehouse_id)
                     cur.execute(
@@ -316,7 +395,7 @@ class TLService:
             with get_conn() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
-                        "SELECT id AS `冶炼厂id`, name AS `冶炼厂` "
+                        "SELECT id AS `冶炼厂id`, name AS `冶炼厂`, address AS `地址` "
                         "FROM dict_factories "
                         "WHERE is_active = 1 "
                         "ORDER BY id"
@@ -330,14 +409,11 @@ class TLService:
 
     # ==================== 接口2b：修改冶炼厂 ====================
 
-    def update_smelter(
-        self,
-        smelter_id: int,
-        name: Optional[str] = None,
-        is_active: Optional[bool] = None,
-    ) -> Dict[str, Any]:
-        if name is None and is_active is None:
-            raise ValueError("至少需要提供一个待修改字段：冶炼厂名 或 is_active")
+    def update_smelter(self, smelter_id: int, patch: Dict[str, Any]) -> Dict[str, Any]:
+        allowed = {"冶炼厂名", "is_active", "地址"}
+        keys = set(patch.keys()) & allowed
+        if not keys:
+            raise ValueError("至少需要提供一个待修改字段：冶炼厂名、is_active、地址 之一")
 
         try:
             with get_conn() as conn:
@@ -346,10 +422,14 @@ class TLService:
                     if not cur.fetchone():
                         raise ValueError(f"冶炼厂 id={smelter_id} 不存在")
 
-                    updates = []
+                    updates: List[str] = []
                     params: List[Any] = []
 
-                    if name is not None:
+                    if "冶炼厂名" in patch:
+                        name = patch["冶炼厂名"]
+                        if name is None or str(name).strip() == "":
+                            raise ValueError("冶炼厂名不能为空")
+                        name = str(name).strip()
                         cur.execute(
                             "SELECT id FROM dict_factories WHERE name = %s AND id <> %s",
                             (name, smelter_id),
@@ -359,9 +439,17 @@ class TLService:
                         updates.append("name = %s")
                         params.append(name)
 
-                    if is_active is not None:
+                    if "is_active" in patch and patch["is_active"] is not None:
                         updates.append("is_active = %s")
-                        params.append(1 if is_active else 0)
+                        params.append(1 if patch["is_active"] else 0)
+
+                    if "地址" in patch:
+                        addr = patch["地址"]
+                        updates.append("address = %s")
+                        params.append(_strip_optional_str(addr) if addr is not None else None)
+
+                    if not updates:
+                        raise ValueError("没有有效的修改项")
 
                     params.append(smelter_id)
                     cur.execute(
