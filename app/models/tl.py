@@ -75,6 +75,12 @@ class ComparisonRequest(BaseModel):
 class AddWarehouseRequest(BaseModel):
     """添加仓库请求体"""
     仓库名: str = Field(..., description="仓库名称")
+    地址: Optional[str] = Field(None, description="地址（可选）")
+    类型: Optional[str] = Field(None, description="仓库类型（可选）")
+    颜色配置: Optional[Any] = Field(
+        None,
+        description="颜色配置（可选），JSON 对象或数组，如 {\"marker\": \"#3388ff\"}",
+    )
 
 
 class UpdateWarehouseRequest(BaseModel):
@@ -82,11 +88,15 @@ class UpdateWarehouseRequest(BaseModel):
     仓库id: int = Field(..., description="仓库ID")
     仓库名: Optional[str] = Field(None, description="仓库名称（可选）")
     is_active: Optional[bool] = Field(None, description="是否启用（可选）")
+    地址: Optional[str] = Field(None, description="地址（可选）")
+    类型: Optional[str] = Field(None, description="仓库类型（可选）")
+    颜色配置: Optional[Any] = Field(None, description="颜色配置（可选）；传 null 可清空")
 
 
 class AddSmelterRequest(BaseModel):
     """新建冶炼厂请求体"""
     冶炼厂名: str = Field(..., description="冶炼厂名称")
+    地址: Optional[str] = Field(None, description="冶炼厂地址（可选）")
 
 
 class UploadVarietyRequest(BaseModel):
@@ -99,6 +109,7 @@ class UpdateSmelterRequest(BaseModel):
     冶炼厂id: int = Field(..., description="冶炼厂ID")
     冶炼厂名: Optional[str] = Field(None, description="冶炼厂名称（可选）")
     is_active: Optional[bool] = Field(None, description="是否启用（可选）")
+    地址: Optional[str] = Field(None, description="冶炼厂地址（可选）；传 null 可清空")
 
 
 class DownloadFreightTemplateRequest(BaseModel):

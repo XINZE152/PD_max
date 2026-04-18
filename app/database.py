@@ -89,6 +89,9 @@ TABLE_STATEMENTS = [
     CREATE TABLE IF NOT EXISTS dict_warehouses (
         id INT AUTO_INCREMENT PRIMARY KEY COMMENT '仓库ID',
         name VARCHAR(100) NOT NULL UNIQUE COMMENT '仓库名称',
+        address VARCHAR(500) DEFAULT NULL COMMENT '地址',
+        warehouse_type VARCHAR(50) DEFAULT NULL COMMENT '仓库类型',
+        color_config JSON DEFAULT NULL COMMENT '颜色配置（JSON）',
         is_active TINYINT(1) DEFAULT 1 COMMENT '是否启用',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
@@ -99,6 +102,7 @@ TABLE_STATEMENTS = [
     CREATE TABLE IF NOT EXISTS dict_factories (
         id INT AUTO_INCREMENT PRIMARY KEY COMMENT '冶炼厂ID',
         name VARCHAR(100) NOT NULL UNIQUE COMMENT '冶炼厂名称',
+        address VARCHAR(500) DEFAULT NULL COMMENT '冶炼厂地址',
         is_active TINYINT(1) DEFAULT 1 COMMENT '是否启用',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
@@ -394,6 +398,74 @@ def ensure_pd_ip_delivery_records_smelter_column() -> None:
         connection.close()
 
 
+def ensure_dict_warehouses_extended_columns() -> None:
+    """已有库升级：为 dict_warehouses 增加 address、warehouse_type、color_config。"""
+    config_dict = get_mysql_config()
+    connection = pymysql.connect(**config_dict)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SHOW TABLES LIKE 'dict_warehouses'")
+            if cursor.fetchone() is None:
+                return
+
+            def _has_col(col: str) -> bool:
+                cursor.execute(
+                    "SELECT COUNT(*) FROM information_schema.columns "
+                    "WHERE table_schema = DATABASE() AND table_name = 'dict_warehouses' "
+                    "AND column_name = %s",
+                    (col,),
+                )
+                return cursor.fetchone()[0] > 0
+
+            if not _has_col("address"):
+                cursor.execute(
+                    "ALTER TABLE dict_warehouses ADD COLUMN address VARCHAR(500) DEFAULT NULL "
+                    "COMMENT '地址' AFTER name"
+                )
+                logger.info("已为 dict_warehouses 添加 address 列")
+            if not _has_col("warehouse_type"):
+                cursor.execute(
+                    "ALTER TABLE dict_warehouses ADD COLUMN warehouse_type VARCHAR(50) DEFAULT NULL "
+                    "COMMENT '仓库类型' AFTER address"
+                )
+                logger.info("已为 dict_warehouses 添加 warehouse_type 列")
+            if not _has_col("color_config"):
+                cursor.execute(
+                    "ALTER TABLE dict_warehouses ADD COLUMN color_config JSON DEFAULT NULL "
+                    "COMMENT '颜色配置（JSON）' AFTER warehouse_type"
+                )
+                logger.info("已为 dict_warehouses 添加 color_config 列")
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def ensure_dict_factories_address_column() -> None:
+    """已有库升级：为 dict_factories 增加 address（冶炼厂地址）。"""
+    config_dict = get_mysql_config()
+    connection = pymysql.connect(**config_dict)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SHOW TABLES LIKE 'dict_factories'")
+            if cursor.fetchone() is None:
+                return
+            cursor.execute(
+                "SELECT COUNT(*) FROM information_schema.columns "
+                "WHERE table_schema = DATABASE() AND table_name = 'dict_factories' "
+                "AND column_name = 'address'"
+            )
+            if cursor.fetchone()[0] > 0:
+                return
+            cursor.execute(
+                "ALTER TABLE dict_factories ADD COLUMN address VARCHAR(500) DEFAULT NULL "
+                "COMMENT '冶炼厂地址' AFTER name"
+            )
+            logger.info("已为 dict_factories 添加 address 列")
+        connection.commit()
+    finally:
+        connection.close()
+
+
 def ensure_ai_detection_history_stored_image_column() -> None:
     """已有库升级：为 ai_detection_history 增加 stored_image（新建库已由 CREATE TABLE 包含）。"""
     config_dict = get_mysql_config()
@@ -444,6 +516,14 @@ def create_tables() -> None:
         ensure_pd_ip_prediction_results_smelter_column()
     except Exception:
         logger.exception("检查/添加 pd_ip_prediction_results.smelter 失败")
+    try:
+        ensure_dict_warehouses_extended_columns()
+    except Exception:
+        logger.exception("检查/添加 dict_warehouses 扩展列失败")
+    try:
+        ensure_dict_factories_address_column()
+    except Exception:
+        logger.exception("检查/添加 dict_factories.address 失败")
 
 
 def init_default_data() -> None:
