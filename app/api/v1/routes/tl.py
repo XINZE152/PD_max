@@ -105,6 +105,7 @@ def add_warehouse(
             name=body.仓库名,
             address=body.地址,
             warehouse_type_id=body.仓库类型id,
+            warehouse_color_config=body.仓库颜色配置,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

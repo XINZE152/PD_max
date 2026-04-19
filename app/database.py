@@ -111,7 +111,8 @@ TABLE_STATEMENTS = [
         id INT AUTO_INCREMENT PRIMARY KEY COMMENT '仓库ID',
         name VARCHAR(100) NOT NULL UNIQUE COMMENT '仓库名称',
         address VARCHAR(500) DEFAULT NULL COMMENT '地址',
-        warehouse_type_id INT DEFAULT NULL COMMENT '库房类型ID（颜色由类型表带出）',
+        warehouse_type_id INT DEFAULT NULL COMMENT '库房类型ID（类型颜色见 dict_warehouse_types）',
+        color_config JSON DEFAULT NULL COMMENT '仓库独立颜色配置（JSON），可与库房类型颜色并存',
         is_active TINYINT(1) DEFAULT 1 COMMENT '是否启用',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -575,12 +576,7 @@ def ensure_dict_warehouse_types_migration() -> None:
                 except Exception:
                     logger.exception("删除 warehouse_type 列失败")
 
-            if has_color:
-                try:
-                    cursor.execute("ALTER TABLE dict_warehouses DROP COLUMN color_config")
-                    logger.info("已删除废弃列 dict_warehouses.color_config")
-                except Exception:
-                    logger.exception("删除 color_config 列失败")
+            # 不再删除 color_config：该列保留为「仓库独立颜色」，与库房类型颜色并存
 
             try:
                 cursor.execute(
@@ -589,6 +585,48 @@ def ensure_dict_warehouse_types_migration() -> None:
             except Exception:
                 pass
 
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def ensure_dict_warehouses_color_config_column() -> None:
+    """已有库升级：保证 dict_warehouses 存在 color_config（仓库独立颜色）；旧版迁移曾删除该列。"""
+    config_dict = get_mysql_config()
+    connection = pymysql.connect(**config_dict)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SHOW TABLES LIKE 'dict_warehouses'")
+            if cursor.fetchone() is None:
+                return
+
+            cursor.execute(
+                "SELECT COUNT(*) FROM information_schema.columns "
+                "WHERE table_schema = DATABASE() AND table_name = 'dict_warehouses' "
+                "AND column_name = 'color_config'"
+            )
+            if cursor.fetchone()[0] > 0:
+                return
+
+            cursor.execute(
+                "SELECT COUNT(*) FROM information_schema.columns "
+                "WHERE table_schema = DATABASE() AND table_name = 'dict_warehouses' "
+                "AND column_name = 'warehouse_type_id'"
+            )
+            after = "warehouse_type_id" if cursor.fetchone()[0] > 0 else "address"
+            cursor.execute(
+                "SELECT COUNT(*) FROM information_schema.columns "
+                "WHERE table_schema = DATABASE() AND table_name = 'dict_warehouses' "
+                "AND column_name = %s",
+                (after,),
+            )
+            if cursor.fetchone()[0] == 0:
+                after = "name"
+            cursor.execute(
+                f"ALTER TABLE dict_warehouses ADD COLUMN color_config JSON DEFAULT NULL "
+                f"COMMENT '仓库独立颜色配置（JSON），可与库房类型颜色并存' AFTER {after}"
+            )
+            logger.info("已为 dict_warehouses 添加 color_config 列（仓库独立颜色）")
         connection.commit()
     finally:
         connection.close()
@@ -678,6 +716,10 @@ def create_tables() -> None:
         ensure_dict_warehouse_types_migration()
     except Exception:
         logger.exception("库房类型表/warehouse_type_id 迁移失败")
+    try:
+        ensure_dict_warehouses_color_config_column()
+    except Exception:
+        logger.exception("检查/添加 dict_warehouses.color_config（仓库颜色）失败")
     try:
         ensure_dict_factories_address_column()
     except Exception:

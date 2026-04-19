@@ -190,12 +190,16 @@ class ComparisonRequest(BaseModel):
 
 
 class AddWarehouseRequest(BaseModel):
-    """添加仓库请求体（颜色由库房类型决定，勿再传独立颜色）"""
+    """添加仓库请求体：库房类型带出类型颜色，仓库可另有独立颜色"""
     仓库名: str = Field(..., description="仓库名称")
     地址: Optional[str] = Field(None, description="地址（可选）")
     仓库类型id: Optional[int] = Field(
         None,
-        description="库房类型 ID（可选）；传入后展示色与该类型在类型表中配置的颜色一致",
+        description="库房类型 ID（可选）；类型颜色来自类型表的「颜色配置」",
+    )
+    仓库颜色配置: Optional[Any] = Field(
+        None,
+        description="仓库独立颜色（JSON，可选），与库房类型颜色并存；未传则不写入",
     )
 
 
@@ -207,7 +211,11 @@ class UpdateWarehouseRequest(BaseModel):
     地址: Optional[str] = Field(None, description="地址（可选）")
     仓库类型id: Optional[int] = Field(
         None,
-        description="库房类型 ID（可选）；传 null 可取消类型关联（颜色随之为空）",
+        description="库房类型 ID（可选）；传 null 可取消类型关联（库房类型颜色随之不可用）",
+    )
+    仓库颜色配置: Optional[Any] = Field(
+        None,
+        description="仓库独立颜色（可选）；传 null 可清空；不传则不修改",
     )
 
 

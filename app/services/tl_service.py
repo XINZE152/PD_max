@@ -195,8 +195,14 @@ class TLService:
         name: str,
         address: Optional[str] = None,
         warehouse_type_id: Optional[int] = None,
+        warehouse_color_config: Optional[Any] = None,
     ) -> Dict[str, Any]:
         addr = _strip_optional_str(address)
+        wh_cc_json = (
+            _color_config_to_json_str(warehouse_color_config)
+            if warehouse_color_config is not None
+            else None
+        )
         try:
             with get_conn() as conn:
                 with conn.cursor() as cur:
@@ -220,9 +226,9 @@ class TLService:
                         return {"code": 200, "msg": "仓库已存在", "仓库id": row[0], "新建": False}
                     cur.execute(
                         "INSERT INTO dict_warehouses "
-                        "(name, address, warehouse_type_id, is_active) "
-                        "VALUES (%s, %s, %s, 1)",
-                        (name, addr, warehouse_type_id),
+                        "(name, address, warehouse_type_id, color_config, is_active) "
+                        "VALUES (%s, %s, %s, %s, 1)",
+                        (name, addr, warehouse_type_id, wh_cc_json),
                     )
                     return {"code": 200, "msg": "仓库新建成功", "仓库id": cur.lastrowid, "新建": True}
         except ValueError:
@@ -278,7 +284,8 @@ class TLService:
                     cur.execute(
                         f"SELECT dw.id AS `仓库id`, dw.name AS `仓库名`, "
                         f"dw.address AS `地址`, dw.warehouse_type_id AS `仓库类型id`, "
-                        f"wt.name AS `类型`, wt.color_config AS `颜色配置` "
+                        f"wt.name AS `类型`, wt.color_config AS `库房类型颜色配置`, "
+                        f"dw.color_config AS `仓库颜色配置` "
                         f"FROM dict_warehouses dw "
                         f"LEFT JOIN dict_warehouse_types wt ON dw.warehouse_type_id = wt.id "
                         f"WHERE {where_sql} "
@@ -290,8 +297,11 @@ class TLService:
                     out: List[Dict[str, Any]] = []
                     for row in rows:
                         rec = dict(zip(columns, row))
-                        if "颜色配置" in rec:
-                            rec["颜色配置"] = _color_config_from_db(rec.get("颜色配置"))
+                        type_cc = _color_config_from_db(rec.get("库房类型颜色配置"))
+                        wh_cc = _color_config_from_db(rec.get("仓库颜色配置"))
+                        rec["库房类型颜色配置"] = type_cc
+                        rec["仓库颜色配置"] = wh_cc
+                        rec["颜色配置"] = type_cc
                         out.append(rec)
                     return out
         except Exception as e:
@@ -301,11 +311,11 @@ class TLService:
     # ==================== 接口1b：修改仓库 ====================
 
     def update_warehouse(self, warehouse_id: int, patch: Dict[str, Any]) -> Dict[str, Any]:
-        allowed = {"仓库名", "is_active", "地址", "仓库类型id"}
+        allowed = {"仓库名", "is_active", "地址", "仓库类型id", "仓库颜色配置"}
         keys = set(patch.keys()) & allowed
         if not keys:
             raise ValueError(
-                "至少需要提供一个待修改字段：仓库名、is_active、地址、仓库类型id 之一"
+                "至少需要提供一个待修改字段：仓库名、is_active、地址、仓库类型id、仓库颜色配置 之一"
             )
 
         try:
@@ -356,6 +366,14 @@ class TLService:
                             params.append(int(wtid))
                         else:
                             updates.append("warehouse_type_id = NULL")
+
+                    if "仓库颜色配置" in patch:
+                        cc = patch["仓库颜色配置"]
+                        if cc is not None:
+                            updates.append("color_config = %s")
+                            params.append(_color_config_to_json_str(cc))
+                        else:
+                            updates.append("color_config = NULL")
 
                     if not updates:
                         raise ValueError("没有有效的修改项")
