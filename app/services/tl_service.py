@@ -390,15 +390,21 @@ class TLService:
 
     # ==================== 接口2：获取冶炼厂列表 ====================
 
-    def get_smelters(self) -> List[Dict[str, Any]]:
+    def get_smelters(self, keyword: Optional[str] = None) -> List[Dict[str, Any]]:
         try:
+            conditions = ["is_active = 1"]
+            params: List[Any] = []
+            if keyword is not None and str(keyword).strip():
+                conditions.append("name LIKE %s")
+                params.append(f"%{str(keyword).strip()}%")
+            where_sql = " AND ".join(conditions)
             with get_conn() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
-                        "SELECT id AS `冶炼厂id`, name AS `冶炼厂`, address AS `地址` "
-                        "FROM dict_factories "
-                        "WHERE is_active = 1 "
-                        "ORDER BY id"
+                        f"SELECT id AS `冶炼厂id`, name AS `冶炼厂`, address AS `地址` "
+                        f"FROM dict_factories WHERE {where_sql} "
+                        "ORDER BY id",
+                        tuple(params),
                     )
                     columns = [desc[0] for desc in cur.description]
                     rows = cur.fetchall()
@@ -486,6 +492,46 @@ class TLService:
             raise
         except Exception as e:
             logger.error(f"删除冶炼厂失败: {e}")
+            raise
+
+    def batch_delete_warehouses(self, warehouse_ids: List[int]) -> Dict[str, Any]:
+        """批量软删除仓库（将 is_active 置 0）。"""
+        if not warehouse_ids:
+            raise ValueError("仓库id列表不能为空")
+        ids = list(dict.fromkeys(int(x) for x in warehouse_ids))
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    ph = ",".join(["%s"] * len(ids))
+                    cur.execute(
+                        f"UPDATE dict_warehouses SET is_active = 0 "
+                        f"WHERE id IN ({ph}) AND is_active = 1",
+                        tuple(ids),
+                    )
+                    n = cur.rowcount
+            return {"code": 200, "msg": f"已批量停用 {n} 个仓库", "更新行数": n}
+        except Exception as e:
+            logger.error(f"批量停用仓库失败: {e}")
+            raise
+
+    def batch_delete_smelters(self, smelter_ids: List[int]) -> Dict[str, Any]:
+        """批量软删除冶炼厂。"""
+        if not smelter_ids:
+            raise ValueError("冶炼厂id列表不能为空")
+        ids = list(dict.fromkeys(int(x) for x in smelter_ids))
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    ph = ",".join(["%s"] * len(ids))
+                    cur.execute(
+                        f"UPDATE dict_factories SET is_active = 0 "
+                        f"WHERE id IN ({ph}) AND is_active = 1",
+                        tuple(ids),
+                    )
+                    n = cur.rowcount
+            return {"code": 200, "msg": f"已批量停用 {n} 个冶炼厂", "更新行数": n}
+        except Exception as e:
+            logger.error(f"批量停用冶炼厂失败: {e}")
             raise
 
     # ==================== 接口3：获取品类列表 ====================
@@ -2103,21 +2149,21 @@ class TLService:
         qd_exact: Optional[date] = None
         d_from: Optional[date] = None
         d_to: Optional[date] = None
+        def _parse_filter_date(label: str, raw: Optional[str]) -> Optional[date]:
+            if raw is None or str(raw).strip() == "":
+                return None
+            s = str(raw).strip().replace("/", "-")
+            try:
+                return date.fromisoformat(s)
+            except (ValueError, TypeError):
+                raise ValueError(f"{label} 格式不正确: {raw}，应为 YYYY-MM-DD（可用 / 分隔）")
+
         if quote_date:
-            try:
-                qd_exact = date.fromisoformat(quote_date)
-            except (ValueError, TypeError):
-                raise ValueError(f"quote_date 格式不正确: {quote_date}，应为 YYYY-MM-DD")
+            qd_exact = _parse_filter_date("quote_date", quote_date)
         if date_from:
-            try:
-                d_from = date.fromisoformat(date_from)
-            except (ValueError, TypeError):
-                raise ValueError(f"date_from 格式不正确: {date_from}，应为 YYYY-MM-DD")
+            d_from = _parse_filter_date("date_from", date_from)
         if date_to:
-            try:
-                d_to = date.fromisoformat(date_to)
-            except (ValueError, TypeError):
-                raise ValueError(f"date_to 格式不正确: {date_to}，应为 YYYY-MM-DD")
+            d_to = _parse_filter_date("date_to", date_to)
         if d_from and d_to and d_from > d_to:
             raise ValueError("date_from 不能晚于 date_to")
 

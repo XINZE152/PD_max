@@ -31,10 +31,12 @@ import io
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, UploadFile, File
 from fastapi.responses import StreamingResponse
 
 from app.models.tl import (
+    BatchSmelterIdsRequest,
+    BatchWarehouseIdsRequest,
     ComparisonRequest,
     UploadFreightRequest,
     DownloadFreightTemplateRequest,
@@ -51,6 +53,7 @@ from app.models.tl import (
     VlmFullData,
     TaxRateItem,
     TaxRateUpsertRequest,
+    QuoteDetailsFilterRequest,
 )
 from app.services.tl_service import PurchaseSuggestionLLMError, TLService, get_tl_service
 
@@ -74,6 +77,17 @@ def _merge_quote_list_filters(
     elif category_name is not None and str(category_name).strip():
         cat = str(category_name).strip()
     return d_from, d_to, cat
+
+
+def _quote_details_excel_response(data: bytes) -> StreamingResponse:
+    filename = "报价数据导出.xlsx"
+    return StreamingResponse(
+        io.BytesIO(data),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}",
+        },
+    )
 
 
 # ===================== 接口0：添加仓库 =====================
@@ -159,9 +173,15 @@ def add_smelter(
 # ===================== 接口2：获取冶炼厂列表 =====================
 
 @router.get("/get_smelters", summary="获取冶炼厂列表")
-def get_smelters(service: TLService = Depends(get_tl_service)):
+def get_smelters(
+    keyword: Optional[str] = Query(
+        None,
+        description="冶炼厂名称模糊搜索（可选），与库房列表 keyword 用法一致",
+    ),
+    service: TLService = Depends(get_tl_service),
+):
     try:
-        data = service.get_smelters()
+        data = service.get_smelters(keyword=keyword)
         return {"code": 200, "data": data}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -199,6 +219,32 @@ def delete_smelter(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.post("/batch_delete_warehouses", summary="批量停用仓库（软删除）")
+def batch_delete_warehouses(
+    body: BatchWarehouseIdsRequest,
+    service: TLService = Depends(get_tl_service),
+):
+    try:
+        return service.batch_delete_warehouses(body.仓库id列表)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/batch_delete_smelters", summary="批量停用冶炼厂（软删除）")
+def batch_delete_smelters(
+    body: BatchSmelterIdsRequest,
+    service: TLService = Depends(get_tl_service),
+):
+    try:
+        return service.batch_delete_smelters(body.冶炼厂id列表)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ===================== 接口3：获取品类列表 =====================
 
 @router.get("/get_categories", summary="获取品类列表")
@@ -214,13 +260,26 @@ def get_categories(service: TLService = Depends(get_tl_service)):
 
 @router.post("/upload_variety", summary="上传品种")
 def upload_variety(
-    body: List[UploadVarietyRequest],
+    body: Any = Body(...),
     service: TLService = Depends(get_tl_service),
 ):
-    """批量提交品种名：新建品类分组、已存在则跳过、停用则恢复启用（与报价确认时新建品类规则一致）。"""
+    """批量提交品种名：新建品类分组、已存在则跳过、停用则恢复启用。
+    请求体可为 **单对象** `{ \"品种名\": \"…\" }` 或 **数组** `[{ \"品种名\": \"…\" }, …]`。
+    """
     try:
-        items = [item.model_dump() for item in body]
+        if isinstance(body, list):
+            parsed = [UploadVarietyRequest.model_validate(x) for x in body]
+        elif isinstance(body, dict):
+            parsed = [UploadVarietyRequest.model_validate(body)]
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail='请求体须为 JSON 对象或数组，例如 {"品种名":"电动车电池"} 或 [{"品种名":"..."}]',
+            )
+        items = [item.model_dump() for item in parsed]
         return service.upload_variety(items)
+    except HTTPException:
+        raise
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -255,6 +314,32 @@ def get_comparison(
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/get_comparison_options", summary="智能比价取价/最优价口径选项")
+def get_comparison_options():
+    """供前端下拉使用：取价口径与最优价计税口径（与 get_comparison 中 price_type / 最优价计税口径列表 对应）。"""
+    return {
+        "code": 200,
+        "data": {
+            "price_type": [
+                {"value": None, "label": "普通价（不含税）"},
+                {"value": "1pct", "label": "1%增值税"},
+                {"value": "3pct", "label": "3%增值税"},
+                {"value": "13pct", "label": "13%增值税"},
+                {"value": "normal_invoice", "label": "普通发票价格"},
+                {"value": "reverse_invoice", "label": "反向发票价格"},
+            ],
+            "optimal_basis": [
+                {"value": "base", "label": "不含税基准价"},
+                {"value": "1pct", "label": "1%增值税价"},
+                {"value": "3pct", "label": "3%增值税价"},
+                {"value": "13pct", "label": "13%增值税价"},
+                {"value": "normal_invoice", "label": "普通发票价"},
+                {"value": "reverse_invoice", "label": "反向发票价"},
+            ],
+        },
+    }
 
 
 # ===================== 接口5：上传价格表 =====================
@@ -375,14 +460,37 @@ def export_quote_details_excel(
             category_name=eff_cat,
             category_exact=category_exact,
         )
-        filename = "报价数据导出.xlsx"
-        return StreamingResponse(
-            io.BytesIO(data),
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={
-                "Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}",
-            },
+        return _quote_details_excel_response(data)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/export_quote_details_excel", summary="导出报价数据 Excel（POST，筛选与列表一致）")
+def export_quote_details_excel_post(
+    body: QuoteDetailsFilterRequest,
+    service: TLService = Depends(get_tl_service),
+):
+    """与 GET 导出相同，请求体携带筛选条件，避免查询串过长或编码不一致导致导出为空。"""
+    eff_from, eff_to, eff_cat = _merge_quote_list_filters(
+        body.date_from,
+        body.date_to,
+        body.start_date,
+        body.end_date,
+        body.category_name,
+        body.variety,
+    )
+    try:
+        data = service.export_quote_details_excel(
+            factory_id=body.factory_id,
+            quote_date=body.quote_date,
+            date_from=eff_from,
+            date_to=eff_to,
+            category_name=eff_cat,
+            category_exact=body.category_exact,
         )
+        return _quote_details_excel_response(data)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:

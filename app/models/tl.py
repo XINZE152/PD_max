@@ -6,6 +6,95 @@ OPTIMAL_PRICE_BASIS_ALLOWED = frozenset(
     {"base", "1pct", "3pct", "13pct", "normal_invoice", "reverse_invoice"}
 )
 
+def _normalize_comparison_price_type(v: Any) -> Any:
+    """将前端常用中文/别名规范为接口约定：null、1pct、3pct、13pct、normal_invoice、reverse_invoice。"""
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        raise ValueError(f"price_type 不能为布尔值: {v!r}")
+    s = str(v).strip()
+    if not s:
+        return None
+    compact = s.replace(" ", "").replace("（", "(").replace("）", ")")
+    low = compact.lower()
+    aliases = {
+        "普通价": None,
+        "不含税": None,
+        "基准价": None,
+        "基准": None,
+        "null": None,
+        "none": None,
+        "1pct": "1pct",
+        "1%增值税": "1pct",
+        "1%含税": "1pct",
+        "含1%增值税": "1pct",
+        "3pct": "3pct",
+        "3%增值税": "3pct",
+        "3%含税": "3pct",
+        "含3%增值税": "3pct",
+        "13pct": "13pct",
+        "13%增值税": "13pct",
+        "13%含税": "13pct",
+        "含13%增值税": "13pct",
+        "normal_invoice": "normal_invoice",
+        "普通发票": "normal_invoice",
+        "普票": "normal_invoice",
+        "reverse_invoice": "reverse_invoice",
+        "反向发票": "reverse_invoice",
+    }
+    if low in aliases:
+        return aliases[low]
+    if compact in aliases:
+        return aliases[compact]
+    if low in ("1pct", "3pct", "13pct", "normal_invoice", "reverse_invoice"):
+        return low
+    raise ValueError(
+        f"不支持的 price_type: {v!r}，请使用 null/1pct/3pct/13pct/normal_invoice/reverse_invoice，"
+        f"或中文如 3%增值税、普通价 等"
+    )
+
+
+def _normalize_optimal_basis_token(x: Any) -> str:
+    """最优价计税口径：中文/英文 → base、1pct、3pct 等。"""
+    s = str(x).strip()
+    if not s:
+        raise ValueError("最优价计税口径不能为空")
+    compact = s.replace(" ", "").replace("（", "(").replace("）", ")")
+    low = compact.lower()
+    aliases = {
+        "base": "base",
+        "基准价": "base",
+        "基准": "base",
+        "不含税基准": "base",
+        "普通价": "base",
+        "1pct": "1pct",
+        "1%增值税": "1pct",
+        "1%含税": "1pct",
+        "含1%增值税": "1pct",
+        "3pct": "3pct",
+        "3%增值税": "3pct",
+        "3%含税": "3pct",
+        "含3%增值税": "3pct",
+        "13pct": "13pct",
+        "13%增值税": "13pct",
+        "13%含税": "13pct",
+        "含13%增值税": "13pct",
+        "normal_invoice": "normal_invoice",
+        "普通发票": "normal_invoice",
+        "普票": "normal_invoice",
+        "reverse_invoice": "reverse_invoice",
+        "反向发票": "reverse_invoice",
+    }
+    if low in aliases:
+        return aliases[low]
+    if compact in aliases:
+        return aliases[compact]
+    if low in OPTIMAL_PRICE_BASIS_ALLOWED:
+        return low
+    raise ValueError(
+        f"不支持的最优价计税口径: {x!r}，允许：{sorted(OPTIMAL_PRICE_BASIS_ALLOWED)} 或中文如 基准价、3%增值税 等"
+    )
+
 
 class ComparisonRequest(BaseModel):
     """接口4 请求体"""
@@ -47,9 +136,28 @@ class ComparisonRequest(BaseModel):
         ),
     )
 
+    @field_validator("price_type", mode="before")
+    @classmethod
+    def _normalize_price_type(cls, v: Any) -> Any:
+        if v is None or (isinstance(v, str) and not str(v).strip()):
+            return None
+        return _normalize_comparison_price_type(v)
+
+    @field_validator("最优价计税口径列表", mode="before")
+    @classmethod
+    def _normalize_optimal_basis_list(cls, v: Any) -> Any:
+        if v is None:
+            return ["3pct"]
+        if not isinstance(v, list):
+            raise ValueError("最优价计税口径列表须为数组")
+        out: List[str] = []
+        for x in v:
+            out.append(_normalize_optimal_basis_token(x))
+        return out if out else ["3pct"]
+
     @field_validator("最优价计税口径列表", mode="after")
     @classmethod
-    def _normalize_optimal_basis_list(cls, v: List[str]) -> List[str]:
+    def _dedupe_optimal_basis_list(cls, v: List[str]) -> List[str]:
         order_unique: List[str] = []
         seen = set()
         for x in v:
@@ -61,6 +169,15 @@ class ComparisonRequest(BaseModel):
                 seen.add(x)
                 order_unique.append(x)
         return order_unique if order_unique else ["3pct"]
+
+    @field_validator("最优价排序口径", mode="before")
+    @classmethod
+    def _normalize_optimal_sort_basis(cls, v: Any) -> Any:
+        if v is None:
+            return None
+        if isinstance(v, str) and not v.strip():
+            return None
+        return _normalize_optimal_basis_token(v)
 
     @model_validator(mode="after")
     def _validate_optimal_sort_basis(self) -> "ComparisonRequest":
@@ -101,7 +218,14 @@ class AddSmelterRequest(BaseModel):
 
 class UploadVarietyRequest(BaseModel):
     """上传品种（单条，与上传运费相同可传列表批量）"""
-    品种名: str = Field(..., description="品种名称，写入 dict_categories")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    品种名: str = Field(
+        ...,
+        validation_alias=AliasChoices("品种名", "name", "varietyName", "categoryName"),
+        description="品种名称，写入 dict_categories",
+    )
 
 
 class UpdateSmelterRequest(BaseModel):
@@ -342,9 +466,58 @@ class TaxRateItem(BaseModel):
     """单条税率记录"""
     factory_id: int = Field(..., description="冶炼厂ID")
     tax_type: str = Field(..., description="税率类型：1pct/3pct/13pct")
-    tax_rate: float = Field(..., ge=0, le=1, description="税率值，如 0.03 表示3%")
+    tax_rate: float = Field(
+        ...,
+        description="税率：0~1 小数（如 0.03），或 1~100 表示百分比（如 3 表示 3%）",
+    )
+
+    @field_validator("tax_rate", mode="before")
+    @classmethod
+    def _coerce_tax_rate(cls, v: Any) -> Any:
+        if v is None:
+            raise ValueError("tax_rate 不能为空")
+        return float(v)
+
+    @field_validator("tax_rate", mode="after")
+    @classmethod
+    def _percent_to_fraction(cls, v: float) -> float:
+        if v > 1.0:
+            if v <= 100.0:
+                return round(v / 100.0, 6)
+            raise ValueError(f"百分比税率须在 1~100 之间，收到：{v}")
+        if not (0 <= v <= 1):
+            raise ValueError(f"税率须在 0~1 之间（或填写 1~100 表示百分比），收到：{v}")
+        return v
 
 
 class TaxRateUpsertRequest(BaseModel):
     """批量设置税率（upsert）"""
     items: List[TaxRateItem] = Field(..., description="税率列表")
+
+
+class QuoteDetailsFilterRequest(BaseModel):
+    """报价明细分页/导出共用的筛选条件（与 Query 参数一致，供 POST 导出使用）"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    factory_id: Optional[int] = None
+    quote_date: Optional[str] = None
+    date_from: Optional[str] = None
+    date_to: Optional[str] = None
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    category_name: Optional[str] = None
+    variety: Optional[str] = None
+    category_exact: bool = False
+
+
+class BatchWarehouseIdsRequest(BaseModel):
+    """批量停用仓库（软删除）"""
+
+    仓库id列表: List[int] = Field(..., min_length=1, description="仓库主键列表")
+
+
+class BatchSmelterIdsRequest(BaseModel):
+    """批量停用冶炼厂（软删除）"""
+
+    冶炼厂id列表: List[int] = Field(..., min_length=1, description="冶炼厂主键列表")
