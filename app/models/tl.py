@@ -190,13 +190,12 @@ class ComparisonRequest(BaseModel):
 
 
 class AddWarehouseRequest(BaseModel):
-    """添加仓库请求体"""
+    """添加仓库请求体（颜色由库房类型决定，勿再传独立颜色）"""
     仓库名: str = Field(..., description="仓库名称")
     地址: Optional[str] = Field(None, description="地址（可选）")
-    类型: Optional[str] = Field(None, description="仓库类型（可选）")
-    颜色配置: Optional[Any] = Field(
+    仓库类型id: Optional[int] = Field(
         None,
-        description="颜色配置（可选），JSON 对象或数组，如 {\"marker\": \"#3388ff\"}",
+        description="库房类型 ID（可选）；传入后展示色与该类型在类型表中配置的颜色一致",
     )
 
 
@@ -206,8 +205,27 @@ class UpdateWarehouseRequest(BaseModel):
     仓库名: Optional[str] = Field(None, description="仓库名称（可选）")
     is_active: Optional[bool] = Field(None, description="是否启用（可选）")
     地址: Optional[str] = Field(None, description="地址（可选）")
-    类型: Optional[str] = Field(None, description="仓库类型（可选）")
+    仓库类型id: Optional[int] = Field(
+        None,
+        description="库房类型 ID（可选）；传 null 可取消类型关联（颜色随之为空）",
+    )
+
+
+class AddWarehouseTypeRequest(BaseModel):
+    """新增库房类型（类型与颜色一对一）"""
+    类型名: str = Field(..., description="类型名称，唯一")
+    颜色配置: Optional[Any] = Field(
+        None,
+        description="颜色配置（JSON），如 {\"marker\": \"#3388ff\"} 或主色字段名与色值",
+    )
+
+
+class UpdateWarehouseTypeRequest(BaseModel):
+    """修改库房类型"""
+    类型id: int = Field(..., description="dict_warehouse_types.id")
+    类型名: Optional[str] = Field(None, description="类型名称（可选）")
     颜色配置: Optional[Any] = Field(None, description="颜色配置（可选）；传 null 可清空")
+    is_active: Optional[bool] = Field(None, description="是否启用（可选）")
 
 
 class AddSmelterRequest(BaseModel):

@@ -4,6 +4,7 @@ TL比价模块路由
 包含接口：
   0. POST /tl/add_warehouse            - 添加仓库（不存在则新建）
   1. GET  /tl/get_warehouses           - 获取仓库列表
+  1a.  GET/POST/DELETE  /tl/get_warehouse_types, /add_warehouse_type, /update_warehouse_type, /delete_warehouse_type  - 库房类型与颜色
   1b.POST /tl/update_warehouse         - 修改仓库信息
   1c.DELETE /tl/delete_warehouse        - 删除仓库（软删除）
   1d.POST /tl/add_smelter              - 新建冶炼厂
@@ -45,7 +46,9 @@ from app.models.tl import (
     UpdateCategoryRowRequest,
     ConfirmPriceTableRequest,
     AddWarehouseRequest,
+    AddWarehouseTypeRequest,
     UpdateWarehouseRequest,
+    UpdateWarehouseTypeRequest,
     AddSmelterRequest,
     UploadVarietyRequest,
     UpdateSmelterRequest,
@@ -101,9 +104,10 @@ def add_warehouse(
         return service.add_warehouse(
             name=body.仓库名,
             address=body.地址,
-            warehouse_type=body.类型,
-            color_config=body.颜色配置,
+            warehouse_type_id=body.仓库类型id,
         )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -121,6 +125,71 @@ def get_warehouses(
     try:
         data = service.get_warehouses(keyword=keyword)
         return {"code": 200, "data": data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ===================== 接口1a：库房类型（类型-颜色）维护 =====================
+
+@router.get("/get_warehouse_types", summary="库房类型列表")
+def get_warehouse_types(
+    keyword: Optional[str] = Query(None, description="类型名模糊搜索（可选）"),
+    include_inactive: bool = Query(
+        False,
+        description="是否包含已停用的类型",
+    ),
+    service: TLService = Depends(get_tl_service),
+):
+    try:
+        data = service.get_warehouse_types(
+            keyword=keyword,
+            include_inactive=include_inactive,
+        )
+        return {"code": 200, "data": data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/add_warehouse_type", summary="新增库房类型")
+def add_warehouse_type(
+    body: AddWarehouseTypeRequest,
+    service: TLService = Depends(get_tl_service),
+):
+    try:
+        return service.add_warehouse_type(
+            name=body.类型名,
+            color_config=body.颜色配置,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/update_warehouse_type", summary="修改库房类型")
+def update_warehouse_type(
+    body: UpdateWarehouseTypeRequest,
+    service: TLService = Depends(get_tl_service),
+):
+    try:
+        patch = body.model_dump(exclude_unset=True)
+        type_id = patch.pop("类型id")
+        return service.update_warehouse_type(type_id=type_id, patch=patch)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/delete_warehouse_type", summary="删除库房类型（软删除）")
+def delete_warehouse_type(
+    type_id: int = Query(..., description="库房类型 id"),
+    service: TLService = Depends(get_tl_service),
+):
+    try:
+        return service.delete_warehouse_type(type_id=type_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

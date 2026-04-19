@@ -1,3 +1,4 @@
+import json
 from contextlib import contextmanager
 import logging
 
@@ -84,17 +85,31 @@ TABLE_STATEMENTS = [
         INDEX idx_category_main (category_id, is_main)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='品类字典表（多名称共用同一category_id）';
     """,
+    # 库房类型字典（类型与颜色一对一，仓库通过 warehouse_type_id 关联）
+    """
+    CREATE TABLE IF NOT EXISTS dict_warehouse_types (
+        id INT AUTO_INCREMENT PRIMARY KEY COMMENT '库房类型ID',
+        name VARCHAR(50) NOT NULL UNIQUE COMMENT '类型名称',
+        color_config JSON DEFAULT NULL COMMENT '颜色配置（JSON），与类型唯一绑定',
+        is_active TINYINT(1) DEFAULT 1 COMMENT '是否启用',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_wh_type_active (is_active)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='库房类型字典（类型-颜色一对一）';
+    """,
     # 仓库字典表
     """
     CREATE TABLE IF NOT EXISTS dict_warehouses (
         id INT AUTO_INCREMENT PRIMARY KEY COMMENT '仓库ID',
         name VARCHAR(100) NOT NULL UNIQUE COMMENT '仓库名称',
         address VARCHAR(500) DEFAULT NULL COMMENT '地址',
-        warehouse_type VARCHAR(50) DEFAULT NULL COMMENT '仓库类型',
-        color_config JSON DEFAULT NULL COMMENT '颜色配置（JSON）',
+        warehouse_type_id INT DEFAULT NULL COMMENT '库房类型ID（颜色由类型表带出）',
         is_active TINYINT(1) DEFAULT 1 COMMENT '是否启用',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        CONSTRAINT fk_wh_warehouse_type FOREIGN KEY (warehouse_type_id)
+            REFERENCES dict_warehouse_types (id) ON UPDATE CASCADE ON DELETE SET NULL,
+        INDEX idx_wh_warehouse_type (warehouse_type_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='仓库字典表';
     """,
     # 冶炼厂字典表
@@ -399,13 +414,58 @@ def ensure_pd_ip_delivery_records_smelter_column() -> None:
 
 
 def ensure_dict_warehouses_extended_columns() -> None:
-    """已有库升级：为 dict_warehouses 增加 address、warehouse_type、color_config。"""
+    """已有库升级：为 dict_warehouses 仅增加 address（类型/颜色已迁移至 dict_warehouse_types）。"""
     config_dict = get_mysql_config()
     connection = pymysql.connect(**config_dict)
     try:
         with connection.cursor() as cursor:
             cursor.execute("SHOW TABLES LIKE 'dict_warehouses'")
             if cursor.fetchone() is None:
+                return
+
+            def _has_col(table: str, col: str) -> bool:
+                cursor.execute(
+                    "SELECT COUNT(*) FROM information_schema.columns "
+                    "WHERE table_schema = DATABASE() AND table_name = %s "
+                    "AND column_name = %s",
+                    (table, col),
+                )
+                return cursor.fetchone()[0] > 0
+
+            if not _has_col("dict_warehouses", "address"):
+                cursor.execute(
+                    "ALTER TABLE dict_warehouses ADD COLUMN address VARCHAR(500) DEFAULT NULL "
+                    "COMMENT '地址' AFTER name"
+                )
+                logger.info("已为 dict_warehouses 添加 address 列")
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def ensure_dict_warehouse_types_migration() -> None:
+    """库房类型表 + 仓库 warehouse_type_id；从旧列 warehouse_type/color_config 迁移后删除旧列。"""
+    config_dict = get_mysql_config()
+    connection = pymysql.connect(**config_dict)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS dict_warehouse_types (
+                    id INT AUTO_INCREMENT PRIMARY KEY COMMENT '库房类型ID',
+                    name VARCHAR(50) NOT NULL UNIQUE COMMENT '类型名称',
+                    color_config JSON DEFAULT NULL COMMENT '颜色配置（JSON），与类型唯一绑定',
+                    is_active TINYINT(1) DEFAULT 1 COMMENT '是否启用',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    INDEX idx_wh_type_active (is_active)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='库房类型字典（类型-颜色一对一）';
+                """
+            )
+
+            cursor.execute("SHOW TABLES LIKE 'dict_warehouses'")
+            if cursor.fetchone() is None:
+                connection.commit()
                 return
 
             def _has_col(col: str) -> bool:
@@ -417,24 +477,110 @@ def ensure_dict_warehouses_extended_columns() -> None:
                 )
                 return cursor.fetchone()[0] > 0
 
-            if not _has_col("address"):
+            def _has_fk_wh_type() -> bool:
                 cursor.execute(
-                    "ALTER TABLE dict_warehouses ADD COLUMN address VARCHAR(500) DEFAULT NULL "
-                    "COMMENT '地址' AFTER name"
+                    "SELECT COUNT(*) FROM information_schema.TABLE_CONSTRAINTS "
+                    "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'dict_warehouses' "
+                    "AND CONSTRAINT_TYPE = 'FOREIGN KEY' AND CONSTRAINT_NAME = 'fk_wh_warehouse_type'"
                 )
-                logger.info("已为 dict_warehouses 添加 address 列")
-            if not _has_col("warehouse_type"):
+                return cursor.fetchone()[0] > 0
+
+            if not _has_col("warehouse_type_id"):
+                after = "address" if _has_col("address") else "name"
                 cursor.execute(
-                    "ALTER TABLE dict_warehouses ADD COLUMN warehouse_type VARCHAR(50) DEFAULT NULL "
-                    "COMMENT '仓库类型' AFTER address"
+                    f"ALTER TABLE dict_warehouses ADD COLUMN warehouse_type_id INT DEFAULT NULL "
+                    f"COMMENT '库房类型ID' AFTER {after}"
                 )
-                logger.info("已为 dict_warehouses 添加 warehouse_type 列")
-            if not _has_col("color_config"):
+                logger.info("已为 dict_warehouses 添加 warehouse_type_id 列")
+
+            has_varchar = _has_col("warehouse_type")
+            has_color = _has_col("color_config")
+
+            if has_varchar:
                 cursor.execute(
-                    "ALTER TABLE dict_warehouses ADD COLUMN color_config JSON DEFAULT NULL "
-                    "COMMENT '颜色配置（JSON）' AFTER warehouse_type"
+                    "SELECT DISTINCT TRIM(warehouse_type) AS t FROM dict_warehouses "
+                    "WHERE warehouse_type IS NOT NULL AND TRIM(warehouse_type) <> ''"
                 )
-                logger.info("已为 dict_warehouses 添加 color_config 列")
+                for (tname,) in cursor.fetchall():
+                    if not tname:
+                        continue
+                    cursor.execute(
+                        "INSERT IGNORE INTO dict_warehouse_types (name, is_active) VALUES (%s, 1)",
+                        (tname,),
+                    )
+                cursor.execute(
+                    """
+                    UPDATE dict_warehouses w
+                    INNER JOIN dict_warehouse_types t ON t.name = TRIM(w.warehouse_type)
+                    SET w.warehouse_type_id = t.id
+                    WHERE w.warehouse_type_id IS NULL AND w.warehouse_type IS NOT NULL
+                    """
+                )
+                logger.info("已从旧 warehouse_type 列回填 warehouse_type_id")
+
+            if has_color and _has_col("warehouse_type_id"):
+                cursor.execute(
+                    "SELECT id, warehouse_type_id, color_config FROM dict_warehouses "
+                    "WHERE color_config IS NOT NULL AND warehouse_type_id IS NOT NULL"
+                )
+                for _wh_id, tid, cc in cursor.fetchall():
+                    if cc is None or tid is None:
+                        continue
+                    cursor.execute(
+                        "SELECT color_config FROM dict_warehouse_types WHERE id = %s", (tid,)
+                    )
+                    row = cursor.fetchone()
+                    if not row or row[0] is not None:
+                        continue
+                    if isinstance(cc, (dict, list)):
+                        cc_payload = json.dumps(cc, ensure_ascii=False)
+                        cursor.execute(
+                            "UPDATE dict_warehouse_types SET color_config = CAST(%s AS JSON) "
+                            "WHERE id = %s",
+                            (cc_payload, tid),
+                        )
+                    else:
+                        cursor.execute(
+                            "UPDATE dict_warehouse_types SET color_config = %s WHERE id = %s",
+                            (cc, tid),
+                        )
+                logger.info("已将仓库上旧 color_config 合并到对应库房类型（仅类型色为空时）")
+
+            if not _has_fk_wh_type():
+                try:
+                    cursor.execute(
+                        """
+                        ALTER TABLE dict_warehouses
+                        ADD CONSTRAINT fk_wh_warehouse_type
+                        FOREIGN KEY (warehouse_type_id) REFERENCES dict_warehouse_types(id)
+                        ON UPDATE CASCADE ON DELETE SET NULL
+                        """
+                    )
+                    logger.info("已为 dict_warehouses 添加外键 fk_wh_warehouse_type")
+                except Exception:
+                    logger.exception("添加 fk_wh_warehouse_type 失败")
+
+            if has_varchar:
+                try:
+                    cursor.execute("ALTER TABLE dict_warehouses DROP COLUMN warehouse_type")
+                    logger.info("已删除废弃列 dict_warehouses.warehouse_type")
+                except Exception:
+                    logger.exception("删除 warehouse_type 列失败")
+
+            if has_color:
+                try:
+                    cursor.execute("ALTER TABLE dict_warehouses DROP COLUMN color_config")
+                    logger.info("已删除废弃列 dict_warehouses.color_config")
+                except Exception:
+                    logger.exception("删除 color_config 列失败")
+
+            try:
+                cursor.execute(
+                    "ALTER TABLE dict_warehouses ADD INDEX idx_wh_warehouse_type (warehouse_type_id)"
+                )
+            except Exception:
+                pass
+
         connection.commit()
     finally:
         connection.close()
@@ -520,6 +666,10 @@ def create_tables() -> None:
         ensure_dict_warehouses_extended_columns()
     except Exception:
         logger.exception("检查/添加 dict_warehouses 扩展列失败")
+    try:
+        ensure_dict_warehouse_types_migration()
+    except Exception:
+        logger.exception("库房类型表/warehouse_type_id 迁移失败")
     try:
         ensure_dict_factories_address_column()
     except Exception:

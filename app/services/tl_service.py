@@ -194,15 +194,23 @@ class TLService:
         self,
         name: str,
         address: Optional[str] = None,
-        warehouse_type: Optional[str] = None,
-        color_config: Optional[Any] = None,
+        warehouse_type_id: Optional[int] = None,
     ) -> Dict[str, Any]:
         addr = _strip_optional_str(address)
-        wtype = _strip_optional_str(warehouse_type)
-        cc_json = _color_config_to_json_str(color_config) if color_config is not None else None
         try:
             with get_conn() as conn:
                 with conn.cursor() as cur:
+                    if warehouse_type_id is not None:
+                        cur.execute(
+                            "SELECT id FROM dict_warehouse_types "
+                            "WHERE id = %s AND is_active = 1",
+                            (warehouse_type_id,),
+                        )
+                        if not cur.fetchone():
+                            raise ValueError(
+                                f"库房类型 id={warehouse_type_id} 不存在或未启用，"
+                                f"请先用 add_warehouse_type 维护类型"
+                            )
                     cur.execute(
                         "SELECT id FROM dict_warehouses WHERE name = %s",
                         (name,),
@@ -210,21 +218,15 @@ class TLService:
                     row = cur.fetchone()
                     if row:
                         return {"code": 200, "msg": "仓库已存在", "仓库id": row[0], "新建": False}
-                    if cc_json is None:
-                        cur.execute(
-                            "INSERT INTO dict_warehouses "
-                            "(name, address, warehouse_type, color_config, is_active) "
-                            "VALUES (%s, %s, %s, NULL, 1)",
-                            (name, addr, wtype),
-                        )
-                    else:
-                        cur.execute(
-                            "INSERT INTO dict_warehouses "
-                            "(name, address, warehouse_type, color_config, is_active) "
-                            "VALUES (%s, %s, %s, CAST(%s AS JSON), 1)",
-                            (name, addr, wtype, cc_json),
-                        )
+                    cur.execute(
+                        "INSERT INTO dict_warehouses "
+                        "(name, address, warehouse_type_id, is_active) "
+                        "VALUES (%s, %s, %s, 1)",
+                        (name, addr, warehouse_type_id),
+                    )
                     return {"code": 200, "msg": "仓库新建成功", "仓库id": cur.lastrowid, "新建": True}
+        except ValueError:
+            raise
         except Exception as e:
             logger.error(f"添加仓库失败: {e}")
             raise
@@ -264,19 +266,23 @@ class TLService:
 
     def get_warehouses(self, keyword: Optional[str] = None) -> List[Dict[str, Any]]:
         try:
-            conditions = ["is_active = 1"]
+            conditions = ["dw.is_active = 1"]
             params: List[Any] = []
-            if keyword is not None and str(keyword).strip():
-                conditions.append("name LIKE %s")
-                params.append(f"%{str(keyword).strip()}%")
+            kw = str(keyword).strip() if keyword is not None and str(keyword).strip() else ""
+            if kw:
+                conditions.append("(dw.name LIKE %s OR IFNULL(wt.name, '') LIKE %s)")
+                params.extend([f"%{kw}%", f"%{kw}%"])
             where_sql = " AND ".join(conditions)
             with get_conn() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
-                        f"SELECT id AS `仓库id`, name AS `仓库名`, "
-                        f"address AS `地址`, warehouse_type AS `类型`, color_config AS `颜色配置` "
-                        f"FROM dict_warehouses WHERE {where_sql} "
-                        "ORDER BY id",
+                        f"SELECT dw.id AS `仓库id`, dw.name AS `仓库名`, "
+                        f"dw.address AS `地址`, dw.warehouse_type_id AS `仓库类型id`, "
+                        f"wt.name AS `类型`, wt.color_config AS `颜色配置` "
+                        f"FROM dict_warehouses dw "
+                        f"LEFT JOIN dict_warehouse_types wt ON dw.warehouse_type_id = wt.id "
+                        f"WHERE {where_sql} "
+                        "ORDER BY dw.id",
                         tuple(params),
                     )
                     columns = [desc[0] for desc in cur.description]
@@ -295,11 +301,11 @@ class TLService:
     # ==================== 接口1b：修改仓库 ====================
 
     def update_warehouse(self, warehouse_id: int, patch: Dict[str, Any]) -> Dict[str, Any]:
-        allowed = {"仓库名", "is_active", "地址", "类型", "颜色配置"}
+        allowed = {"仓库名", "is_active", "地址", "仓库类型id"}
         keys = set(patch.keys()) & allowed
         if not keys:
             raise ValueError(
-                "至少需要提供一个待修改字段：仓库名、is_active、地址、类型、颜色配置 之一"
+                "至少需要提供一个待修改字段：仓库名、is_active、地址、仓库类型id 之一"
             )
 
         try:
@@ -335,18 +341,21 @@ class TLService:
                         updates.append("address = %s")
                         params.append(_strip_optional_str(addr) if addr is not None else None)
 
-                    if "类型" in patch:
-                        wt = patch["类型"]
-                        updates.append("warehouse_type = %s")
-                        params.append(_strip_optional_str(wt) if wt is not None else None)
-
-                    if "颜色配置" in patch:
-                        cc = patch["颜色配置"]
-                        if cc is None:
-                            updates.append("color_config = NULL")
+                    if "仓库类型id" in patch:
+                        wtid = patch["仓库类型id"]
+                        if wtid is not None:
+                            if int(wtid) < 1:
+                                raise ValueError("仓库类型id 无效")
+                            cur.execute(
+                                "SELECT id FROM dict_warehouse_types WHERE id = %s AND is_active = 1",
+                                (int(wtid),),
+                            )
+                            if not cur.fetchone():
+                                raise ValueError(f"库房类型 id={wtid} 不存在或未启用")
+                            updates.append("warehouse_type_id = %s")
+                            params.append(int(wtid))
                         else:
-                            updates.append("color_config = CAST(%s AS JSON)")
-                            params.append(_color_config_to_json_str(cc))
+                            updates.append("warehouse_type_id = NULL")
 
                     if not updates:
                         raise ValueError("没有有效的修改项")
@@ -386,6 +395,197 @@ class TLService:
             raise
         except Exception as e:
             logger.error(f"删除仓库失败: {e}")
+            raise
+
+    # ==================== 库房类型维护（类型与颜色一对一）====================
+
+    def get_warehouse_types(
+        self,
+        keyword: Optional[str] = None,
+        include_inactive: bool = False,
+    ) -> List[Dict[str, Any]]:
+        try:
+            conditions: List[str] = []
+            params: List[Any] = []
+            if not include_inactive:
+                conditions.append("is_active = 1")
+            if keyword is not None and str(keyword).strip():
+                conditions.append("name LIKE %s")
+                params.append(f"%{str(keyword).strip()}%")
+            where_sql = " AND ".join(conditions) if conditions else "1=1"
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"SELECT id AS `类型id`, name AS `类型名`, color_config AS `颜色配置`, "
+                        f"is_active AS `is_active` "
+                        f"FROM dict_warehouse_types WHERE {where_sql} "
+                        "ORDER BY id",
+                        tuple(params),
+                    )
+                    columns = [d[0] for d in cur.description]
+                    out: List[Dict[str, Any]] = []
+                    for row in cur.fetchall():
+                        rec = dict(zip(columns, row))
+                        rec["颜色配置"] = _color_config_from_db(rec.get("颜色配置"))
+                        out.append(rec)
+                    return out
+        except Exception as e:
+            logger.error(f"获取库房类型列表失败: {e}")
+            raise
+
+    def add_warehouse_type(
+        self, name: str, color_config: Optional[Any] = None
+    ) -> Dict[str, Any]:
+        n = str(name).strip()
+        if not n:
+            raise ValueError("类型名不能为空")
+        if len(n) > 50:
+            raise ValueError("类型名长度不能超过 50 字符")
+        cc_json = _color_config_to_json_str(color_config) if color_config is not None else None
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT id, is_active FROM dict_warehouse_types WHERE name = %s",
+                        (n,),
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        tid, act = int(row[0]), row[1]
+                        if act == 1:
+                            return {
+                                "code": 200,
+                                "msg": "类型已存在",
+                                "类型id": tid,
+                                "新建": False,
+                            }
+                        if cc_json is None:
+                            cur.execute(
+                                "UPDATE dict_warehouse_types SET is_active = 1 WHERE id = %s",
+                                (tid,),
+                            )
+                        else:
+                            cur.execute(
+                                "UPDATE dict_warehouse_types SET is_active = 1, "
+                                "color_config = CAST(%s AS JSON) WHERE id = %s",
+                                (cc_json, tid),
+                            )
+                        return {
+                            "code": 200,
+                            "msg": "类型已恢复启用",
+                            "类型id": tid,
+                            "新建": False,
+                        }
+                    if cc_json is None:
+                        cur.execute(
+                            "INSERT INTO dict_warehouse_types (name, color_config, is_active) "
+                            "VALUES (%s, NULL, 1)",
+                            (n,),
+                        )
+                    else:
+                        cur.execute(
+                            "INSERT INTO dict_warehouse_types (name, color_config, is_active) "
+                            "VALUES (%s, CAST(%s AS JSON), 1)",
+                            (n, cc_json),
+                        )
+                    return {
+                        "code": 200,
+                        "msg": "库房类型新建成功",
+                        "类型id": cur.lastrowid,
+                        "新建": True,
+                    }
+        except ValueError:
+            raise
+        except Exception as e:
+            logger.error(f"新建库房类型失败: {e}")
+            raise
+
+    def update_warehouse_type(self, type_id: int, patch: Dict[str, Any]) -> Dict[str, Any]:
+        allowed = {"类型名", "颜色配置", "is_active"}
+        if not (set(patch.keys()) & allowed):
+            raise ValueError("至少需要提供一个待修改字段：类型名、颜色配置、is_active 之一")
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT id FROM dict_warehouse_types WHERE id = %s",
+                        (type_id,),
+                    )
+                    if not cur.fetchone():
+                        raise ValueError(f"库房类型 id={type_id} 不存在")
+
+                    updates: List[str] = []
+                    params: List[Any] = []
+
+                    if "类型名" in patch:
+                        nn = patch["类型名"]
+                        if nn is None or str(nn).strip() == "":
+                            raise ValueError("类型名不能为空")
+                        nn = str(nn).strip()
+                        cur.execute(
+                            "SELECT id FROM dict_warehouse_types WHERE name = %s AND id <> %s",
+                            (nn, type_id),
+                        )
+                        if cur.fetchone():
+                            raise ValueError(f"类型名「{nn}」已存在")
+                        updates.append("name = %s")
+                        params.append(nn)
+
+                    if "is_active" in patch and patch["is_active"] is not None:
+                        updates.append("is_active = %s")
+                        params.append(1 if patch["is_active"] else 0)
+
+                    if "颜色配置" in patch:
+                        cc = patch["颜色配置"]
+                        if cc is None:
+                            updates.append("color_config = NULL")
+                        else:
+                            updates.append("color_config = CAST(%s AS JSON)")
+                            params.append(_color_config_to_json_str(cc))
+
+                    if not updates:
+                        raise ValueError("没有有效的修改项")
+
+                    params.append(type_id)
+                    cur.execute(
+                        f"UPDATE dict_warehouse_types SET {', '.join(updates)} WHERE id = %s",
+                        tuple(params),
+                    )
+
+            return {"code": 200, "msg": "库房类型已更新"}
+        except ValueError:
+            raise
+        except Exception as e:
+            logger.error(f"更新库房类型失败: {e}")
+            raise
+
+    def delete_warehouse_type(self, type_id: int) -> Dict[str, Any]:
+        """软删除类型：相关仓库的 warehouse_type_id 置空（颜色随类型失效）。"""
+        if type_id < 1:
+            raise ValueError("类型id 无效")
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT id FROM dict_warehouse_types WHERE id = %s AND is_active = 1",
+                        (type_id,),
+                    )
+                    if not cur.fetchone():
+                        raise ValueError(f"库房类型 id={type_id} 不存在或已停用")
+                    cur.execute(
+                        "UPDATE dict_warehouses SET warehouse_type_id = NULL "
+                        "WHERE warehouse_type_id = %s",
+                        (type_id,),
+                    )
+                    cur.execute(
+                        "UPDATE dict_warehouse_types SET is_active = 0 WHERE id = %s",
+                        (type_id,),
+                    )
+            return {"code": 200, "msg": "库房类型已删除"}
+        except ValueError:
+            raise
+        except Exception as e:
+            logger.error(f"删除库房类型失败: {e}")
             raise
 
     # ==================== 接口2：获取冶炼厂列表 ====================
