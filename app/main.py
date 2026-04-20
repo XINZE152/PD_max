@@ -114,7 +114,7 @@ async def on_startup():
 
             await get_cache_manager().redis.connect()
         except Exception:
-            logger.exception("智能預測 Redis 預連線失敗（不影響主服務）")
+            logger.exception("智能预测 Redis 预连接失败（不影响主服务）")
         from app.intelligent_prediction.settings import settings as ip_settings
 
         if ip_settings.intelligent_prediction_schedule_enabled:
@@ -138,7 +138,7 @@ async def on_startup():
             sched.start()
             app.state.ip_prediction_scheduler = sched
             logger.info(
-                "智能預測定時任務已啟用：cron %s:%s",
+                "智能预测定时任务已启用：cron %s:%s",
                 ip_settings.intelligent_prediction_schedule_cron_hour,
                 ip_settings.intelligent_prediction_schedule_cron_minute,
             )
@@ -146,7 +146,7 @@ async def on_startup():
             app.state.ip_prediction_scheduler = None
     else:
         logger.info(
-            "智能預測模組已關閉（INTELLIGENT_PREDICTION_ENABLED=0），不註冊相關路由"
+            "智能预测模块已关闭（INTELLIGENT_PREDICTION_ENABLED=0），不注册相关路由"
         )
 
 

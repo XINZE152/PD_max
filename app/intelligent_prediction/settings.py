@@ -1,4 +1,4 @@
-"""智能預測模組設定：讀環境變數，並與主應用 app.config（JWT、MySQL、LLM）對齊。"""
+"""智能预测模块配置：读取环境变量，并与主应用 app.config（JWT、MySQL、LLM）对齐。"""
 
 from __future__ import annotations
 
@@ -58,7 +58,7 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 def _openai_key_chain() -> str:
-    """與主程式一致：顯式 OPENAI_API_KEY 優先，否則沿用 app.config 的 LLM_API_KEY（含百鍊等兜底）。"""
+    """与主程序一致：显式 OPENAI_API_KEY 优先，否则沿用 app.config 的 LLM_API_KEY（含百炼等兜底）。"""
     explicit = (os.getenv("OPENAI_API_KEY") or "").strip()
     if explicit:
         return explicit
@@ -66,7 +66,7 @@ def _openai_key_chain() -> str:
 
 
 def _openai_base_chain() -> str:
-    """顯式 OPENAI_API_BASE 優先；僅在設了專用 OpenAI Key 時預設 openai.com，其餘跟主程式 LLM_BASE_URL。"""
+    """显式 OPENAI_API_BASE 优先；仅在配置了专用 OpenAI Key 时默认 openai.com，其余跟随主程序 LLM_BASE_URL。"""
     ob = (os.getenv("OPENAI_API_BASE") or "").strip()
     if ob:
         return ob
@@ -132,6 +132,10 @@ class IntelligentPredictionSettings(BaseModel):
     intelligent_prediction_history_purge_secret: str = Field(
         default_factory=lambda: (os.getenv("INTELLIGENT_PREDICTION_HISTORY_PURGE_SECRET") or "").strip()
     )
+
+    #: 天气 API 根地址（留空则导入时不请求天气，weather_json 为 NULL）
+    weather_api_base_url: str = Field(default_factory=lambda: (os.getenv("WEATHER_API_BASE_URL") or "").strip())
+    weather_api_key: str = Field(default_factory=lambda: (os.getenv("WEATHER_API_KEY") or "").strip())
 
 
 def load_intelligent_prediction_settings() -> IntelligentPredictionSettings:

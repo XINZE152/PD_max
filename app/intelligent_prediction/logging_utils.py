@@ -1,4 +1,4 @@
-﻿"""與主專案一致的 logger 取得方式（避免依賴 PD 的 app.core.logging）。"""
+"""与主项目一致的 logger 获取方式（避免依赖 PD 的 app.core.logging）。"""
 
 from __future__ import annotations
 

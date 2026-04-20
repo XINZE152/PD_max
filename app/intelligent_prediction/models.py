@@ -1,4 +1,4 @@
-﻿"""智能预测 ORM（MySQL，表名 pd_ip_*）。"""
+"""智能预测 ORM（MySQL，表名 pd_ip_*）。"""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, Optional
 
-from sqlalchemy import BigInteger, Date, DateTime, ForeignKey, Numeric, String, Text, func
+from sqlalchemy import BigInteger, Boolean, Date, DateTime, ForeignKey, Numeric, String, Text, func
 from sqlalchemy.dialects.mysql import JSON
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -25,9 +25,14 @@ class DeliveryRecord(Base):
     regional_manager: Mapped[str] = mapped_column(String(255), index=True)
     smelter: Mapped[Optional[str]] = mapped_column(String(100), nullable=True, index=True)
     warehouse: Mapped[str] = mapped_column(String(255), index=True)
+    warehouse_address: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    smelter_address: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
     delivery_date: Mapped[date] = mapped_column(Date, index=True)
     product_variety: Mapped[str] = mapped_column(String(255), index=True)
     weight: Mapped[Decimal] = mapped_column(Numeric(18, 4))
+    cn_is_workday: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    cn_calendar_label: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    weather_json: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime,
         server_default=func.current_timestamp(),

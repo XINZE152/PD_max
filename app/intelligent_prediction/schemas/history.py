@@ -1,4 +1,4 @@
-﻿"""历史数据 API 结构。"""
+"""历史数据 API 结构。"""
 
 from __future__ import annotations
 
@@ -18,10 +18,16 @@ class DeliveryRecordRead(BaseModel):
     regional_manager: str
     smelter: Optional[str] = None
     warehouse: str
+    warehouse_address: Optional[str] = None
+    smelter_address: Optional[str] = None
     delivery_date: date
     product_variety: str
     weight: Decimal
+    cn_is_workday: Optional[bool] = Field(None, description="是否中国工作日（含调休），导入时按送货日期自动计算")
+    cn_calendar_label: Optional[str] = Field(None, description="节假日/周末/工作日等中文说明")
+    weather_json: Optional[dict[str, Any]] = Field(None, description="天气 API 返回摘要（未配置 API 时为空）")
     created_at: datetime
+    updated_at: Optional[datetime] = None
 
 
 class HistoryListResponse(BaseModel):
@@ -78,6 +84,8 @@ class DeliveryRecordUpdate(BaseModel):
     regional_manager: Optional[str] = Field(default=None, max_length=255)
     smelter: Optional[str] = Field(default=None, max_length=100)
     warehouse: Optional[str] = Field(default=None, min_length=1, max_length=255)
+    warehouse_address: Optional[str] = Field(default=None, max_length=512)
+    smelter_address: Optional[str] = Field(default=None, max_length=512)
     delivery_date: Optional[date] = None
     product_variety: Optional[str] = Field(default=None, min_length=1, max_length=255)
     weight: Optional[Decimal] = Field(default=None, ge=0)
@@ -85,6 +93,14 @@ class DeliveryRecordUpdate(BaseModel):
     @field_validator("smelter", mode="before")
     @classmethod
     def empty_smelter_none(cls, v: Any) -> Any:
+        if v is None:
+            return None
+        s = str(v).strip()
+        return s or None
+
+    @field_validator("warehouse_address", "smelter_address", mode="before")
+    @classmethod
+    def empty_address_none(cls, v: Any) -> Any:
         if v is None:
             return None
         s = str(v).strip()

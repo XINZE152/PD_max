@@ -1,4 +1,4 @@
-﻿"""送货历史 HTTP 接口。"""
+"""送货历史 HTTP 接口。"""
 
 from __future__ import annotations
 
@@ -66,7 +66,7 @@ def _parse_history_query_date(name: str, raw: Optional[str]) -> Optional[date]:
     "/模板/fields",
     response_model=HistoryTemplateFieldsResponse,
     summary="导入模板列定义（JSON）",
-    description="返回模板表头顺序及与内部字段映射，含「冶炼厂」；导入时「到货日期」列名会映射为送货日期；与 GET /送货历史/模板 下载的 xlsx 表头一致。",
+    description="返回模板表头顺序及与内部字段映射（含冶炼厂、选填仓库地址/冶炼厂地址）；导入时「到货日期」列名会映射为送货日期；节假日由系统按送货日期写入；与 GET /送货历史/模板 下载的 xlsx 表头一致。",
 )
 async def history_template_fields() -> HistoryTemplateFieldsResponse:
     return HistoryTemplateFieldsResponse(
@@ -80,7 +80,7 @@ async def history_template_fields() -> HistoryTemplateFieldsResponse:
     summary="下载送货历史导入模板",
     description=(
         "返回标准 xlsx：含「导入数据」（表头 + 可跳过示例行）与「使用说明」；"
-        "表头含大区经理、冶炼厂、仓库、送货日期（导入亦支持「到货日期」列名）、品种、重量；"
+        "表头含大区经理、冶炼厂、仓库、选填仓库地址与冶炼厂地址、送货日期（导入亦支持「到货日期」列名）、品种、重量；"
         "大区经理以「(示例)」开头的行导入时自动跳过。"
     ),
 )

@@ -1,4 +1,4 @@
-﻿"""预测相关 Pydantic 模型与校验器。"""
+"""预测相关 Pydantic 模型与校验器。"""
 
 from __future__ import annotations
 
@@ -74,6 +74,14 @@ class PredictionHistoryPoint(BaseModel):
 
     delivery_date: date
     weight: Decimal = Field(..., ge=0)
+    cn_calendar_label: Optional[str] = Field(
+        default=None,
+        description="该送货日对应的中国节假日/工作日说明（来自历史导入自动计算）",
+    )
+    weather_summary: Optional[str] = Field(
+        default=None,
+        description="天气摘要（由 weather_json 提取；未配置 API 时为空）",
+    )
 
 
 class PredictionRequest(BaseModel):

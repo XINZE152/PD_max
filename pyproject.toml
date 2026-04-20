@@ -33,6 +33,7 @@ dependencies = [
 	"celery",
 	"pandas",
 	"apscheduler",
+	"chinese-calendar>=1.9.0",
 ]
 
 [[tool.uv.index]]

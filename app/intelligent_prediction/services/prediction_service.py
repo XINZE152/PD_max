@@ -1,4 +1,4 @@
-﻿"""核心预测逻辑：缓存、并发限制、结果校验。"""
+"""核心预测逻辑：缓存、并发限制、结果校验。"""
 
 from __future__ import annotations
 
@@ -27,6 +27,16 @@ from app.intelligent_prediction.services.cache_manager import CacheManager
 from app.intelligent_prediction.services.prompt_builder import PromptBuilder
 
 logger = get_logger(__name__)
+
+
+def _weather_summary_from_json(data: Any) -> Optional[str]:
+    if not isinstance(data, dict):
+        return None
+    for k in ("summary", "brief", "text", "description"):
+        v = data.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()[:500]
+    return None
 
 
 class PredictionService:
@@ -73,7 +83,12 @@ class PredictionService:
         rows = list(res.scalars().all())
         rows.reverse()
         return [
-            PredictionHistoryPoint(delivery_date=r.delivery_date, weight=Decimal(r.weight))
+            PredictionHistoryPoint(
+                delivery_date=r.delivery_date,
+                weight=Decimal(r.weight),
+                cn_calendar_label=getattr(r, "cn_calendar_label", None),
+                weather_summary=_weather_summary_from_json(getattr(r, "weather_json", None)),
+            )
             for r in rows
         ]
 

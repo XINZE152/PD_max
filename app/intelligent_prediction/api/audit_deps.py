@@ -1,4 +1,4 @@
-"""智能預測介面：審計主體（可選 Bearer，不強制登入）。"""
+"""智能预测接口：审计主体（可选 Bearer，不强制登录）。"""
 
 from __future__ import annotations
 

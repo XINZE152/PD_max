@@ -1,4 +1,4 @@
-﻿"""历史送货：Excel 导入、分页、批量删除。"""
+"""历史送货：Excel 导入、分页、批量删除。"""
 
 from __future__ import annotations
 
@@ -16,6 +16,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.intelligent_prediction.exceptions import ValidationBusinessException
 from app.intelligent_prediction.logging_utils import get_logger
 from app.intelligent_prediction.models import DeliveryRecord
+from app.intelligent_prediction.services.weather_client import fetch_weather_json
+from app.intelligent_prediction.utils.cn_calendar import cn_workday_and_label
 from app.intelligent_prediction.schemas.history import (
     DeliveryRecordRead,
     DeliveryRecordUpdate,
@@ -40,8 +42,8 @@ _EXCEL_SERIAL_MAX = 200_000  # 约到 2448 年，覆盖正常业务日期列
 class HistoryService:
     """历史记录业务逻辑。"""
 
-    # 单一来源：下载模板表头顺序与导入必填列一致（含「冶炼厂」）
-    _IMPORT_COLUMN_PAIRS: ClassVar[tuple[tuple[str, str], ...]] = (
+    # 必填列 + 选填列（地址）；节假日、天气由系统按送货日期与地址自动写入，不在模板中手填
+    _REQUIRED_IMPORT_COLUMN_PAIRS: ClassVar[tuple[tuple[str, str], ...]] = (
         ("大区经理", "regional_manager"),
         ("冶炼厂", "smelter"),
         ("仓库", "warehouse"),
@@ -49,15 +51,27 @@ class HistoryService:
         ("品种", "product_variety"),
         ("重量", "weight"),
     )
-    REQUIRED_COLUMNS_CANONICAL: dict[str, str] = dict(_IMPORT_COLUMN_PAIRS)
+    _OPTIONAL_IMPORT_COLUMN_PAIRS: ClassVar[tuple[tuple[str, str], ...]] = (
+        ("仓库地址", "warehouse_address"),
+        ("冶炼厂地址", "smelter_address"),
+    )
+    _ALL_IMPORT_COLUMN_PAIRS: ClassVar[tuple[tuple[str, str], ...]] = (
+        _REQUIRED_IMPORT_COLUMN_PAIRS + _OPTIONAL_IMPORT_COLUMN_PAIRS
+    )
+    REQUIRED_COLUMNS_CANONICAL: dict[str, str] = dict(_REQUIRED_IMPORT_COLUMN_PAIRS)
+    OPTIONAL_COLUMNS_CANONICAL: dict[str, str] = dict(_OPTIONAL_IMPORT_COLUMN_PAIRS)
+    HEADER_TO_FIELD: ClassVar[dict[str, str]] = {
+        **dict(_REQUIRED_IMPORT_COLUMN_PAIRS),
+        **dict(_OPTIONAL_IMPORT_COLUMN_PAIRS),
+    }
     _HEADER_TO_EXCEL_COLUMN: ClassVar[dict[str, str]] = {
-        cn: chr(ord("A") + i) for i, (cn, _) in enumerate(_IMPORT_COLUMN_PAIRS)
+        cn: chr(ord("A") + i) for i, (cn, _) in enumerate(_ALL_IMPORT_COLUMN_PAIRS)
     }
 
     @classmethod
     def import_template_headers(cls) -> list[str]:
         """与 GET /送货历史/模板 生成的 xlsx/csv 表头顺序一致。"""
-        return [cn for cn, _ in cls._IMPORT_COLUMN_PAIRS]
+        return [cn for cn, _ in cls._ALL_IMPORT_COLUMN_PAIRS]
 
     ALIAS_TO_CANONICAL: dict[str, str] = {
         "大区经理": "大区经理",
@@ -86,6 +100,14 @@ class HistoryService:
         "重量": "重量",
         "Weight": "重量",
         "weight": "重量",
+        "仓库地址": "仓库地址",
+        "倉庫地址": "仓库地址",
+        "Warehouse Address": "仓库地址",
+        "warehouse_address": "仓库地址",
+        "冶炼厂地址": "冶炼厂地址",
+        "冶煉廠地址": "冶炼厂地址",
+        "Smelter Address": "冶炼厂地址",
+        "smelter_address": "冶炼厂地址",
     }
 
     #: 下载模板中示例行的大区经理须以此开头；导入时跳过，计入 skipped
@@ -103,6 +125,8 @@ class HistoryService:
         ),
         "品种": "必填。",
         "重量": "必填；非负数字，可含小数。",
+        "仓库地址": "选填；用于天气查询定位，建议填写完整地址，最长 512 字符。",
+        "冶炼厂地址": "选填；用于天气查询定位，最长 512 字符。",
     }
 
     @staticmethod
@@ -124,10 +148,10 @@ class HistoryService:
             if hint:
                 cell.comment = Comment(hint, "PD")
             cell.font = Font(bold=True)
-        example_rows: list[tuple[str, str, str, str, str, float]] = [
-            ("(示例)李经理", "金利", "华东一号仓", "2026-01-15", "阴极铜", 12.5),
-            ("(示例)李经理", "", "华东一号仓", "2026/1/16", "A级电解铜", 8.0),
-            ("(示例)王经理", "某冶炼厂", "华南中心库", "2026-01-17", "铝锭", 3.25),
+        example_rows: list[tuple[str, str, str, str, str, str, str, float]] = [
+            ("(示例)李经理", "金利", "华东一号仓", "上海市浦东新区示例路1号", "江苏省苏州市示例冶炼厂路2号", "2026-01-15", "阴极铜", 12.5),
+            ("(示例)李经理", "", "华东一号仓", "", "", "2026/1/16", "A级电解铜", 8.0),
+            ("(示例)王经理", "某冶炼厂", "华南中心库", "广州市南沙区示例仓3号", "", "2026-01-17", "铝锭", 3.25),
         ]
         for r in example_rows:
             ws.append(list(r))
@@ -136,9 +160,11 @@ class HistoryService:
             ("A", 22),
             ("B", 12),
             ("C", 16),
-            ("D", 14),
-            ("E", 14),
-            ("F", 10),
+            ("D", 28),
+            ("E", 28),
+            ("F", 14),
+            ("G", 14),
+            ("H", 10),
         ):
             ws.column_dimensions[col_letter].width = width
 
@@ -149,7 +175,9 @@ class HistoryService:
             "·「导入数据」：系统仅读取此工作表（须为工作簿中的第一个工作表）。请勿修改首行表头文字、顺序或增删列。\n"
             "·「使用说明」：仅供阅读，导入时不会解析本页。\n\n"
             "二、字段与格式\n"
-            "·大区经理、仓库、品种、重量、送货日期为必填；冶炼厂选填。\n"
+            "·大区经理、仓库、品种、重量、送货日期为必填；冶炼厂、仓库地址、冶炼厂地址选填。\n"
+            "·节假日：系统根据「送货日期」自动写入是否工作日及中文说明（不在表中填写）。\n"
+            "·天气：配置天气 API 后按日期与地址拉取并写入；未配置时该列为空。\n"
             "·送货日期：可用 2026-01-15、2026/1/15、2026年1月15日、1月15日（缺省年为当年 UTC）等；"
             "亦支持 Excel 原生日期单元格或日期序列号。\n"
             "·重量：非负数字，可含小数。\n\n"
@@ -160,9 +188,9 @@ class HistoryService:
         )
         c = ws_help.cell(row=1, column=1, value=help_lines)
         c.alignment = Alignment(wrap_text=True, vertical="top")
-        ws_help.merge_cells("A1:F22")
-        ws_help.row_dimensions[1].height = 320
-        for col_letter in ("A", "B", "C", "D", "E", "F"):
+        ws_help.merge_cells("A1:H24")
+        ws_help.row_dimensions[1].height = 360
+        for col_letter in ("A", "B", "C", "D", "E", "F", "G", "H"):
             ws_help.column_dimensions[col_letter].width = 18
 
         buf = io.BytesIO()
@@ -179,17 +207,24 @@ class HistoryService:
 
     def _validate_headers(self, df: pd.DataFrame) -> None:
         cols = {str(c).strip() for c in df.columns}
-        needed = set(self.REQUIRED_COLUMNS_CANONICAL.keys())
-        if cols != needed:
-            missing = needed - cols
-            extra = cols - needed
+        required_cn = set(self.REQUIRED_COLUMNS_CANONICAL.keys())
+        optional_cn = set(self.OPTIONAL_COLUMNS_CANONICAL.keys())
+        allowed = required_cn | optional_cn
+        if not required_cn.issubset(cols):
+            missing = required_cn - cols
             raise ValidationBusinessException(
-                "表头不符合要求（须与模板一致）",
+                "表头不符合要求（须包含全部必填列，选填列仅允许仓库地址/冶炼厂地址）",
                 details={
-                    "required": sorted(needed),
+                    "required": sorted(required_cn),
                     "missing": sorted(missing),
-                    "extra": sorted(extra),
+                    "unknown_extra": sorted(cols - allowed),
                 },
+            )
+        extra = cols - allowed
+        if extra:
+            raise ValidationBusinessException(
+                "表头不符合要求（存在未识别的列）",
+                details={"required": sorted(required_cn), "optional": sorted(optional_cn), "extra": sorted(extra)},
             )
 
     def _parse_date_cell(self, value: Any) -> tuple[date | None, str | None]:
@@ -272,10 +307,26 @@ class HistoryService:
                 row_index=excel_row,
                 excel_column=self._HEADER_TO_EXCEL_COLUMN.get(column_header),
                 column_header=column_header,
-                field=self.REQUIRED_COLUMNS_CANONICAL.get(column_header),
+                field=self.HEADER_TO_FIELD.get(column_header),
                 message=message,
             )
         )
+
+    async def _refresh_derived_delivery_fields(self, row: DeliveryRecord) -> None:
+        """按送货日期写入中国工作日/节假日；按日期与地址尝试写入天气 JSON。"""
+        wd, lab = cn_workday_and_label(row.delivery_date)
+        row.cn_is_workday = wd
+        row.cn_calendar_label = lab
+        loc = " ".join(
+            x
+            for x in [
+                (row.warehouse_address or "").strip(),
+                (row.smelter_address or "").strip(),
+                (row.warehouse or "").strip(),
+            ]
+            if x
+        )
+        row.weather_json = await fetch_weather_json(row.delivery_date, loc or (row.warehouse or ""))
 
     def _parse_weight_cell(self, value: Any) -> tuple[Decimal | None, str | None]:
         if value is None or (isinstance(value, float) and pd.isna(value)):
@@ -376,6 +427,8 @@ class HistoryService:
             rm = row.get("大区经理")
             sm = row.get("冶炼厂")
             wh = row.get("仓库")
+            wh_addr_cell = row.get("仓库地址")
+            sm_addr_cell = row.get("冶炼厂地址")
             dv = row.get("送货日期")
             variety = row.get("品种")
             wv = row.get("重量")
@@ -420,18 +473,43 @@ class HistoryService:
                 self._append_import_cell_error(errors, excel_row, "重量", "不可为负")
                 row_has_error = True
 
+            wa: str | None = None
+            if wh_addr_cell is not None and str(wh_addr_cell).strip():
+                wa = str(wh_addr_cell).strip()
+                if len(wa) > 512:
+                    self._append_import_cell_error(
+                        errors, excel_row, "仓库地址", "长度不可超过 512 字符"
+                    )
+                    row_has_error = True
+            sa: str | None = None
+            if sm_addr_cell is not None and str(sm_addr_cell).strip():
+                sa = str(sm_addr_cell).strip()
+                if len(sa) > 512:
+                    self._append_import_cell_error(
+                        errors, excel_row, "冶炼厂地址", "长度不可超过 512 字符"
+                    )
+                    row_has_error = True
+
             if row_has_error:
                 continue
 
             assert d is not None and w is not None
+            cn_wd, cn_lab = cn_workday_and_label(d)
+            loc = " ".join(x for x in [wa or "", sa or "", str(wh).strip()] if x)
+            weather_json = await fetch_weather_json(d, loc or str(wh).strip())
             to_insert.append(
                 DeliveryRecord(
                     regional_manager=str(rm).strip(),
                     smelter=sm_str,
                     warehouse=str(wh).strip(),
+                    warehouse_address=wa,
+                    smelter_address=sa,
                     delivery_date=d,
                     product_variety=str(variety).strip(),
                     weight=w,
+                    cn_is_workday=cn_wd,
+                    cn_calendar_label=cn_lab,
+                    weather_json=weather_json,
                 )
             )
 
@@ -609,6 +687,8 @@ class HistoryService:
             raise ValidationBusinessException("品种不可为空")
         for k, v in patch.items():
             setattr(row, k, v)
+        if patch.keys() & {"delivery_date", "warehouse_address", "smelter_address"}:
+            await self._refresh_derived_delivery_fields(row)
         await session.flush()
         return DeliveryRecordRead.model_validate(row, from_attributes=True)
 

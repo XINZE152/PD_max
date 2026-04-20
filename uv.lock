@@ -398,6 +398,15 @@ wheels = [
 ]
 
 [[package]]
+name = "chinese-calendar"
+version = "1.11.0"
+source = { registry = "https://mirrors.aliyun.com/pypi/simple/" }
+sdist = { url = "https://mirrors.aliyun.com/pypi/packages/a0/af/d5dd356a7d03d17325a2f3100e35d26300a405bc7d57d3325dd634f04cc2/chinese_calendar-1.11.0.tar.gz", hash = "sha256:931d9187cbf7bb1dc09685dedb5013e74678bbe03a173d71d46b76afc37f2597" }
+wheels = [
+    { url = "https://mirrors.aliyun.com/pypi/packages/c1/34/5ba74e1c2509c522dc9bbc7ff07f2a9823c51183ef32ec2dbade1c593205/chinese_calendar-1.11.0-py2.py3-none-any.whl", hash = "sha256:6800bf53bd011a8b3e9fbb91805d16210f59648c2d86130dc43c2aa7708207ec" },
+]
+
+[[package]]
 name = "click"
 version = "8.3.1"
 source = { registry = "https://mirrors.aliyun.com/pypi/simple/" }
@@ -1650,6 +1659,7 @@ dependencies = [
     { name = "apscheduler" },
     { name = "bcrypt" },
     { name = "celery" },
+    { name = "chinese-calendar" },
     { name = "cryptography" },
     { name = "easyocr" },
     { name = "faiss-cpu" },
@@ -1682,6 +1692,7 @@ requires-dist = [
     { name = "apscheduler" },
     { name = "bcrypt" },
     { name = "celery" },
+    { name = "chinese-calendar", specifier = ">=1.9.0" },
     { name = "cryptography" },
     { name = "easyocr" },
     { name = "faiss-cpu" },

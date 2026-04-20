@@ -1,4 +1,4 @@
-﻿"""Prompt 构建：系统提示、历史统计、强制 JSON 输出格式。"""
+"""Prompt 构建：系统提示、历史统计、强制 JSON 输出格式。"""
 
 from __future__ import annotations
 
@@ -63,9 +63,19 @@ class PromptBuilder:
         """组装 User Prompt。"""
         dates = [start_date + timedelta(days=i) for i in range(req.horizon_days)]
         date_lines = ", ".join(d.isoformat() for d in dates)
+        def _hist_line(p: PredictionHistoryPoint) -> str:
+            base = f"- {p.delivery_date.isoformat()}: {float(p.weight)}"
+            bits: list[str] = []
+            if getattr(p, "cn_calendar_label", None):
+                bits.append(str(p.cn_calendar_label))
+            if getattr(p, "weather_summary", None):
+                bits.append(f"天气:{p.weather_summary}")
+            if bits:
+                return f"{base} ({' | '.join(bits)})"
+            return base
+
         hist_lines = "\n".join(
-            f"- {p.delivery_date.isoformat()}: {float(p.weight)}"
-            for p in sorted(req.history, key=lambda x: x.delivery_date)[-30:]
+            _hist_line(p) for p in sorted(req.history, key=lambda x: x.delivery_date)[-30:]
         )
         return (
             f"仓库: {req.warehouse}\n"

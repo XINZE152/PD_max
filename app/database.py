@@ -286,9 +286,14 @@ TABLE_STATEMENTS = [
         regional_manager VARCHAR(255) NOT NULL COMMENT '大区经理',
         smelter VARCHAR(100) DEFAULT NULL COMMENT '冶炼厂',
         warehouse VARCHAR(255) NOT NULL COMMENT '仓库',
+        warehouse_address VARCHAR(512) DEFAULT NULL COMMENT '仓库地址',
+        smelter_address VARCHAR(512) DEFAULT NULL COMMENT '冶炼厂地址',
         delivery_date DATE NOT NULL COMMENT '送货日期',
         product_variety VARCHAR(255) NOT NULL COMMENT '品种',
         weight DECIMAL(18,4) NOT NULL COMMENT '重量',
+        cn_is_workday TINYINT(1) DEFAULT NULL COMMENT '是否中国工作日(含调休)',
+        cn_calendar_label VARCHAR(128) DEFAULT NULL COMMENT '节假日/周末/工作日等说明',
+        weather_json JSON DEFAULT NULL COMMENT '天气API返回摘要',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
         INDEX idx_ip_delivery_date (delivery_date),
@@ -430,6 +435,62 @@ def ensure_pd_ip_delivery_records_smelter_column() -> None:
             except Exception:
                 pass
             logger.info("已为 pd_ip_delivery_records 添加 smelter 列")
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def ensure_pd_ip_delivery_records_enrichment_columns() -> None:
+    """已有库升级：送货历史增加地址、中国工作日/节假日标注、天气 JSON。"""
+    config_dict = get_mysql_config()
+    connection = pymysql.connect(**config_dict)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SHOW TABLES LIKE 'pd_ip_delivery_records'")
+            if cursor.fetchone() is None:
+                return
+
+            def _has_col(col: str) -> bool:
+                cursor.execute(
+                    "SELECT COUNT(*) FROM information_schema.columns "
+                    "WHERE table_schema = DATABASE() AND table_name = 'pd_ip_delivery_records' "
+                    "AND column_name = %s",
+                    (col,),
+                )
+                return cursor.fetchone()[0] > 0
+
+            if not _has_col("warehouse_address"):
+                cursor.execute(
+                    "ALTER TABLE pd_ip_delivery_records "
+                    "ADD COLUMN warehouse_address VARCHAR(512) DEFAULT NULL COMMENT '仓库地址' AFTER warehouse"
+                )
+                logger.info("已为 pd_ip_delivery_records 添加 warehouse_address 列")
+            if not _has_col("smelter_address"):
+                cursor.execute(
+                    "ALTER TABLE pd_ip_delivery_records "
+                    "ADD COLUMN smelter_address VARCHAR(512) DEFAULT NULL COMMENT '冶炼厂地址' "
+                    "AFTER warehouse_address"
+                )
+                logger.info("已为 pd_ip_delivery_records 添加 smelter_address 列")
+            if not _has_col("cn_is_workday"):
+                cursor.execute(
+                    "ALTER TABLE pd_ip_delivery_records "
+                    "ADD COLUMN cn_is_workday TINYINT(1) DEFAULT NULL COMMENT '是否中国工作日(含调休)' AFTER weight"
+                )
+                logger.info("已为 pd_ip_delivery_records 添加 cn_is_workday 列")
+            if not _has_col("cn_calendar_label"):
+                cursor.execute(
+                    "ALTER TABLE pd_ip_delivery_records "
+                    "ADD COLUMN cn_calendar_label VARCHAR(128) DEFAULT NULL COMMENT '节假日/周末/工作日等说明' "
+                    "AFTER cn_is_workday"
+                )
+                logger.info("已为 pd_ip_delivery_records 添加 cn_calendar_label 列")
+            if not _has_col("weather_json"):
+                cursor.execute(
+                    "ALTER TABLE pd_ip_delivery_records "
+                    "ADD COLUMN weather_json JSON DEFAULT NULL COMMENT '天气API返回摘要' AFTER cn_calendar_label"
+                )
+                logger.info("已为 pd_ip_delivery_records 添加 weather_json 列")
         connection.commit()
     finally:
         connection.close()
@@ -817,6 +878,10 @@ def create_tables() -> None:
         ensure_pd_ip_delivery_records_smelter_column()
     except Exception:
         logger.exception("检查/添加 pd_ip_delivery_records.smelter 失败")
+    try:
+        ensure_pd_ip_delivery_records_enrichment_columns()
+    except Exception:
+        logger.exception("检查/添加 pd_ip_delivery_records 地址/节假日/天气列失败")
     try:
         ensure_pd_ip_prediction_results_smelter_column()
     except Exception:
