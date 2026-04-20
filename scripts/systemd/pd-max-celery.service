@@ -1,0 +1,26 @@
+[Unit]
+Description=PD_max Celery worker (intelligent_prediction)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/home/ubuntu/var/www/PD_max/.env
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/var/www/PD_max
+
+ExecStart=/home/ubuntu/var/www/PD_max/.venv/bin/celery -A app.intelligent_prediction.tasks.celery_app worker --loglevel=info
+
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=120
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pd-max-celery
+
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

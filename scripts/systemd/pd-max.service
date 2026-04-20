@@ -1,0 +1,30 @@
+[Unit]
+Description=PD_max FastAPI (uvicorn)
+After=network-online.target
+Wants=network-online.target
+# 未配置项目根 .env 时不启动，避免开机反复崩溃（填好配置后：cp .env.example .env）
+ConditionPathExists=/home/ubuntu/var/www/PD_max/.env
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/var/www/PD_max
+
+# 使用项目内虚拟环境，避免依赖登录 shell 里的 PATH
+Environment=RELOAD=0
+ExecStart=/home/ubuntu/var/www/PD_max/.venv/bin/python /home/ubuntu/var/www/PD_max/app.py
+
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+# 日志写入 journal；应用自身若写文件仍受项目目录权限约束
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pd-max
+
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

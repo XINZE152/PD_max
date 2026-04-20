@@ -7,6 +7,7 @@ import io
 import json
 import logging
 import os
+import re
 import uuid
 from datetime import date, datetime
 from decimal import Decimal
@@ -32,9 +33,25 @@ from app.price_tax_utils import (
     net_from_inclusive,
     parse_price_basis_from_remark,
 )
+from app.services.tl_dict_geo_crud import (
+    CODE_DB as SA_CODE_DB,
+    CODE_DUP_NAME as SA_CODE_DUP_NAME,
+    CODE_INTERNAL as SA_CODE_INTERNAL,
+    CODE_NOT_FOUND as SA_CODE_NOT_FOUND,
+    CODE_OK as SA_CODE_OK,
+    CODE_VALIDATION as SA_CODE_VALIDATION,
+    smelter_create as sa_smelter_create,
+    smelter_list as sa_smelter_list,
+    smelter_update as sa_smelter_update,
+    warehouse_create as sa_wh_create,
+    warehouse_list as sa_wh_list,
+    warehouse_update as sa_wh_update,
+)
 from app.services.vlm_extractor_service import QwenVLFullExtractor, VLMConfig
 
 logger = logging.getLogger(__name__)
+
+_MARKER_HEX_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
 
 
 def _comparison_quote_calendar_date() -> date:
@@ -148,6 +165,56 @@ def _color_config_from_db(val: Any) -> Any:
     return val
 
 
+def _strip_nonempty(v: Optional[str]) -> Optional[str]:
+    if v is None:
+        return None
+    s = str(v).strip()
+    return s if s else None
+
+
+def _full_cn_site_address(
+    province: Optional[str],
+    city: Optional[str],
+    district: Optional[str],
+    street: Optional[str],
+) -> bool:
+    return bool(
+        _strip_nonempty(province)
+        and _strip_nonempty(city)
+        and _strip_nonempty(district)
+        and _strip_nonempty(street)
+    )
+
+
+def _marker_hex_from_wh_color_config(cc: Any) -> Optional[str]:
+    """从 TL 仓库颜色配置 JSON/dict 中提取六位 #RRGGBB（供 tl_dict_geo_crud 落库）。"""
+    if cc is None:
+        return None
+    if isinstance(cc, dict):
+        d = cc
+    else:
+        d = _color_config_from_db(cc)
+    if isinstance(d, dict):
+        h = d.get("marker") or d.get("hex")
+        if isinstance(h, str):
+            hs = h.strip()
+            if _MARKER_HEX_RE.match(hs):
+                return hs
+    return None
+
+
+def _raise_tl_geo_crud_result(res: Dict[str, Any]) -> Dict[str, Any]:
+    c = int(res.get("code", SA_CODE_INTERNAL))
+    if c == SA_CODE_OK:
+        return res
+    msg = str(res.get("msg") or "操作失败")
+    if c in (SA_CODE_VALIDATION, SA_CODE_NOT_FOUND, SA_CODE_DUP_NAME):
+        raise ValueError(msg)
+    if c in (SA_CODE_DB, SA_CODE_INTERNAL):
+        raise RuntimeError(msg)
+    raise RuntimeError(msg)
+
+
 def _apply_factory_tax_rates_to_quote_item(
     item: Dict[str, Any],
     tax_by_fid: Dict[int, Dict[str, float]],
@@ -190,13 +257,71 @@ class TLService:
 
     # ==================== 接口0：添加仓库 ====================
 
+    def _resolve_warehouse_type_name_by_id(self, type_id: int) -> Optional[str]:
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT name FROM dict_warehouse_types WHERE id = %s AND is_active = 1",
+                        (int(type_id),),
+                    )
+                    row = cur.fetchone()
+                    return row[0] if row else None
+        except Exception:
+            return None
+
     def add_warehouse(
         self,
         name: str,
         address: Optional[str] = None,
         warehouse_type_id: Optional[int] = None,
+        warehouse_color_config: Optional[Any] = None,
+        province: Optional[str] = None,
+        city: Optional[str] = None,
+        district: Optional[str] = None,
+        longitude: Optional[float] = None,
+        latitude: Optional[float] = None,
+        warehouse_type_name: Optional[str] = None,
     ) -> Dict[str, Any]:
+        """极简录入仅 name/地址；含省市区详址时走 tl_dict_geo_crud，经纬度默认天地图（未同时传经度+纬度时）。"""
         addr = _strip_optional_str(address)
+        if _full_cn_site_address(province, city, district, addr):
+            type_name = _strip_nonempty(warehouse_type_name)
+            if not type_name and warehouse_type_id is not None:
+                type_name = self._resolve_warehouse_type_name_by_id(int(warehouse_type_id))
+            if not type_name:
+                raise ValueError(
+                    "完整地址模式下需提供「库房类型名」或有效的「仓库类型id」（已在系统中启用）"
+                )
+            hex_color = _marker_hex_from_wh_color_config(warehouse_color_config)
+            payload = {
+                "name": str(name).strip(),
+                "type": type_name,
+                "province": _strip_nonempty(province),
+                "city": _strip_nonempty(city),
+                "district": _strip_nonempty(district),
+                "address": addr,
+                "color": hex_color,
+                "longitude": longitude,
+                "latitude": latitude,
+                "status": 1,
+            }
+            try:
+                res = _raise_tl_geo_crud_result(sa_wh_create(payload))
+                data = res.get("data") or {}
+                wid = int(data.get("id", 0))
+                return {"code": 200, "msg": "仓库新建成功", "仓库id": wid, "新建": True}
+            except ValueError:
+                raise
+            except RuntimeError as e:
+                logger.error(f"添加仓库失败(地理落库): {e}")
+                raise
+
+        wh_cc_json = (
+            _color_config_to_json_str(warehouse_color_config)
+            if warehouse_color_config is not None
+            else None
+        )
         try:
             with get_conn() as conn:
                 with conn.cursor() as cur:
@@ -220,9 +345,9 @@ class TLService:
                         return {"code": 200, "msg": "仓库已存在", "仓库id": row[0], "新建": False}
                     cur.execute(
                         "INSERT INTO dict_warehouses "
-                        "(name, address, warehouse_type_id, is_active) "
-                        "VALUES (%s, %s, %s, 1)",
-                        (name, addr, warehouse_type_id),
+                        "(name, address, warehouse_type_id, color_config, is_active) "
+                        "VALUES (%s, %s, %s, %s, 1)",
+                        (name, addr, warehouse_type_id, wh_cc_json),
                     )
                     return {"code": 200, "msg": "仓库新建成功", "仓库id": cur.lastrowid, "新建": True}
         except ValueError:
@@ -233,8 +358,40 @@ class TLService:
 
     # ==================== 接口0b：新建冶炼厂 ====================
 
-    def add_smelter(self, name: str, address: Optional[str] = None) -> Dict[str, Any]:
+    def add_smelter(
+        self,
+        name: str,
+        address: Optional[str] = None,
+        province: Optional[str] = None,
+        city: Optional[str] = None,
+        district: Optional[str] = None,
+        longitude: Optional[float] = None,
+        latitude: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """全地址落库时经纬度由天地图解析；未传经度/纬度或只传其一由 maybe_geocode 处理（可回退为 NULL）。"""
         addr = _strip_optional_str(address)
+        if _full_cn_site_address(province, city, district, addr):
+            payload = {
+                "name": str(name).strip(),
+                "province": _strip_nonempty(province),
+                "city": _strip_nonempty(city),
+                "district": _strip_nonempty(district),
+                "address": addr,
+                "longitude": longitude,
+                "latitude": latitude,
+                "status": 1,
+            }
+            try:
+                res = _raise_tl_geo_crud_result(sa_smelter_create(payload))
+                data = res.get("data") or {}
+                fid = int(data.get("id", 0))
+                return {"code": 200, "msg": "冶炼厂新建成功", "冶炼厂id": fid, "新建": True}
+            except ValueError:
+                raise
+            except RuntimeError as e:
+                logger.error(f"新建冶炼厂失败(地理落库): {e}")
+                raise
+
         try:
             with get_conn() as conn:
                 with conn.cursor() as cur:
@@ -264,7 +421,128 @@ class TLService:
 
     # ==================== 接口1：获取仓库列表 ====================
 
-    def get_warehouses(self, keyword: Optional[str] = None) -> List[Dict[str, Any]]:
+    def _warehouse_type_ids_by_names(self, names: List[str]) -> Dict[str, int]:
+        names = [n.strip() for n in names if n and str(n).strip()]
+        if not names:
+            return {}
+        uniq = list(dict.fromkeys(names))
+        out: Dict[str, int] = {}
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    ph = ",".join(["%s"] * len(uniq))
+                    cur.execute(
+                        f"SELECT name, id FROM dict_warehouse_types "
+                        f"WHERE is_active = 1 AND name IN ({ph})",
+                        tuple(uniq),
+                    )
+                    for name, tid in cur.fetchall():
+                        out[str(name)] = int(tid)
+            return out
+        except Exception as e:
+            logger.warning(f"按名称解析库房类型 id 失败: {e}")
+            return {}
+
+    def _site_wh_item_to_tl_row(
+        self,
+        item: Dict[str, Any],
+        type_id_by_name: Dict[str, int],
+    ) -> Dict[str, Any]:
+        tname = str(item.get("type") or "").strip()
+        wt_id = type_id_by_name.get(tname) if tname else None
+        hex_c = item.get("color")
+        wh_cc = {"marker": hex_c} if hex_c else None
+        rec: Dict[str, Any] = {
+            "仓库id": int(item["id"]),
+            "仓库名": item["name"],
+            "地址": item.get("address") or "",
+            "省": item.get("province") or "",
+            "市": item.get("city") or "",
+            "区": item.get("district") or "",
+            "经度": item.get("longitude"),
+            "纬度": item.get("latitude"),
+            "仓库类型id": wt_id,
+            "类型": tname,
+            "库房类型颜色配置": None,
+            "仓库颜色配置": wh_cc,
+            "颜色配置": None,
+        }
+        return rec
+
+    def _batch_warehouse_type_colors(self, ids: List[int]) -> Dict[int, Any]:
+        ids = [int(x) for x in ids if x is not None]
+        if not ids:
+            return {}
+        uniq = list(dict.fromkeys(ids))
+        out: Dict[int, Any] = {}
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    ph = ",".join(["%s"] * len(uniq))
+                    cur.execute(
+                        f"SELECT id, color_config FROM dict_warehouse_types "
+                        f"WHERE id IN ({ph})",
+                        tuple(uniq),
+                    )
+                    for tid, raw_cc in cur.fetchall():
+                        out[int(tid)] = _color_config_from_db(raw_cc)
+        except Exception as e:
+            logger.warning(f"批量加载库房类型颜色失败: {e}")
+        return out
+
+    def get_warehouses(
+        self,
+        keyword: Optional[str] = None,
+        page: Optional[int] = None,
+        size: Optional[int] = None,
+        province: Optional[str] = None,
+        city: Optional[str] = None,
+        district: Optional[str] = None,
+        status: Optional[int] = None,
+    ) -> Any:
+        if page is not None:
+            try:
+                pg = max(1, int(page))
+                sz = min(100, max(1, int(size or 20)))
+                kw = (
+                    str(keyword).strip()
+                    if keyword is not None and str(keyword).strip()
+                    else None
+                )
+                eff_status = status if status is not None else 1
+                res = _raise_tl_geo_crud_result(
+                    sa_wh_list(pg, sz, kw, None, province, city, district, eff_status)
+                )
+                payload = res["data"] or {}
+                items_raw = payload.get("list") or []
+                tnames = [
+                    str(x.get("type") or "").strip()
+                    for x in items_raw
+                    if x.get("type")
+                ]
+                tid_by_name = self._warehouse_type_ids_by_names(tnames)
+                tids = [tid_by_name[t] for t in tnames if t in tid_by_name]
+                tcol = self._batch_warehouse_type_colors(tids)
+                out_rows: List[Dict[str, Any]] = []
+                for x in items_raw:
+                    tname = str(x.get("type") or "").strip()
+                    wt_id = tid_by_name.get(tname) if tname else None
+                    t_cc = tcol.get(int(wt_id)) if wt_id is not None else None
+                    row = self._site_wh_item_to_tl_row(x, tid_by_name)
+                    row["库房类型颜色配置"] = t_cc
+                    row["颜色配置"] = t_cc
+                    out_rows.append(row)
+                return {
+                    "list": out_rows,
+                    "total": int(payload.get("total") or 0),
+                    "page": int(payload.get("page") or pg),
+                    "size": int(payload.get("size") or sz),
+                }
+            except ValueError:
+                raise
+            except RuntimeError as e:
+                logger.error(f"分页获取仓库列表失败: {e}")
+                raise
         try:
             conditions = ["dw.is_active = 1"]
             params: List[Any] = []
@@ -277,8 +555,12 @@ class TLService:
                 with conn.cursor() as cur:
                     cur.execute(
                         f"SELECT dw.id AS `仓库id`, dw.name AS `仓库名`, "
-                        f"dw.address AS `地址`, dw.warehouse_type_id AS `仓库类型id`, "
-                        f"wt.name AS `类型`, wt.color_config AS `颜色配置` "
+                        f"dw.address AS `地址`, "
+                        f"dw.province AS `省`, dw.city AS `市`, dw.district AS `区`, "
+                        f"dw.longitude AS `经度`, dw.latitude AS `纬度`, "
+                        f"dw.warehouse_type_id AS `仓库类型id`, "
+                        f"wt.name AS `类型`, wt.color_config AS `库房类型颜色配置`, "
+                        f"dw.color_config AS `仓库颜色配置` "
                         f"FROM dict_warehouses dw "
                         f"LEFT JOIN dict_warehouse_types wt ON dw.warehouse_type_id = wt.id "
                         f"WHERE {where_sql} "
@@ -290,8 +572,11 @@ class TLService:
                     out: List[Dict[str, Any]] = []
                     for row in rows:
                         rec = dict(zip(columns, row))
-                        if "颜色配置" in rec:
-                            rec["颜色配置"] = _color_config_from_db(rec.get("颜色配置"))
+                        type_cc = _color_config_from_db(rec.get("库房类型颜色配置"))
+                        wh_cc = _color_config_from_db(rec.get("仓库颜色配置"))
+                        rec["库房类型颜色配置"] = type_cc
+                        rec["仓库颜色配置"] = wh_cc
+                        rec["颜色配置"] = type_cc
                         out.append(rec)
                     return out
         except Exception as e:
@@ -300,13 +585,83 @@ class TLService:
 
     # ==================== 接口1b：修改仓库 ====================
 
+    _WH_SITE_PATCH_KEYS = frozenset({"省", "市", "区", "经度", "纬度", "库房类型名"})
+
+    def _build_site_warehouse_update_patch(self, patch: Dict[str, Any]) -> Dict[str, Any]:
+        out: Dict[str, Any] = {}
+        if "仓库名" in patch:
+            raw = patch["仓库名"]
+            if raw is None or str(raw).strip() == "":
+                raise ValueError("仓库名不能为空")
+            out["name"] = str(raw).strip()
+        if "地址" in patch:
+            addr = patch["地址"]
+            out["address"] = _strip_optional_str(addr) if addr is not None else ""
+        if "省" in patch:
+            v = patch["省"]
+            out["province"] = _strip_nonempty(str(v)) if v is not None else ""
+        if "市" in patch:
+            v = patch["市"]
+            out["city"] = _strip_nonempty(str(v)) if v is not None else ""
+        if "区" in patch:
+            v = patch["区"]
+            out["district"] = _strip_nonempty(str(v)) if v is not None else ""
+        if "经度" in patch:
+            out["longitude"] = patch["经度"]
+        if "纬度" in patch:
+            out["latitude"] = patch["纬度"]
+        if "库房类型名" in patch:
+            tn = patch["库房类型名"]
+            out["type"] = "" if tn is None or str(tn).strip() == "" else str(tn).strip()
+        elif "仓库类型id" in patch:
+            wtid = patch["仓库类型id"]
+            if wtid is None:
+                out["type"] = ""
+            else:
+                nm = self._resolve_warehouse_type_name_by_id(int(wtid))
+                if not nm:
+                    raise ValueError(f"库房类型 id={wtid} 不存在或未启用")
+                out["type"] = nm
+        if "仓库颜色配置" in patch:
+            cc = patch["仓库颜色配置"]
+            if cc is None:
+                out["color"] = ""
+            else:
+                hx = _marker_hex_from_wh_color_config(cc)
+                if not hx:
+                    raise ValueError(
+                        "仓库颜色配置须为 JSON，且包含 marker（或 hex）字段为六位十六进制色值，如 #3388FF"
+                    )
+                out["color"] = hx
+        if "is_active" in patch and patch["is_active"] is not None:
+            out["status"] = 1 if patch["is_active"] else 0
+        return out
+
     def update_warehouse(self, warehouse_id: int, patch: Dict[str, Any]) -> Dict[str, Any]:
-        allowed = {"仓库名", "is_active", "地址", "仓库类型id"}
+        allowed = (
+            {"仓库名", "is_active", "地址", "仓库类型id", "仓库颜色配置"}
+            | self._WH_SITE_PATCH_KEYS
+        )
         keys = set(patch.keys()) & allowed
         if not keys:
             raise ValueError(
-                "至少需要提供一个待修改字段：仓库名、is_active、地址、仓库类型id 之一"
+                "至少需要提供一个待修改字段：仓库名、is_active、地址、仓库类型id、仓库颜色配置、"
+                "省、市、区、经度、纬度、库房类型名 之一"
             )
+
+        use_site = bool(keys & self._WH_SITE_PATCH_KEYS)
+        if use_site:
+            try:
+                site_patch = self._build_site_warehouse_update_patch(patch)
+                if not site_patch:
+                    raise ValueError("没有有效的修改项")
+                _raise_tl_geo_crud_result(sa_wh_update(warehouse_id, site_patch))
+                return {"code": 200, "msg": "仓库信息修改成功"}
+            except ValueError:
+                raise
+            except RuntimeError as e:
+                logger.error(f"修改仓库失败(地理落库): {e}")
+                raise
 
         try:
             with get_conn() as conn:
@@ -356,6 +711,14 @@ class TLService:
                             params.append(int(wtid))
                         else:
                             updates.append("warehouse_type_id = NULL")
+
+                    if "仓库颜色配置" in patch:
+                        cc = patch["仓库颜色配置"]
+                        if cc is not None:
+                            updates.append("color_config = %s")
+                            params.append(_color_config_to_json_str(cc))
+                        else:
+                            updates.append("color_config = NULL")
 
                     if not updates:
                         raise ValueError("没有有效的修改项")
@@ -590,7 +953,58 @@ class TLService:
 
     # ==================== 接口2：获取冶炼厂列表 ====================
 
-    def get_smelters(self, keyword: Optional[str] = None) -> List[Dict[str, Any]]:
+    _SM_SITE_PATCH_KEYS = frozenset({"省", "市", "区", "经度", "纬度"})
+
+    def _site_smelter_item_to_tl_row(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        """分页冶炼厂条目 → TL 字段（无颜色）。"""
+        return {
+            "冶炼厂id": int(item["id"]),
+            "冶炼厂": item["name"],
+            "地址": item.get("address") or "",
+            "省": item.get("province") or "",
+            "市": item.get("city") or "",
+            "区": item.get("district") or "",
+            "经度": item.get("longitude"),
+            "纬度": item.get("latitude"),
+        }
+
+    def get_smelters(
+        self,
+        keyword: Optional[str] = None,
+        page: Optional[int] = None,
+        size: Optional[int] = None,
+        province: Optional[str] = None,
+        city: Optional[str] = None,
+        district: Optional[str] = None,
+        status: Optional[int] = None,
+    ) -> Any:
+        if page is not None:
+            try:
+                pg = max(1, int(page))
+                sz = min(100, max(1, int(size or 20)))
+                kw = (
+                    str(keyword).strip()
+                    if keyword is not None and str(keyword).strip()
+                    else None
+                )
+                eff_status = status if status is not None else 1
+                res = _raise_tl_geo_crud_result(
+                    sa_smelter_list(pg, sz, kw, province, city, district, eff_status)
+                )
+                payload = res["data"] or {}
+                items_raw = payload.get("list") or []
+                out_rows = [self._site_smelter_item_to_tl_row(x) for x in items_raw]
+                return {
+                    "list": out_rows,
+                    "total": int(payload.get("total") or 0),
+                    "page": int(payload.get("page") or pg),
+                    "size": int(payload.get("size") or sz),
+                }
+            except ValueError:
+                raise
+            except RuntimeError as e:
+                logger.error(f"分页获取冶炼厂列表失败: {e}")
+                raise
         try:
             conditions = ["is_active = 1"]
             params: List[Any] = []
@@ -601,25 +1015,75 @@ class TLService:
             with get_conn() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
-                        f"SELECT id AS `冶炼厂id`, name AS `冶炼厂`, address AS `地址` "
+                        f"SELECT id AS `冶炼厂id`, name AS `冶炼厂`, address AS `地址`, "
+                        f"province AS `省`, city AS `市`, district AS `区`, "
+                        f"longitude AS `经度`, latitude AS `纬度` "
                         f"FROM dict_factories WHERE {where_sql} "
                         "ORDER BY id",
                         tuple(params),
                     )
                     columns = [desc[0] for desc in cur.description]
                     rows = cur.fetchall()
-                    return [dict(zip(columns, row)) for row in rows]
+                    out: List[Dict[str, Any]] = []
+                    for row in rows:
+                        rec = dict(zip(columns, row))
+                        out.append(rec)
+                    return out
         except Exception as e:
             logger.error(f"获取冶炼厂列表失败: {e}")
             raise
 
     # ==================== 接口2b：修改冶炼厂 ====================
 
+    def _build_site_smelter_update_patch(self, patch: Dict[str, Any]) -> Dict[str, Any]:
+        """冶炼厂省市区变更且未手传经纬度时，由 tl_dict_geo_crud 内 maybe_geocode 重算坐标。"""
+        out: Dict[str, Any] = {}
+        if "冶炼厂名" in patch:
+            raw = patch["冶炼厂名"]
+            if raw is None or str(raw).strip() == "":
+                raise ValueError("冶炼厂名不能为空")
+            out["name"] = str(raw).strip()
+        if "地址" in patch:
+            addr = patch["地址"]
+            out["address"] = _strip_optional_str(addr) if addr is not None else ""
+        if "省" in patch:
+            v = patch["省"]
+            out["province"] = _strip_nonempty(str(v)) if v is not None else ""
+        if "市" in patch:
+            v = patch["市"]
+            out["city"] = _strip_nonempty(str(v)) if v is not None else ""
+        if "区" in patch:
+            v = patch["区"]
+            out["district"] = _strip_nonempty(str(v)) if v is not None else ""
+        if "经度" in patch:
+            out["longitude"] = patch["经度"]
+        if "纬度" in patch:
+            out["latitude"] = patch["纬度"]
+        if "is_active" in patch and patch["is_active"] is not None:
+            out["status"] = 1 if patch["is_active"] else 0
+        return out
+
     def update_smelter(self, smelter_id: int, patch: Dict[str, Any]) -> Dict[str, Any]:
-        allowed = {"冶炼厂名", "is_active", "地址"}
+        allowed = {"冶炼厂名", "is_active", "地址"} | self._SM_SITE_PATCH_KEYS
         keys = set(patch.keys()) & allowed
         if not keys:
-            raise ValueError("至少需要提供一个待修改字段：冶炼厂名、is_active、地址 之一")
+            raise ValueError(
+                "至少需要提供一个待修改字段：冶炼厂名、is_active、地址、省、市、区、经度、纬度 之一"
+            )
+
+        use_site = bool(keys & self._SM_SITE_PATCH_KEYS)
+        if use_site:
+            try:
+                site_patch = self._build_site_smelter_update_patch(patch)
+                if not site_patch:
+                    raise ValueError("没有有效的修改项")
+                _raise_tl_geo_crud_result(sa_smelter_update(smelter_id, site_patch))
+                return {"code": 200, "msg": "冶炼厂信息修改成功"}
+            except ValueError:
+                raise
+            except RuntimeError as e:
+                logger.error(f"修改冶炼厂失败(地理落库): {e}")
+                raise
 
         try:
             with get_conn() as conn:

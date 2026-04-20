@@ -190,12 +190,35 @@ class ComparisonRequest(BaseModel):
 
 
 class AddWarehouseRequest(BaseModel):
-    """添加仓库请求体（颜色由库房类型决定，勿再传独立颜色）"""
+    """添加仓库请求体：库房类型带出类型颜色，仓库可另有独立颜色"""
     仓库名: str = Field(..., description="仓库名称")
     地址: Optional[str] = Field(None, description="地址（可选）")
     仓库类型id: Optional[int] = Field(
         None,
-        description="库房类型 ID（可选）；传入后展示色与该类型在类型表中配置的颜色一致",
+        description="库房类型 ID（可选）；类型颜色来自类型表的「颜色配置」",
+    )
+    库房类型名: Optional[str] = Field(
+        None,
+        description="库房类型名称（可选）；若与省市区详址一并提供则走完整落库（含天地图经纬度），与仓库类型id二选一或同时传时优先名称",
+    )
+    省: Optional[str] = Field(None, description="省（与市、区、详细地址一并传时启用完整落库）")
+    市: Optional[str] = Field(None, description="市")
+    区: Optional[str] = Field(None, description="区/县")
+    经度: Optional[float] = Field(
+        None,
+        ge=-180,
+        le=180,
+        description="默认不传：完整地址模式下由天地图解析；仅当与纬度同时传入时才跳过天地图并手写坐标",
+    )
+    纬度: Optional[float] = Field(
+        None,
+        ge=-90,
+        le=90,
+        description="默认不传：完整地址模式下由天地图解析；须与经度成对传入才可手写坐标",
+    )
+    仓库颜色配置: Optional[Any] = Field(
+        None,
+        description="仓库独立颜色（JSON，可选），与库房类型颜色并存；未传则不写入",
     )
 
 
@@ -207,7 +230,30 @@ class UpdateWarehouseRequest(BaseModel):
     地址: Optional[str] = Field(None, description="地址（可选）")
     仓库类型id: Optional[int] = Field(
         None,
-        description="库房类型 ID（可选）；传 null 可取消类型关联（颜色随之为空）",
+        description="库房类型 ID（可选）；传 null 可取消类型关联（库房类型颜色随之不可用）",
+    )
+    库房类型名: Optional[str] = Field(
+        None,
+        description="库房类型名称；与省市区等组合修改时写入；传空字符串可取消类型关联",
+    )
+    省: Optional[str] = None
+    市: Optional[str] = None
+    区: Optional[str] = None
+    经度: Optional[float] = Field(
+        None,
+        ge=-180,
+        le=180,
+        description="与纬度成对传则只改坐标；单改省市区/地址且未传经纬度时由天地图重算",
+    )
+    纬度: Optional[float] = Field(
+        None,
+        ge=-90,
+        le=90,
+        description="与经度成对传则只改坐标；否则随行政区/地址变更触发天地图",
+    )
+    仓库颜色配置: Optional[Any] = Field(
+        None,
+        description="仓库独立颜色（可选）；传 null 可清空；不传则不修改",
     )
 
 
@@ -229,9 +275,24 @@ class UpdateWarehouseTypeRequest(BaseModel):
 
 
 class AddSmelterRequest(BaseModel):
-    """新建冶炼厂请求体"""
+    """新建冶炼厂（比价侧不设标记颜色；经纬度默认由天地图根据地址解析）"""
     冶炼厂名: str = Field(..., description="冶炼厂名称")
-    地址: Optional[str] = Field(None, description="冶炼厂地址（可选）")
+    地址: Optional[str] = Field(None, description="详细地址（与省市区一并传时走完整落库）")
+    省: Optional[str] = None
+    市: Optional[str] = None
+    区: Optional[str] = None
+    经度: Optional[float] = Field(
+        None,
+        ge=-180,
+        le=180,
+        description="默认不传；与纬度同时传则跳过天地图手写坐标",
+    )
+    纬度: Optional[float] = Field(
+        None,
+        ge=-90,
+        le=90,
+        description="默认不传；须与经度同时传才可手写坐标",
+    )
 
 
 class UploadVarietyRequest(BaseModel):
@@ -247,11 +308,26 @@ class UploadVarietyRequest(BaseModel):
 
 
 class UpdateSmelterRequest(BaseModel):
-    """修改冶炼厂请求体"""
+    """修改冶炼厂（无颜色字段；改行政区/地址且未手传经纬度时重新天地图）"""
     冶炼厂id: int = Field(..., description="冶炼厂ID")
     冶炼厂名: Optional[str] = Field(None, description="冶炼厂名称（可选）")
     is_active: Optional[bool] = Field(None, description="是否启用（可选）")
     地址: Optional[str] = Field(None, description="冶炼厂地址（可选）；传 null 可清空")
+    省: Optional[str] = None
+    市: Optional[str] = None
+    区: Optional[str] = None
+    经度: Optional[float] = Field(
+        None,
+        ge=-180,
+        le=180,
+        description="与纬度成对传则直接改库中坐标",
+    )
+    纬度: Optional[float] = Field(
+        None,
+        ge=-90,
+        le=90,
+        description="与经度成对传则直接改库中坐标",
+    )
 
 
 class DownloadFreightTemplateRequest(BaseModel):

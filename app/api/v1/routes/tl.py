@@ -1,9 +1,10 @@
 """
 TL比价模块路由
 接口前缀：/tl
+仓库/冶炼厂仅通过本模块 /tl/* 维护（无独立 /warehouse、/smelter 路由）；地理编码见 tl_dict_geo_crud + tianditu_geocoder。
 包含接口：
-  0. POST /tl/add_warehouse            - 添加仓库（不存在则新建）
-  1. GET  /tl/get_warehouses           - 获取仓库列表
+  0. POST /tl/add_warehouse            - 添加仓库（省市区+详址齐全时经纬度默认由天地图解析）
+  1. GET  /tl/get_warehouses           - 获取仓库列表（keyword；可选 page 分页）
   1a.  GET/POST/DELETE  /tl/get_warehouse_types, /add_warehouse_type, /update_warehouse_type, /delete_warehouse_type  - 库房类型与颜色
   1b.POST /tl/update_warehouse         - 修改仓库信息
   1c.DELETE /tl/delete_warehouse        - 删除仓库（软删除）
@@ -100,11 +101,19 @@ def add_warehouse(
     body: AddWarehouseRequest,
     service: TLService = Depends(get_tl_service),
 ):
+    """省、市、区与详细地址齐全时写入完整记录，经度/纬度未同时传则走天地图；否则走极简 name+地址+类型。"""
     try:
         return service.add_warehouse(
             name=body.仓库名,
             address=body.地址,
             warehouse_type_id=body.仓库类型id,
+            warehouse_color_config=body.仓库颜色配置,
+            province=body.省,
+            city=body.市,
+            district=body.区,
+            longitude=body.经度,
+            latitude=body.纬度,
+            warehouse_type_name=body.库房类型名,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -120,10 +129,37 @@ def get_warehouses(
         None,
         description="仓库名模糊搜索（可选）；不传则返回全部启用仓库",
     ),
+    page: Optional[int] = Query(
+        None,
+        ge=1,
+        description="分页页码；传入则返回 data 为 { list, total, page, size }，并与省/市/区/status 筛选联用",
+    ),
+    size: Optional[int] = Query(
+        None,
+        ge=1,
+        le=100,
+        description="分页大小（默认 20）；须与 page 同用",
+    ),
+    province: Optional[str] = Query(None, description="省（精确，仅分页模式）"),
+    city: Optional[str] = Query(None, description="市（精确，仅分页模式）"),
+    district: Optional[str] = Query(None, description="区（精确，仅分页模式）"),
+    status: Optional[int] = Query(
+        None,
+        description="1 启用 0 停用；分页时省略则默认仅启用",
+    ),
     service: TLService = Depends(get_tl_service),
 ):
+    """未传 page 时返回全部启用仓库（含省市区与经纬度列）；传 page 时分页并支持省/市/区/status 筛选。"""
     try:
-        data = service.get_warehouses(keyword=keyword)
+        data = service.get_warehouses(
+            keyword=keyword,
+            page=page,
+            size=size,
+            province=province,
+            city=city,
+            district=district,
+            status=status,
+        )
         return {"code": 200, "data": data}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -201,6 +237,7 @@ def update_warehouse(
     body: UpdateWarehouseRequest,
     service: TLService = Depends(get_tl_service),
 ):
+    """含省/市/区/经纬度/库房类型名等字段时走地理落库逻辑；单改名称/类型/颜色等仍支持。"""
     try:
         patch = body.model_dump(exclude_unset=True)
         warehouse_id = patch.pop("仓库id")
@@ -233,8 +270,19 @@ def add_smelter(
     body: AddSmelterRequest,
     service: TLService = Depends(get_tl_service),
 ):
+    """省市区+详址齐全时落库并无标记色；经度/纬度默认不传，由天地图解析（若同时传经度+纬度则用手写值）。"""
     try:
-        return service.add_smelter(name=body.冶炼厂名, address=body.地址)
+        return service.add_smelter(
+            name=body.冶炼厂名,
+            address=body.地址,
+            province=body.省,
+            city=body.市,
+            district=body.区,
+            longitude=body.经度,
+            latitude=body.纬度,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -247,10 +295,29 @@ def get_smelters(
         None,
         description="冶炼厂名称模糊搜索（可选），与库房列表 keyword 用法一致",
     ),
+    page: Optional[int] = Query(
+        None,
+        ge=1,
+        description="分页页码；传入则 data 为 { list, total, page, size }",
+    ),
+    size: Optional[int] = Query(None, ge=1, le=100, description="分页大小，默认 20"),
+    province: Optional[str] = Query(None),
+    city: Optional[str] = Query(None),
+    district: Optional[str] = Query(None),
+    status: Optional[int] = Query(None, description="1 启用 0 停用；分页时省略则默认仅启用"),
     service: TLService = Depends(get_tl_service),
 ):
+    """列表不含冶炼厂颜色字段；未传 page 为简易列表，传 page 为分页结构。"""
     try:
-        data = service.get_smelters(keyword=keyword)
+        data = service.get_smelters(
+            keyword=keyword,
+            page=page,
+            size=size,
+            province=province,
+            city=city,
+            district=district,
+            status=status,
+        )
         return {"code": 200, "data": data}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -263,6 +330,7 @@ def update_smelter(
     body: UpdateSmelterRequest,
     service: TLService = Depends(get_tl_service),
 ):
+    """变更行政区或地址且未同时传经纬度时由服务端调用天地图刷新坐标；不支持颜色字段。"""
     try:
         patch = body.model_dump(exclude_unset=True)
         smelter_id = patch.pop("冶炼厂id")

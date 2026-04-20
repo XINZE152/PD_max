@@ -70,6 +70,17 @@ VLM_API_KEY = os.getenv("VLM_API_KEY", "")
 VLM_BASE_URL = os.getenv("VLM_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
 VLM_MODEL = os.getenv("VLM_MODEL", "qwen-vl-max-latest")
 
+# 天地图地理编码（MAP_API_KEY 即文档中的 tk）
+MAP_API_KEY = os.getenv("MAP_API_KEY", "").strip()
+MAP_GEOCODER_URL = (
+    os.getenv("MAP_GEOCODER_URL", "http://api.tianditu.gov.cn/geocoder").strip()
+    or "http://api.tianditu.gov.cn/geocoder"
+)
+
+# 天地图不可用（403/网络/无 KEY）时是否仍写入仓库/冶炼厂，经纬度置 NULL（默认允许，避免阻断业务）
+_MAP_ALLOW_NULL_RAW = os.getenv("MAP_GEOCODE_ALLOW_NULL", "1").strip().lower()
+MAP_GEOCODE_ALLOW_NULL = _MAP_ALLOW_NULL_RAW in ("1", "true", "yes", "on")
+
 
 def _optional_positive_int(name: str) -> Optional[int]:
     raw = os.getenv(name, "").strip()
