@@ -25,18 +25,12 @@ from app.intelligent_prediction.schemas.prediction import (
 from app.intelligent_prediction.services.ai_client import AIModelClient
 from app.intelligent_prediction.services.cache_manager import CacheManager
 from app.intelligent_prediction.services.prompt_builder import PromptBuilder
+from app.intelligent_prediction.services.weather_client import (
+    fetch_forecast_weather_by_dates,
+    summary_from_weather_json,
+)
 
 logger = get_logger(__name__)
-
-
-def _weather_summary_from_json(data: Any) -> Optional[str]:
-    if not isinstance(data, dict):
-        return None
-    for k in ("summary", "brief", "text", "description"):
-        v = data.get(k)
-        if isinstance(v, str) and v.strip():
-            return v.strip()[:500]
-    return None
 
 
 class PredictionService:
@@ -87,10 +81,50 @@ class PredictionService:
                 delivery_date=r.delivery_date,
                 weight=Decimal(r.weight),
                 cn_calendar_label=getattr(r, "cn_calendar_label", None),
-                weather_summary=_weather_summary_from_json(getattr(r, "weather_json", None)),
+                weather_summary=self._merged_history_weather(r),
             )
             for r in rows
         ]
+
+    @staticmethod
+    def _merged_history_weather(r: DeliveryRecord) -> str:
+        imp = (getattr(r, "import_weather", None) or "").strip()
+        if imp:
+            return imp[:200]
+        api = summary_from_weather_json(getattr(r, "weather_json", None))
+        if api:
+            return api[:500]
+        return "晴"
+
+    async def _resolve_weather_context(
+        self,
+        session: AsyncSession,
+        req: PredictionRequest,
+    ) -> tuple[str, Optional[str], str]:
+        """用于预测日天气拉取：取同条件最近一条历史的仓/厂名与地址拼接兜底。"""
+        conds = [
+            DeliveryRecord.warehouse == req.warehouse,
+            DeliveryRecord.product_variety == req.product_variety,
+        ]
+        if req.smelter and str(req.smelter).strip():
+            conds.append(DeliveryRecord.smelter == str(req.smelter).strip())
+        stmt = (
+            select(DeliveryRecord)
+            .where(and_(*conds))
+            .order_by(DeliveryRecord.delivery_date.desc(), DeliveryRecord.id.desc())
+            .limit(1)
+        )
+        row = (await session.execute(stmt)).scalar_one_or_none()
+        wh = (str(row.warehouse).strip() if row else "") or str(req.warehouse).strip()
+        sm: Optional[str] = None
+        if row and row.smelter and str(row.smelter).strip():
+            sm = str(row.smelter).strip()
+        elif req.smelter and str(req.smelter).strip():
+            sm = str(req.smelter).strip()
+        wa = (str(row.warehouse_address).strip() if row and row.warehouse_address else "")
+        sa = (str(row.smelter_address).strip() if row and row.smelter_address else "")
+        loc = " ".join(x for x in [wa, sa, wh] if x) or wh
+        return wh, sm, loc
 
     async def _ensure_request_history(
         self,
@@ -270,11 +304,19 @@ class PredictionService:
         )
         stats = self._prompt.analyze_history(req.history)
         fp = self._cache.stats_fingerprint(stats)
+        forecast_dates = [start + timedelta(days=i) for i in range(req.horizon_days)]
+        wh_ctx, sm_ctx, loc_fb = await self._resolve_weather_context(session, req)
+        forecast_map = await fetch_forecast_weather_by_dates(
+            forecast_dates, wh_ctx, sm_ctx, loc_fb, default_when_missing="晴"
+        )
+        forecast_fp = self._cache.forecast_weather_fingerprint(forecast_map)
         sm_part = req.smelter or ""
-        mem_key = f"prompt:{req.warehouse}:{sm_part}:{req.product_variety}:{fp}"
+        mem_key = f"prompt:{req.warehouse}:{sm_part}:{req.product_variety}:{fp}:{forecast_fp}"
         cached_prompt = await self._cache.memory.get(mem_key)
         if cached_prompt is None:
-            system, user = self._prompt.build_messages(req, stats, start)
+            system, user = self._prompt.build_messages(
+                req, stats, start, forecast_weather_by_date=forecast_map
+            )
             await self._cache.memory.set(mem_key, (system, user))
         else:
             system, user = cached_prompt
@@ -285,6 +327,7 @@ class PredictionService:
             req.horizon_days,
             fp,
             smelter=req.smelter,
+            forecast_fp=forecast_fp,
         )
         if req.use_cache:
             cached = await self._cache.redis.get_json(redis_key)

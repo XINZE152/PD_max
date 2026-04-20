@@ -8,6 +8,8 @@ from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+HolidayYesNo = Literal["是", "否"]
+
 
 class DeliveryRecordRead(BaseModel):
     """单条送货记录（读取）。"""
@@ -23,9 +25,19 @@ class DeliveryRecordRead(BaseModel):
     delivery_date: date
     product_variety: str
     weight: Decimal
-    cn_is_workday: Optional[bool] = Field(None, description="是否中国工作日（含调休），导入时按送货日期自动计算")
-    cn_calendar_label: Optional[str] = Field(None, description="节假日/周末/工作日等中文说明")
+    cn_is_workday: Optional[bool] = Field(
+        None,
+        description="是否中国工作日：与导入「节假日」列一致，「否」为工作日，「是」为非工作日",
+    )
+    cn_calendar_label: Optional[str] = Field(
+        None,
+        description="导入「节假日」列：仅「是」（非工作日）或「否」（工作日）",
+    )
     weather_json: Optional[dict[str, Any]] = Field(None, description="天气 API 返回摘要（未配置 API 时为空）")
+    import_weather: Optional[str] = Field(
+        None,
+        description="导入「天气」列简述；未填时按「晴」入库",
+    )
     created_at: datetime
     updated_at: Optional[datetime] = None
 
@@ -89,6 +101,11 @@ class DeliveryRecordUpdate(BaseModel):
     delivery_date: Optional[date] = None
     product_variety: Optional[str] = Field(default=None, min_length=1, max_length=255)
     weight: Optional[Decimal] = Field(default=None, ge=0)
+    cn_calendar_label: Optional[HolidayYesNo] = Field(
+        default=None,
+        description="节假日：仅「是」或「否」；更新时与 cn_is_workday 联动",
+    )
+    import_weather: Optional[str] = Field(default=None, max_length=64)
 
     @field_validator("smelter", mode="before")
     @classmethod

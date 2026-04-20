@@ -76,11 +76,11 @@ class PredictionHistoryPoint(BaseModel):
     weight: Decimal = Field(..., ge=0)
     cn_calendar_label: Optional[str] = Field(
         default=None,
-        description="该送货日对应的中国节假日/工作日说明（来自历史导入自动计算）",
+        description="节假日列：仅「是」（非工作日）或「否」（工作日），来自历史导入",
     )
     weather_summary: Optional[str] = Field(
         default=None,
-        description="天气摘要（由 weather_json 提取；未配置 API 时为空）",
+        description="天气展示：导入「天气」列优先，否则高德摘要，否则按「晴」",
     )
 
 

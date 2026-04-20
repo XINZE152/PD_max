@@ -14,7 +14,8 @@ def _require_env(name: str) -> str:
     value = os.getenv(name)
     if not value:
         raise ValueError(f"Missing required env var: {name}")
-    return value
+    # 去掉首尾空白，避免 .env 里误带空格/换行（尤其 MYSQL_PASSWORD）导致 MySQL 1045
+    return value.strip()
 
 
 # 数据库配置

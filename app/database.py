@@ -291,9 +291,10 @@ TABLE_STATEMENTS = [
         delivery_date DATE NOT NULL COMMENT '送货日期',
         product_variety VARCHAR(255) NOT NULL COMMENT '品种',
         weight DECIMAL(18,4) NOT NULL COMMENT '重量',
-        cn_is_workday TINYINT(1) DEFAULT NULL COMMENT '是否中国工作日(含调休)',
-        cn_calendar_label VARCHAR(128) DEFAULT NULL COMMENT '节假日/周末/工作日等说明',
+        cn_is_workday TINYINT(1) DEFAULT NULL COMMENT '是否中国工作日：与导入节假日列一致',
+        cn_calendar_label VARCHAR(128) DEFAULT NULL COMMENT '导入节假日列：仅「是」非工作日或「否」工作日',
         weather_json JSON DEFAULT NULL COMMENT '天气API返回摘要',
+        import_weather VARCHAR(64) DEFAULT NULL COMMENT '导入天气简述，空按晴',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
         INDEX idx_ip_delivery_date (delivery_date),
@@ -481,7 +482,7 @@ def ensure_pd_ip_delivery_records_enrichment_columns() -> None:
             if not _has_col("cn_calendar_label"):
                 cursor.execute(
                     "ALTER TABLE pd_ip_delivery_records "
-                    "ADD COLUMN cn_calendar_label VARCHAR(128) DEFAULT NULL COMMENT '节假日/周末/工作日等说明' "
+                    "ADD COLUMN cn_calendar_label VARCHAR(128) DEFAULT NULL COMMENT '导入节假日：仅「是」非工作日或「否」工作日' "
                     "AFTER cn_is_workday"
                 )
                 logger.info("已为 pd_ip_delivery_records 添加 cn_calendar_label 列")
@@ -491,6 +492,12 @@ def ensure_pd_ip_delivery_records_enrichment_columns() -> None:
                     "ADD COLUMN weather_json JSON DEFAULT NULL COMMENT '天气API返回摘要' AFTER cn_calendar_label"
                 )
                 logger.info("已为 pd_ip_delivery_records 添加 weather_json 列")
+            if not _has_col("import_weather"):
+                cursor.execute(
+                    "ALTER TABLE pd_ip_delivery_records "
+                    "ADD COLUMN import_weather VARCHAR(64) DEFAULT NULL COMMENT '导入天气简述，空按晴' AFTER weather_json"
+                )
+                logger.info("已为 pd_ip_delivery_records 添加 import_weather 列")
         connection.commit()
     finally:
         connection.close()

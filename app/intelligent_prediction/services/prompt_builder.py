@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import Counter
 from datetime import date, timedelta
+from typing import Optional
 from decimal import Decimal
 from statistics import mean, pstdev
 from typing import Any
@@ -59,7 +60,13 @@ class PromptBuilder:
             "trend_note": f"recent_trend={trend}",
         }
 
-    def build_user_prompt(self, req: PredictionRequest, stats: dict[str, Any], start_date: date) -> str:
+    def build_user_prompt(
+        self,
+        req: PredictionRequest,
+        stats: dict[str, Any],
+        start_date: date,
+        forecast_weather_by_date: Optional[dict[date, str]] = None,
+    ) -> str:
         """组装 User Prompt。"""
         dates = [start_date + timedelta(days=i) for i in range(req.horizon_days)]
         date_lines = ", ".join(d.isoformat() for d in dates)
@@ -67,9 +74,16 @@ class PromptBuilder:
             base = f"- {p.delivery_date.isoformat()}: {float(p.weight)}"
             bits: list[str] = []
             if getattr(p, "cn_calendar_label", None):
-                bits.append(str(p.cn_calendar_label))
-            if getattr(p, "weather_summary", None):
-                bits.append(f"天气:{p.weather_summary}")
+                lab = str(p.cn_calendar_label).strip()
+                if lab in ("是", "否"):
+                    bits.append(f"节假日:{lab}")
+                else:
+                    bits.append(lab)
+            ws = getattr(p, "weather_summary", None)
+            if ws and str(ws).strip():
+                bits.append(f"天气:{str(ws).strip()}")
+            else:
+                bits.append("天气:晴")
             if bits:
                 return f"{base} ({' | '.join(bits)})"
             return base
@@ -77,12 +91,22 @@ class PromptBuilder:
         hist_lines = "\n".join(
             _hist_line(p) for p in sorted(req.history, key=lambda x: x.delivery_date)[-30:]
         )
+        fw = forecast_weather_by_date or {}
+        forecast_block = ""
+        if dates:
+            lines = [f"- {d.isoformat()}: {fw.get(d, '晴')}" for d in dates]
+            forecast_block = (
+                "预测日当日参考天气（按目标日期拉取，未配置天气服务或失败时为「晴」）:\n"
+                + "\n".join(lines)
+                + "\n"
+            )
         return (
             f"仓库: {req.warehouse}\n"
             f"冶炼厂: {req.smelter or '未指定（历史含全部冶炼厂）'}\n"
             f"品种: {req.product_variety}\n"
             f"大区经理: {req.regional_manager or '未提供'}\n"
             f"需要预测的目标日期（依次）: {date_lines}\n"
+            f"{forecast_block}"
             f"历史统计: {stats}\n"
             f"最近历史记录（最多30笔）:\n{hist_lines or '（无）'}\n"
             "请为每个目标日期输出一条 items，target_date 必须与上述日期一致且为 YYYY-MM-DD。"
@@ -90,7 +114,13 @@ class PromptBuilder:
         )
 
     def build_messages(
-        self, req: PredictionRequest, stats: dict[str, Any], start_date: date
+        self,
+        req: PredictionRequest,
+        stats: dict[str, Any],
+        start_date: date,
+        forecast_weather_by_date: Optional[dict[date, str]] = None,
     ) -> tuple[str, str]:
         """返回 (system, user) 双字符串。"""
-        return self.SYSTEM_PROMPT, self.build_user_prompt(req, stats, start_date)
+        return self.SYSTEM_PROMPT, self.build_user_prompt(
+            req, stats, start_date, forecast_weather_by_date=forecast_weather_by_date
+        )

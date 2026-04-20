@@ -66,12 +66,12 @@ def _parse_history_query_date(name: str, raw: Optional[str]) -> Optional[date]:
     "/模板/fields",
     response_model=HistoryTemplateFieldsResponse,
     summary="导入模板列定义（JSON）",
-    description="返回模板表头顺序及与内部字段映射（含冶炼厂、选填仓库地址/冶炼厂地址）；导入时「到货日期」列名会映射为送货日期；节假日由系统按送货日期写入；与 GET /送货历史/模板 下载的 xlsx 表头一致。",
+    description="返回模板表头顺序及与内部字段映射；导入时「到货日期」列名会映射为送货日期；「节假日」须手填；选填「天气」不填则按晴；与 GET /delivery-history/模板 下载的 xlsx 表头一致。",
 )
 async def history_template_fields() -> HistoryTemplateFieldsResponse:
     return HistoryTemplateFieldsResponse(
         headers=HistoryService.import_template_headers(),
-        header_to_field=dict(HistoryService.REQUIRED_COLUMNS_CANONICAL),
+        header_to_field=dict(HistoryService.HEADER_TO_FIELD),
     )
 
 
@@ -80,8 +80,8 @@ async def history_template_fields() -> HistoryTemplateFieldsResponse:
     summary="下载送货历史导入模板",
     description=(
         "返回标准 xlsx：含「导入数据」（表头 + 可跳过示例行）与「使用说明」；"
-        "表头含大区经理、冶炼厂、仓库、选填仓库地址与冶炼厂地址、送货日期（导入亦支持「到货日期」列名）、品种、重量；"
-        "大区经理以「(示例)」开头的行导入时自动跳过。"
+        "表头含大区经理、冶炼厂、仓库、送货日期、必填节假日（仅「是」/「否」）、品种、重量、选填仓库地址与冶炼厂地址与天气（不填则晴）；"
+        "送货日期列亦支持「到货日期」列名；大区经理以「(示例)」开头的行导入时自动跳过。"
     ),
 )
 async def download_history_template() -> StreamingResponse:
@@ -124,7 +124,7 @@ async def download_history_template_csv() -> StreamingResponse:
     response_model=HistoryImportResponse,
     summary="导入送货历史 Excel",
     description=(
-        "上传 xlsx/csv，校验后批量写入送货历史表。"
+        "上传 xlsx/csv，校验后批量写入送货历史表；须含「节假日」列且每行仅填「是」或「否」。"
         "校验失败时返回 details.errors：每项含 Excel 行号 row_index、列字母 excel_column、表头 column_header 与 message。"
     ),
 )
@@ -222,7 +222,7 @@ async def history_statistics(
     "/{record_id}",
     response_model=DeliveryRecordRead,
     summary="更新单条送货历史",
-    description="按主键更新大区经理、冶炼厂、仓库、送货日期、品种、重量等字段；请求体至少包含一项。",
+    description="按主键更新大区经理、冶炼厂、仓库、送货日期、品种、重量、地址及节假日（cn_calendar_label，仅「是」/「否」）等；请求体至少包含一项。",
 )
 async def update_history_record(
     record_id: int,

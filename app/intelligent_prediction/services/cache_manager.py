@@ -1,4 +1,4 @@
-﻿"""L1 内存缓存与 L2 Redis（redis.asyncio）。"""
+"""L1 内存缓存与 L2 Redis（redis.asyncio）。"""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import time
+from datetime import date
 from typing import Any, Optional
 
 import redis.asyncio as aioredis
@@ -116,16 +117,26 @@ class CacheManager:
         self.redis = RedisCache(settings.prediction_redis_url)
 
     @staticmethod
+    def forecast_weather_fingerprint(forecast_by_date: dict[date, str]) -> str:
+        """预测日天气摘要指纹，用于区分 Prompt/缓存。"""
+        if not forecast_by_date:
+            return "none"
+        payload = {d.isoformat(): v for d, v in sorted(forecast_by_date.items())}
+        s = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+        return hashlib.sha256(s.encode("utf-8")).hexdigest()[:24]
+
+    @staticmethod
     def prediction_cache_key(
         warehouse: str,
         variety: str,
         horizon: int,
         stats_fingerprint: str,
         smelter: str | None = None,
+        forecast_fp: str = "",
     ) -> str:
         """生成预测结果 Redis 键。"""
         sm = smelter or ""
-        base = f"{warehouse}|{sm}|{variety}|{horizon}|{stats_fingerprint}"
+        base = f"{warehouse}|{sm}|{variety}|{horizon}|{stats_fingerprint}|{forecast_fp or 'none'}"
         h = hashlib.sha256(base.encode("utf-8")).hexdigest()[:48]
         return f"pred:v1:{h}"
 

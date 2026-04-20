@@ -33,6 +33,7 @@ class DeliveryRecord(Base):
     cn_is_workday: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
     cn_calendar_label: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     weather_json: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON, nullable=True)
+    import_weather: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime,
         server_default=func.current_timestamp(),
