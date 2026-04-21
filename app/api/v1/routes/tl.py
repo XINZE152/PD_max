@@ -4,6 +4,7 @@ TL比价模块路由
 仓库/冶炼厂仅通过本模块 /tl/* 维护（无独立 /warehouse、/smelter 路由）；地理编码见 tl_dict_geo_crud + tianditu_geocoder。
 包含接口：
   0. POST /tl/add_warehouse            - 添加仓库（省市区+详址齐全时经纬度默认由天地图解析）
+  0b.POST /tl/import_partner_warehouses_excel - 上传「合作库房清单」xlsx，逐条调用与 add_warehouse 相同落库逻辑
   1. GET  /tl/get_warehouses           - 获取仓库列表（keyword；可选 page 分页）
   1a.  GET/POST/DELETE  /tl/get_warehouse_types, /add_warehouse_type, /update_warehouse_type, /delete_warehouse_type  - 库房类型与颜色
   1b.POST /tl/update_warehouse         - 修改仓库信息
@@ -30,10 +31,11 @@ TL比价模块路由
   7d.DELETE /tl/delete_category_row    - 删除单条品类别名（软删除）
 """
 import io
+import time
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Query, UploadFile, File
+from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import StreamingResponse
 
 from app.models.tl import (
@@ -58,6 +60,11 @@ from app.models.tl import (
     TaxRateItem,
     TaxRateUpsertRequest,
     QuoteDetailsFilterRequest,
+)
+from app.services.partner_warehouse_excel import (
+    PartnerWarehouseExcelError,
+    parse_partner_warehouse_rows,
+    warehouse_site_fields_from_full_address,
 )
 from app.services.tl_service import PurchaseSuggestionLLMError, TLService, get_tl_service
 
@@ -119,6 +126,119 @@ def add_warehouse(
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/import_partner_warehouses_excel", summary="批量导入合作库房清单 Excel")
+async def import_partner_warehouses_excel(
+    file: UploadFile = File(..., description="xlsx，需含库房名称、库房地址列（规则同离线脚本）"),
+    库房类型名: Optional[str] = Form(
+        None,
+        description="与单条 add_warehouse 一致：完整省市区详址落库时须能解析出类型（名称或 id 至少其一）",
+    ),
+    仓库类型id: Optional[int] = Form(None, description="可选，与 库房类型名 二选一或并存（服务内优先名称）"),
+    sheet: Optional[str] = Form(None, description="工作表名；不传则优先「合作库房清单」"),
+    sheet_index: Optional[int] = Form(None, description="工作表索引（0 起）；与 sheet 二选一"),
+    geocode_sleep: float = Form(
+        0.2,
+        ge=0.0,
+        le=10.0,
+        description="行间休眠秒数，略降天地图连续请求压力",
+    ),
+    limit: Optional[int] = Form(
+        None,
+        ge=1,
+        le=5000,
+        description="仅处理前 N 条有效行（不传则处理全部）",
+    ),
+    service: TLService = Depends(get_tl_service),
+):
+    """
+    读取上传文件，按行解析后与 ``POST /tl/add_warehouse`` 相同调用 ``TLService.add_warehouse``：
+    整行地址经 ``cn_address_split`` 拆省市区详址；四级齐全则走完整落库（天地图经纬度），否则走 name+地址极简落库。
+    """
+    fn = (file.filename or "").lower()
+    if not fn.endswith((".xlsx", ".xls")):
+        raise HTTPException(status_code=400, detail="请上传 .xlsx 或 .xls 文件")
+
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="空文件")
+
+    try:
+        sheet_used, name_col, addr_col, rows = parse_partner_warehouse_rows(
+            raw,
+            sheet=sheet,
+            sheet_index=sheet_index,
+        )
+    except PartnerWarehouseExcelError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    if limit is not None:
+        rows = rows[: int(limit)]
+
+    wt_name = (库房类型名 or "").strip() or None
+    wt_id = 仓库类型id
+
+    results: List[Dict[str, Any]] = []
+    summary = {"新建": 0, "已存在": 0, "失败": 0, "其它": 0}
+
+    for idx, (wh_name, full_addr) in enumerate(rows, start=1):
+        pv, cv, dv, addr = warehouse_site_fields_from_full_address(full_addr)
+        try:
+            out = service.add_warehouse(
+                name=wh_name,
+                address=addr,
+                province=pv,
+                city=cv,
+                district=dv,
+                warehouse_type_name=wt_name,
+                warehouse_type_id=wt_id,
+            )
+            code = int(out.get("code", 0))
+            msg = str(out.get("msg", ""))
+            is_new = out.get("新建")
+            if code == 200 and is_new is True:
+                summary["新建"] += 1
+            elif code == 200 and is_new is False:
+                summary["已存在"] += 1
+            elif code == 200:
+                summary["其它"] += 1
+            else:
+                summary["失败"] += 1
+            results.append(
+                {
+                    "index": idx,
+                    "仓库名": wh_name,
+                    "省": pv,
+                    "市": cv,
+                    "区": dv,
+                    "详址": addr,
+                    "response": out,
+                }
+            )
+        except ValueError as e:
+            summary["失败"] += 1
+            results.append(
+                {
+                    "index": idx,
+                    "仓库名": wh_name,
+                    "error": str(e),
+                }
+            )
+        if geocode_sleep > 0 and idx < len(rows):
+            time.sleep(float(geocode_sleep))
+
+    return {
+        "code": 200,
+        "data": {
+            "sheet": sheet_used,
+            "name_column": name_col,
+            "address_column": addr_col,
+            "total_rows": len(rows),
+            "summary": summary,
+            "rows": results,
+        },
+    }
 
 
 # ===================== 接口1：获取仓库列表 =====================
