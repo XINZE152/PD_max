@@ -4,12 +4,14 @@ TL比价模块路由
 仓库/冶炼厂仅通过本模块 /tl/* 维护（无独立 /warehouse、/smelter 路由）；地理编码见 tl_dict_geo_crud + tianditu_geocoder。
 包含接口：
   0. POST /tl/add_warehouse            - 添加仓库（省市区+详址齐全时经纬度默认由天地图解析）
-  1. GET  /tl/get_warehouses           - 获取仓库列表（keyword；可选 page 分页）
+  1. GET  /tl/get_warehouses           - 获取仓库列表（keyword；可选 page；size 最大 200）
   1a.  GET/POST/DELETE  /tl/get_warehouse_types, /add_warehouse_type, /update_warehouse_type, /delete_warehouse_type  - 库房类型与颜色
   1b.POST /tl/update_warehouse         - 修改仓库信息
   1c.DELETE /tl/delete_warehouse        - 删除仓库（软删除）
+  1c2.DELETE /tl/purge_warehouse        - 永久删除仓库（硬删除）
   1d.POST /tl/add_smelter              - 新建冶炼厂
-  2. GET  /tl/get_smelters             - 获取冶炼厂列表
+  2. GET  /tl/get_smelters             - 获取冶炼厂列表（size 最大 200）
+  2c2.DELETE /tl/purge_smelter         - 永久删除冶炼厂（硬删除）
   3. GET  /tl/get_categories           - 获取品类列表
   3b.POST /tl/upload_variety           - 上传品种（批量写入 dict_categories）
   4. POST /tl/get_comparison           - 获取比价表
@@ -137,8 +139,8 @@ def get_warehouses(
     size: Optional[int] = Query(
         None,
         ge=1,
-        le=100,
-        description="分页大小（默认 20）；须与 page 同用",
+        le=200,
+        description="分页大小（默认 20，单页最多 200）；须与 page 同用",
     ),
     province: Optional[str] = Query(None, description="省（精确，仅分页模式）"),
     city: Optional[str] = Query(None, description="市（精确，仅分页模式）"),
@@ -263,6 +265,23 @@ def delete_warehouse(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.delete("/purge_warehouse", summary="永久删除仓库（硬删除）")
+def purge_warehouse(
+    warehouse_id: int,
+    service: TLService = Depends(get_tl_service),
+):
+    """物理删除 dict_warehouses 行；若运费等仍引用该仓库则返回 409。"""
+    try:
+        return service.purge_warehouse(warehouse_id=warehouse_id)
+    except ValueError as e:
+        detail = str(e)
+        if "不存在" in detail or detail == "仓库 id 无效":
+            raise HTTPException(status_code=404, detail=detail)
+        raise HTTPException(status_code=409, detail=detail)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ===================== 接口1d：新建冶炼厂 =====================
 
 @router.post("/add_smelter", summary="新建冶炼厂")
@@ -300,7 +319,9 @@ def get_smelters(
         ge=1,
         description="分页页码；传入则 data 为 { list, total, page, size }",
     ),
-    size: Optional[int] = Query(None, ge=1, le=100, description="分页大小，默认 20"),
+    size: Optional[int] = Query(
+        None, ge=1, le=200, description="分页大小（默认 20，单页最多 200）"
+    ),
     province: Optional[str] = Query(None),
     city: Optional[str] = Query(None),
     district: Optional[str] = Query(None),
@@ -352,6 +373,23 @@ def delete_smelter(
         return service.delete_smelter(smelter_id=smelter_id)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/purge_smelter", summary="永久删除冶炼厂（硬删除）")
+def purge_smelter(
+    smelter_id: int,
+    service: TLService = Depends(get_tl_service),
+):
+    """物理删除 dict_factories 行；若报价/运费等仍引用则返回 409。"""
+    try:
+        return service.purge_smelter(smelter_id=smelter_id)
+    except ValueError as e:
+        detail = str(e)
+        if "不存在" in detail or detail == "冶炼厂 id 无效":
+            raise HTTPException(status_code=404, detail=detail)
+        raise HTTPException(status_code=409, detail=detail)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

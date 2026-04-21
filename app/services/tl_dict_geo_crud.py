@@ -417,7 +417,7 @@ def warehouse_list(
 ) -> Dict[str, Any]:
     try:
         page = max(1, page)
-        size = min(100, max(1, size))
+        size = min(200, max(1, size))
         offset = (page - 1) * size
 
         conds: List[str] = ["1=1"]
@@ -710,7 +710,7 @@ def smelter_list(
 ) -> Dict[str, Any]:
     try:
         page = max(1, page)
-        size = min(100, max(1, size))
+        size = min(200, max(1, size))
         offset = (page - 1) * size
 
         conds: List[str] = ["1=1"]
