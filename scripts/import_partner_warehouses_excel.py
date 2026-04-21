@@ -6,15 +6,21 @@
 
 用法：
 
+  # 已在 .env 设置 PARTNER_WAREHOUSES_EXCEL_PATH 时可省略 --file
+  uv run python scripts/import_partner_warehouses_excel.py
+
   uv run python scripts/import_partner_warehouses_excel.py ^
     --file "C:\\Users\\zhang carry\\Desktop\\3.合作库房清单.xlsx"
 
+  # 仅预览不写库
+  uv run python scripts/import_partner_warehouses_excel.py --dry-run
   uv run python scripts/import_partner_warehouses_excel.py --file ... --dry-run
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -31,7 +37,13 @@ from app.services.partner_warehouse_excel import (  # noqa: E402
 
 def main() -> None:
     p = argparse.ArgumentParser(description="从 Excel 导入合作库房名称与地址到 dict_warehouses（直连 SQL）")
-    p.add_argument("--file", "-f", required=True, type=Path, help="Excel 文件路径")
+    p.add_argument(
+        "--file",
+        "-f",
+        type=Path,
+        default=None,
+        help="Excel 文件路径；省略时读取 .env 中 PARTNER_WAREHOUSES_EXCEL_PATH（相对路径相对项目根）",
+    )
     p.add_argument("--sheet", type=str, default=None, help="工作表名称")
     p.add_argument("--sheet-index", type=int, default=None, help="工作表索引（0 起）")
     p.add_argument("--name-col", type=str, default=None, help="库房名称列名")
@@ -44,7 +56,17 @@ def main() -> None:
     )
     args = p.parse_args()
 
-    path = args.file.expanduser().resolve()
+    if args.file is not None:
+        path = args.file.expanduser().resolve()
+    else:
+        raw = (os.getenv("PARTNER_WAREHOUSES_EXCEL_PATH") or "").strip()
+        if not raw:
+            raise SystemExit(
+                "请使用 --file 指定 Excel，或在 .env 中设置 PARTNER_WAREHOUSES_EXCEL_PATH"
+            )
+        pth = Path(raw).expanduser()
+        path = (PROJECT_ROOT / pth).resolve() if not pth.is_absolute() else pth.resolve()
+
     if not path.is_file():
         raise SystemExit(f"文件不存在: {path}")
 
