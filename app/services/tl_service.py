@@ -14,6 +14,8 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from pymysql.err import IntegrityError as PyMySQLIntegrityError
+
 from app.config import UPLOAD_DIR
 from app.database import get_conn
 from app.models.tl import OPTIMAL_PRICE_BASIS_ALLOWED
@@ -503,7 +505,7 @@ class TLService:
         if page is not None:
             try:
                 pg = max(1, int(page))
-                sz = min(100, max(1, int(size or 20)))
+                sz = min(200, max(1, int(size or 20)))
                 kw = (
                     str(keyword).strip()
                     if keyword is not None and str(keyword).strip()
@@ -760,6 +762,37 @@ class TLService:
             logger.error(f"删除仓库失败: {e}")
             raise
 
+    def purge_warehouse(self, warehouse_id: int) -> Dict[str, Any]:
+        """从 dict_warehouses 物理删除；存在外键引用时失败。"""
+        if warehouse_id < 1:
+            raise ValueError("仓库 id 无效")
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT id FROM dict_warehouses WHERE id = %s",
+                        (warehouse_id,),
+                    )
+                    if not cur.fetchone():
+                        raise ValueError(f"仓库 id={warehouse_id} 不存在")
+                    try:
+                        cur.execute(
+                            "DELETE FROM dict_warehouses WHERE id = %s",
+                            (warehouse_id,),
+                        )
+                    except PyMySQLIntegrityError as e:
+                        logger.warning("硬删除仓库触发外键约束: %s", e)
+                        raise ValueError(
+                            "该仓库仍被运费或其它业务数据引用，无法物理删除；"
+                            "请先解除关联或使用软删除接口"
+                        ) from e
+            return {"code": 200, "msg": "仓库已永久删除"}
+        except ValueError:
+            raise
+        except Exception as e:
+            logger.error(f"硬删除仓库失败: {e}")
+            raise
+
     # ==================== 库房类型维护（类型与颜色一对一）====================
 
     def get_warehouse_types(
@@ -981,7 +1014,7 @@ class TLService:
         if page is not None:
             try:
                 pg = max(1, int(page))
-                sz = min(100, max(1, int(size or 20)))
+                sz = min(200, max(1, int(size or 20)))
                 kw = (
                     str(keyword).strip()
                     if keyword is not None and str(keyword).strip()
@@ -1156,6 +1189,37 @@ class TLService:
             raise
         except Exception as e:
             logger.error(f"删除冶炼厂失败: {e}")
+            raise
+
+    def purge_smelter(self, smelter_id: int) -> Dict[str, Any]:
+        """从 dict_factories 物理删除；存在外键引用时失败。"""
+        if smelter_id < 1:
+            raise ValueError("冶炼厂 id 无效")
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT id FROM dict_factories WHERE id = %s",
+                        (smelter_id,),
+                    )
+                    if not cur.fetchone():
+                        raise ValueError(f"冶炼厂 id={smelter_id} 不存在")
+                    try:
+                        cur.execute(
+                            "DELETE FROM dict_factories WHERE id = %s",
+                            (smelter_id,),
+                        )
+                    except PyMySQLIntegrityError as e:
+                        logger.warning("硬删除冶炼厂触发外键约束: %s", e)
+                        raise ValueError(
+                            "该冶炼厂仍被运费、报价或其它业务数据引用，无法物理删除；"
+                            "请先解除关联或使用软删除接口"
+                        ) from e
+            return {"code": 200, "msg": "冶炼厂已永久删除"}
+        except ValueError:
+            raise
+        except Exception as e:
+            logger.error(f"硬删除冶炼厂失败: {e}")
             raise
 
     def batch_delete_warehouses(self, warehouse_ids: List[int]) -> Dict[str, Any]:
