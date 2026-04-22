@@ -18,8 +18,12 @@ from app.intelligent_prediction.exceptions import (
 from app.intelligent_prediction.logging_utils import get_logger
 from app.intelligent_prediction.api.audit_deps import AuditActor, get_audit_actor
 from app.intelligent_prediction.api.deps import get_prediction_db_session
+from app.intelligent_prediction.schemas.dimensions import DimensionListsResponse
 from app.intelligent_prediction.schemas.forecast import PrdForecastChartResponse, PrdForecastDetailResponse, PrdForecastQuery
 from app.intelligent_prediction.services.audit_service import append_audit, write_audit_standalone
+from app.intelligent_prediction.services.dimension_options_service import (
+    list_dimensions_from_delivery_history,
+)
 from app.intelligent_prediction.services.prd_forecast_service import PrdForecastService, get_prd_forecast_service
 
 logger = get_logger(__name__)
@@ -216,4 +220,25 @@ async def prd_forecast_export(
             detail={"error": str(e)},
             actor=actor,
         )
+        raise HTTPException(status_code=500, detail=INTERNAL_SERVER_ERROR_MESSAGE) from e
+
+
+@router.get(
+    "/dimension-options",
+    response_model=DimensionListsResponse,
+    summary="规则预测筛选维度列表",
+    description=(
+        "与送货历史同源：从 ``pd_ip_delivery_records`` 去重返回大区经理、仓库、冶炼厂，"
+        "供 ``/forecast/chart``、``/forecast/details`` 等筛选参数候选。"
+    ),
+)
+async def forecast_dimension_options(
+    session: AsyncSession = Depends(get_prediction_db_session),
+) -> DimensionListsResponse:
+    try:
+        return await list_dimensions_from_delivery_history(session)
+    except BusinessException:
+        raise
+    except Exception as e:
+        logger.exception("forecast_dimension_options failed")
         raise HTTPException(status_code=500, detail=INTERNAL_SERVER_ERROR_MESSAGE) from e

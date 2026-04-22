@@ -20,6 +20,7 @@ from app.intelligent_prediction.exceptions import (
 from app.intelligent_prediction.logging_utils import get_logger
 from app.intelligent_prediction.api.audit_deps import AuditActor, get_audit_actor
 from app.intelligent_prediction.api.deps import get_history_service_dep, get_prediction_db_session
+from app.intelligent_prediction.schemas.dimensions import DimensionListsResponse
 from app.intelligent_prediction.schemas.history import (
     DeliveryRecordRead,
     DeliveryRecordUpdate,
@@ -32,6 +33,9 @@ from app.intelligent_prediction.schemas.history import (
     HistoryTemplateFieldsResponse,
 )
 from app.intelligent_prediction.services.audit_service import append_audit, write_audit_standalone
+from app.intelligent_prediction.services.dimension_options_service import (
+    list_dimensions_from_delivery_history,
+)
 from app.intelligent_prediction.services.history_service import HistoryService
 
 logger = get_logger(__name__)
@@ -373,4 +377,25 @@ async def purge_all_delivery_history(
         raise
     except Exception as e:
         logger.exception("purge_all failed")
+        raise HTTPException(status_code=500, detail=INTERNAL_SERVER_ERROR_MESSAGE) from e
+
+
+@router.get(
+    "/dimension-options",
+    response_model=DimensionListsResponse,
+    summary="送货历史筛选维度列表",
+    description=(
+        "从送货历史表 ``pd_ip_delivery_records`` 去重返回大区经理、仓库、冶炼厂名称，"
+        "供列表/统计等筛选下拉使用（与规则预测 ``/forecast`` 筛选维度同源）。"
+    ),
+)
+async def delivery_history_dimension_options(
+    session: AsyncSession = Depends(get_prediction_db_session),
+) -> DimensionListsResponse:
+    try:
+        return await list_dimensions_from_delivery_history(session)
+    except BusinessException:
+        raise
+    except Exception as e:
+        logger.exception("delivery_history_dimension_options failed")
         raise HTTPException(status_code=500, detail=INTERNAL_SERVER_ERROR_MESSAGE) from e

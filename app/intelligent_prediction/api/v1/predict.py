@@ -24,6 +24,7 @@ from app.intelligent_prediction.schemas.dict_addresses import (
     TlDictEntityAddress,
     WarehouseSmelterAddressLookupResponse,
 )
+from app.intelligent_prediction.schemas.dimensions import DimensionListsResponse
 from app.intelligent_prediction.schemas.prediction import (
     AsyncPredictionAccepted,
     BatchPredictionRequest,
@@ -33,6 +34,9 @@ from app.intelligent_prediction.schemas.prediction import (
     StoredPredictionResultListResponse,
 )
 from app.intelligent_prediction.services.audit_service import list_audit_events
+from app.intelligent_prediction.services.dimension_options_service import (
+    list_dimensions_from_prediction_results,
+)
 from app.intelligent_prediction.services.dict_geo_lookup import (
     lookup_warehouse_smelter_dict_addresses,
 )
@@ -285,3 +289,24 @@ async def download_batch_excel(
         filename=f"预测导出_{predict_id_str}.xlsx",
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+
+
+@router.get(
+    "/dimension-options",
+    response_model=DimensionListsResponse,
+    summary="已落库预测结果筛选维度列表",
+    description=(
+        "从 ``pd_ip_prediction_results`` 去重返回大区经理、仓库、冶炼厂，"
+        "反映当前库中已写入的智能预测明细里出现过的取值，供 ``/predict/results`` 等筛选下拉使用。"
+    ),
+)
+async def prediction_results_dimension_options(
+    session: AsyncSession = Depends(get_prediction_db_session),
+) -> DimensionListsResponse:
+    try:
+        return await list_dimensions_from_prediction_results(session)
+    except BusinessException:
+        raise
+    except Exception as e:
+        logger.exception("prediction_results_dimension_options failed")
+        raise HTTPException(status_code=500, detail=INTERNAL_SERVER_ERROR_MESSAGE) from e
