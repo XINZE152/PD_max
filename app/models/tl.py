@@ -114,12 +114,12 @@ class ComparisonRequest(BaseModel):
     吨数: float = Field(
         1.0,
         gt=0,
-        description="货物吨数；总运费=freight_rates 每吨运费（元/吨）×吨数",
+        description="货物吨数；比价明细中 总价=单价×吨数，运费=运费单价×吨数，利润=总价−运费（与 报价金额、总运费 一致）",
     )
     最优价计税口径列表: List[str] = Field(
         default_factory=lambda: ["3pct"],
         description=(
-            "最优价（单价×吨数−总运费）按哪些口径各算一份。"
+            "最优价（单价×吨数−全程运费）按哪些口径各算一份。"
             "base=不含税基准；1pct/3pct/13pct=对应含税单价；"
             "normal_invoice/reverse_invoice=表中对应列单价（元/吨）。可多选，重复项会去重保序。"
         ),

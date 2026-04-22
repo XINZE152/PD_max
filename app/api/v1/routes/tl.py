@@ -587,6 +587,7 @@ def get_comparison(
     body: ComparisonRequest,
     service: TLService = Depends(get_tl_service),
 ):
+    """明细含单价/总价/运费单价/运费及兼容字段报价/报价金额/总运费；利润=总价−运费。"""
     try:
         out = service.get_comparison(
             warehouse_ids=body.选中仓库id列表,

@@ -1381,9 +1381,10 @@ class TLService:
     ) -> Dict[str, Any]:
         """
         price_type: 目标税率类型，None=普通价, 1pct/3pct/13pct/normal_invoice/reverse_invoice
-        吨数 t: 报价按元/吨；**总运费** = 运费单价（元/吨）× t，即 **运费×吨数**。
-        **展示用「报价」**：按所选 price_type 折合为不含税（元/吨）后写入 `报价`；
-        **`报价金额`** = **报价×吨数**（无报价为 `null`）；**`利润`** = **报价金额 − 总运费**（即 **报价×吨数 − 运费×吨数**）。
+        吨数 t: **单价**为展示用「报价」（元/吨，按 price_type 折合不含税）；**总价** = 单价×t = **`报价金额`**；
+        **运费单价**（元/吨）来自运费表；**运费** = 运费单价×t = **`总运费`**（全程运费金额，元）；
+        **利润** = 总价 − 运费（与 **报价金额 − 总运费** 一致）。
+        明细中同时保留 **`报价`/`报价金额`/`总运费`** 与上述 **`单价`/`总价`/`运费单价`/`运费`** 便于新旧前端兼容。
         前端最终比价、明细排序与 **`冶炼厂利润排行`** 均以该 **`利润`**（及所选最优价口径）为准。
         **最优价各口径利润**=该口径下元/吨单价×t−总运费（与主利润同一套总运费）。
         同时按表中已有列统一反推 `基准价`（不含税）、`含1%税价`、`含3%税价`（与 OCR 按税点入库、再换算一致）；
@@ -1654,7 +1655,7 @@ class TLService:
                         return row
                 return None
 
-            # 组合结果；总运费 = 每吨运费（元/吨）× 吨数
+            # 组合结果；总运费 = 运费单价（元/吨）× 吨数；总价 = 单价（元/吨）× 吨数
             t = float(tons)
             result: List[Dict[str, Any]] = []
             for (wid, fid), (wname, fname, freight) in freight_map.items():
@@ -1684,7 +1685,6 @@ class TLService:
                         if quote_amount is not None
                         else round(-freight_cost_total, 2)
                     )
-                    p = float(p_net) if p_net is not None else 0.0
 
                     qrow = pick_quote_row(fid, cid)
                     breakdown = (
@@ -1718,7 +1718,11 @@ class TLService:
                         "price_type": price_type_name,
                         "吨数": t,
                         "运费计价方式": "per_ton",
-                        "运费": fr,
+                        # 单价/总价/运费：总价=单价×吨数；运费=运费单价×吨数；利润=总价−运费
+                        "单价": p_net if source != "unavailable" else None,
+                        "总价": quote_amount,
+                        "运费单价": fr,
+                        "运费": freight_cost_total,
                         "总运费": freight_cost_total,
                         "报价": p_net if source != "unavailable" else None,
                         "报价金额": quote_amount,
