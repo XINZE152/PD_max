@@ -1192,14 +1192,27 @@ class TLService:
             logger.error(f"删除冶炼厂失败: {e}")
             raise
 
-    def purge_smelter(self, smelter_id: int, *, cascade: bool = False) -> Dict[str, Any]:
+    def purge_smelter(self, smelter_id: int, *, cascade: bool = True) -> Dict[str, Any]:
         """从 dict_factories 物理删除。
 
-        cascade=False（默认）：若 freight_rates / quote_details 等仍引用该行，则失败（与库外键一致）。
-        cascade=True：在同一事务内按依赖顺序删除需求明细、需求主表、报价明细、报价元数据、运费、税率（随厂级联），再删除冶炼厂。
+        cascade=True（默认）：同一事务内删除该厂关联的需求/报价/运费等后删厂。
+        cascade=False：仅当子表无任何引用时才删厂；否则 409（严格模式，供脚本校验用）。
         """
         if smelter_id < 1:
             raise ValueError("冶炼厂 id 无效")
+
+        _child_count_sql = """
+            SELECT
+              (SELECT COUNT(*) FROM factory_demand_items fdi
+                 INNER JOIN factory_demands fd ON fd.id = fdi.demand_id
+                 WHERE fd.factory_id = %s),
+              (SELECT COUNT(*) FROM factory_demands WHERE factory_id = %s),
+              (SELECT COUNT(*) FROM quote_details WHERE factory_id = %s),
+              (SELECT COUNT(*) FROM quote_table_metadata WHERE factory_id = %s),
+              (SELECT COUNT(*) FROM freight_rates WHERE factory_id = %s),
+              (SELECT COUNT(*) FROM factory_tax_rates WHERE factory_id = %s)
+        """
+
         try:
             if cascade:
                 with get_conn() as conn:
@@ -1214,20 +1227,7 @@ class TLService:
                             if not row:
                                 raise ValueError(f"冶炼厂 id={smelter_id} 不存在")
                             factory_name = str(row[1])
-                            cur.execute(
-                                """
-                                SELECT
-                                  (SELECT COUNT(*) FROM factory_demand_items fdi
-                                     INNER JOIN factory_demands fd ON fd.id = fdi.demand_id
-                                     WHERE fd.factory_id = %s),
-                                  (SELECT COUNT(*) FROM factory_demands WHERE factory_id = %s),
-                                  (SELECT COUNT(*) FROM quote_details WHERE factory_id = %s),
-                                  (SELECT COUNT(*) FROM quote_table_metadata WHERE factory_id = %s),
-                                  (SELECT COUNT(*) FROM freight_rates WHERE factory_id = %s),
-                                  (SELECT COUNT(*) FROM factory_tax_rates WHERE factory_id = %s)
-                                """,
-                                (smelter_id,) * 6,
-                            )
+                            cur.execute(_child_count_sql, (smelter_id,) * 6)
                             c_row = cur.fetchone()
                             n_di, n_dm, n_qd, n_qm, n_fr, n_tr = (
                                 int(c_row[0] or 0),
@@ -1288,7 +1288,7 @@ class TLService:
                 return {
                     "code": 200,
                     "msg": (
-                        f"已级联永久删除冶炼厂 id={smelter_id}（含关联运费/报价等，详见 deleted_counts）"
+                        f"已永久删除冶炼厂 id={smelter_id}，并清除关联数据（见 deleted_counts）"
                     ),
                     "cascade": True,
                     "deleted_counts": {
@@ -1309,19 +1309,34 @@ class TLService:
                     )
                     if not cur.fetchone():
                         raise ValueError(f"冶炼厂 id={smelter_id} 不存在")
-                    try:
-                        cur.execute(
-                            "DELETE FROM dict_factories WHERE id = %s",
-                            (smelter_id,),
-                        )
-                    except PyMySQLIntegrityError as e:
-                        logger.warning("硬删除冶炼厂触发外键约束: %s", e)
+                    cur.execute(_child_count_sql, (smelter_id,) * 6)
+                    c_row = cur.fetchone()
+                    n_di, n_dm, n_qd, n_qm, n_fr, n_tr = (
+                        int(c_row[0] or 0),
+                        int(c_row[1] or 0),
+                        int(c_row[2] or 0),
+                        int(c_row[3] or 0),
+                        int(c_row[4] or 0),
+                        int(c_row[5] or 0),
+                    )
+                    total_children = n_di + n_dm + n_qd + n_qm + n_fr + n_tr
+                    if total_children > 0:
                         raise ValueError(
-                            "该冶炼厂仍被运费、报价或其它业务数据引用，无法物理删除。"
-                            "可调用 DELETE /tl/purge_smelter?cascade=true 级联删除关联数据后再删厂，"
-                            "或先手工清理 freight_rates / quote_details 等表后重试；也可使用软删除接口。"
-                        ) from e
-            return {"code": 200, "msg": "冶炼厂已永久删除", "cascade": False}
+                            "已指定 cascade=false（仅当无子表引用时才删厂）。"
+                            f"冶炼厂 id={smelter_id} 仍存在关联："
+                            f"demand_items={n_di}, demands={n_dm}, quote_details={n_qd}, "
+                            f"quote_metadata={n_qm}, freight_rates={n_fr}, tax_rates={n_tr}。"
+                            "默认删除会级联清空上述数据，请勿传 cascade=false；或先手工清理子表。"
+                        )
+                    cur.execute(
+                        "DELETE FROM dict_factories WHERE id = %s",
+                        (smelter_id,),
+                    )
+            return {
+                "code": 200,
+                "msg": "冶炼厂已永久删除（cascade=false 且无关联子表）",
+                "cascade": False,
+            }
         except ValueError:
             raise
         except Exception as e:

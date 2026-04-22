@@ -11,7 +11,7 @@ TL比价模块路由
   1c2.DELETE /tl/purge_warehouse        - 永久删除仓库（硬删除）
   1d.POST /tl/add_smelter              - 新建冶炼厂
   2. GET  /tl/get_smelters             - 获取冶炼厂列表（size 最大 200）
-  2c2.DELETE /tl/purge_smelter         - 永久删除冶炼厂（硬删除；可选 ?cascade=true 先删运费/报价等再删厂）
+  2c2.DELETE /tl/purge_smelter         - 永久删除冶炼厂（硬删除；默认级联删运费/报价等；?cascade=false 为严格仅删厂）
   3. GET  /tl/get_categories           - 获取品类列表
   3b.POST /tl/upload_variety           - 上传品种（批量写入 dict_categories）
   4. POST /tl/get_comparison           - 获取比价表
@@ -500,15 +500,15 @@ def delete_smelter(
 def purge_smelter(
     smelter_id: int,
     cascade: bool = Query(
-        False,
+        True,
         description=(
-            "为 true 时在同一事务内级联删除：需求明细/需求、报价明细、报价表元数据、运费、税率（随厂），再删除冶炼厂。"
-            "默认 false，若仍存在外键引用则返回 409。"
+            "默认 true：同一事务内级联删除该厂的需求/报价/运费等后再删冶炼厂。"
+            "传 false 时仅当无任何子表引用才删厂，否则 409（严格校验）。"
         ),
     ),
     service: TLService = Depends(get_tl_service),
 ):
-    """物理删除 dict_factories；默认与外键一致；`cascade=true` 时先清空本厂关联业务数据。"""
+    """物理删除冶炼厂；默认级联清除本厂关联业务数据。"""
     try:
         return service.purge_smelter(smelter_id=smelter_id, cascade=cascade)
     except ValueError as e:
