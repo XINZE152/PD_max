@@ -507,7 +507,10 @@ class VlmFullData(BaseModel):
 class ConfirmPriceTableItem(BaseModel):
     """确认价格表 - 单条明细"""
     冶炼厂名: str = Field(..., description="冶炼厂名称（OCR识别或前端修改后）")
-    冶炼厂id: Optional[int] = Field(None, description="冶炼厂ID，null则自动新建")
+    冶炼厂id: Optional[int] = Field(
+        None,
+        description="冶炼厂ID；为 null 时按「冶炼厂名」与字典精确匹配解析 id，不存在或已停用则报错（不在此接口自动新建冶炼厂）",
+    )
     品类名: str = Field(..., description="品类名称（OCR识别或前端修改后）")
     品类id: Optional[int] = Field(None, description="品类分组ID，null则自动新建")
     价格: Optional[float] = Field(None, description="不含税基准价（元/吨）")

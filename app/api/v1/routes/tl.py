@@ -16,7 +16,7 @@ TL比价模块路由
   3b.POST /tl/upload_variety           - 上传品种（批量写入 dict_categories）
   4. POST /tl/get_comparison           - 获取比价表
   5. POST /tl/upload_price_table       - 上传价格表（OCR识别，返回原始识别结果）
-  5b.POST /tl/confirm_price_table      - 确认写入报价数据（自动新建缺失冶炼厂/品类）
+  5b.POST /tl/confirm_price_table      - 确认写入报价数据（冶炼厂须字典名称精确匹配；品类缺失仍可自动新建）
   5c.GET  /tl/get_quote_details_list   - 报价数据列表（分页、筛选）
   5d.GET  /tl/export_quote_details_excel - 导出报价数据 Excel（与查询条件一致）
   6. POST /tl/upload_freight           - 上传运费

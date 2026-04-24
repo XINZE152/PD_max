@@ -2259,23 +2259,42 @@ class TLService:
                     inserted, updated = 0, 0
 
                     for item in items:
-                        # 1. 冶炼厂不存在则新建
+                        # 1. 冶炼厂：须已在字典中存在且名称与库中完全一致；禁止确认写入时静默新建
                         if item.get("冶炼厂id") is None:
-                            factory_name = item["冶炼厂名"]
+                            factory_name = str(item.get("冶炼厂名") or "").strip()
+                            if not factory_name:
+                                raise ValueError("冶炼厂名称不能为空")
                             cur.execute(
-                                "SELECT id FROM dict_factories WHERE name = %s",
+                                "SELECT id, is_active FROM dict_factories WHERE name = %s",
                                 (factory_name,),
                             )
                             row = cur.fetchone()
-                            if row:
-                                item["冶炼厂id"] = row[0]
-                            else:
-                                cur.execute(
-                                    "INSERT INTO dict_factories (name, is_active) "
-                                    "VALUES (%s, 1)",
-                                    (factory_name,),
+                            if not row:
+                                raise ValueError(
+                                    f"冶炼厂「{factory_name}」在系统中不存在，或与字典中的名称不完全一致"
+                                    f"（须与「冶炼厂」管理中的名称一字不差，例如全称「安徽鲁控环保有限公司」）。"
+                                    f"请修正名称或先在字典中新增该冶炼厂。"
                                 )
-                                item["冶炼厂id"] = cur.lastrowid
+                            fid_row, active = int(row[0]), row[1]
+                            if active is not None and int(active) != 1:
+                                raise ValueError(
+                                    f"冶炼厂「{factory_name}」已停用，请先在冶炼厂管理中启用后再写入报价。"
+                                )
+                            item["冶炼厂id"] = fid_row
+                        else:
+                            fid = int(item["冶炼厂id"])
+                            cur.execute(
+                                "SELECT is_active FROM dict_factories WHERE id = %s",
+                                (fid,),
+                            )
+                            row = cur.fetchone()
+                            if not row:
+                                raise ValueError(f"冶炼厂 id={fid} 不存在，请刷新后重新选择冶炼厂。")
+                            active = row[0]
+                            if active is not None and int(active) != 1:
+                                raise ValueError(
+                                    f"冶炼厂 id={fid} 已停用，无法写入报价；请启用后重试。"
+                                )
 
                         # 2. 品类：与 upload_variety 一致——按 name 全局唯一；停用行需恢复而非再 INSERT
                         cat_name = item["品类名"]
