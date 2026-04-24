@@ -177,6 +177,7 @@ async def prd_forecast_export(
     svc: PrdForecastService = Depends(get_prd_forecast_service),
     actor: AuditActor = Depends(get_audit_actor),
 ) -> StreamingResponse:
+    # PrdForecastQuery.page_size 上限為 500；compute() 不按 page 切片，全量明细由此返回。
     q = _prd_query(
         date_from=date_from,
         date_to=date_to,
@@ -189,7 +190,7 @@ async def prd_forecast_export(
         smelters=smelters,
         smelter=smelter,
         page=1,
-        page_size=10**9,
+        page_size=500,
     )
     try:
         rows, _chart = await svc.compute(session, q)
