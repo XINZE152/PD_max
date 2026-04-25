@@ -3380,6 +3380,7 @@ class TLService:
     def _prepare_quote_details_filter(
         self,
         factory_id: Optional[int],
+        category_id: Optional[int],
         quote_date: Optional[str],
         date_from: Optional[str],
         date_to: Optional[str],
@@ -3413,6 +3414,18 @@ class TLService:
         if factory_id is not None:
             conditions.append("qd.factory_id = %s")
             params.append(factory_id)
+        if category_id is not None:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT name FROM dict_categories WHERE category_id = %s AND is_active = 1",
+                        (int(category_id),),
+                    )
+                    category_names = [str(row[0]).strip() for row in cur.fetchall() if str(row[0]).strip()]
+            if category_names:
+                placeholders = ", ".join(["%s"] * len(category_names))
+                conditions.append(f"qd.category_name IN ({placeholders})")
+                params.extend(category_names)
         if qd_exact is not None:
             conditions.append("qd.quote_date = %s")
             params.append(qd_exact)
@@ -3422,13 +3435,20 @@ class TLService:
         if d_to is not None:
             conditions.append("qd.quote_date <= %s")
             params.append(d_to)
-        if category_name:
+        if category_name and category_id is None:
             if category_exact:
                 conditions.append("qd.category_name = %s")
                 params.append(category_name)
             else:
-                conditions.append("qd.category_name LIKE %s")
-                params.append(f"%{category_name}%")
+                names = [
+                    x.strip()
+                    for x in re.split(r"[、,，]+", str(category_name))
+                    if x.strip()
+                ]
+                if not names:
+                    names = [str(category_name).strip()]
+                conditions.append("(" + " OR ".join(["qd.category_name LIKE %s"] * len(names)) + ")")
+                params.extend([f"%{name}%" for name in names])
         where_sql = " AND ".join(conditions)
         return where_sql, params
 
@@ -3437,6 +3457,7 @@ class TLService:
     def get_quote_details_list(
         self,
         factory_id: Optional[int] = None,
+        category_id: Optional[int] = None,
         quote_date: Optional[str] = None,
         date_from: Optional[str] = None,
         date_to: Optional[str] = None,
@@ -3453,6 +3474,7 @@ class TLService:
         page_size = min(max(page_size, 1), 500)
         where_sql, params = self._prepare_quote_details_filter(
             factory_id=factory_id,
+            category_id=category_id,
             quote_date=quote_date,
             date_from=date_from,
             date_to=date_to,
@@ -3530,6 +3552,7 @@ class TLService:
     def export_quote_details_excel(
         self,
         factory_id: Optional[int] = None,
+        category_id: Optional[int] = None,
         quote_date: Optional[str] = None,
         date_from: Optional[str] = None,
         date_to: Optional[str] = None,
@@ -3541,6 +3564,7 @@ class TLService:
         max_rows = min(max(max_rows, 1), 100000)
         where_sql, params = self._prepare_quote_details_filter(
             factory_id=factory_id,
+            category_id=category_id,
             quote_date=quote_date,
             date_from=date_from,
             date_to=date_to,

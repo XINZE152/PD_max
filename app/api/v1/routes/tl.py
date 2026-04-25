@@ -794,6 +794,8 @@ def update_quote_detail(
 @router.get("/get_quote_details_list", summary="报价数据列表")
 def get_quote_details_list(
     factory_id: Optional[int] = None,
+    category_id: Optional[int] = None,
+    品类id: Optional[int] = Query(None, description="品类分组 id；兼容旧前端中文参数"),
     quote_date: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
@@ -820,6 +822,7 @@ def get_quote_details_list(
     try:
         return service.get_quote_details_list(
             factory_id=factory_id,
+            category_id=category_id or 品类id,
             quote_date=quote_date,
             date_from=eff_from,
             date_to=eff_to,
@@ -840,6 +843,8 @@ def get_quote_details_list(
 @router.get("/export_quote_details_excel", summary="导出报价数据 Excel")
 def export_quote_details_excel(
     factory_id: Optional[int] = None,
+    category_id: Optional[int] = None,
+    品类id: Optional[int] = Query(None, description="品类分组 id；兼容旧前端中文参数"),
     quote_date: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
@@ -860,6 +865,7 @@ def export_quote_details_excel(
     try:
         data = service.export_quote_details_excel(
             factory_id=factory_id,
+            category_id=category_id or 品类id,
             quote_date=quote_date,
             date_from=eff_from,
             date_to=eff_to,
@@ -890,6 +896,7 @@ def export_quote_details_excel_post(
     try:
         data = service.export_quote_details_excel(
             factory_id=body.factory_id,
+            category_id=body.category_id,
             quote_date=body.quote_date,
             date_from=eff_from,
             date_to=eff_to,

@@ -644,6 +644,7 @@ class QuoteDetailsFilterRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     factory_id: Optional[int] = None
+    category_id: Optional[int] = None
     quote_date: Optional[str] = None
     date_from: Optional[str] = None
     date_to: Optional[str] = None
