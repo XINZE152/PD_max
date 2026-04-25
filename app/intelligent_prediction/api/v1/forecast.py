@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 from datetime import date, datetime, timedelta
+from urllib.parse import quote
 
 import pandas as pd
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -206,7 +207,7 @@ async def prd_forecast_export(
             detail={"rows": len(rows), "date_from": str(q.date_from), "date_to": str(q.date_to)},
             actor=actor,
         )
-        headers = {"Content-Disposition": f'attachment; filename="{fn}"'}
+        headers = {"Content-Disposition": f"attachment; filename*=UTF-8''{quote(fn)}"}
         return StreamingResponse(
             buf,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
