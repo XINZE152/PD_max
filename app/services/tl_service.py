@@ -52,6 +52,7 @@ from app.services.tl_dict_geo_crud import (
     warehouse_create as sa_wh_create,
     warehouse_link_bind as sa_wh_link_bind,
     warehouse_link_unbind as sa_wh_link_unbind,
+    warehouse_link_update_tier_price_spread as sa_wh_link_update_tier,
     warehouse_links_inbound as sa_wh_links_inbound,
     warehouse_links_outbound as sa_wh_links_outbound,
     warehouse_links_replace_outbound as sa_wh_links_replace_outbound,
@@ -406,6 +407,11 @@ class TLService:
         longitude: Optional[float] = None,
         latitude: Optional[float] = None,
         warehouse_type_name: Optional[str] = None,
+        contact_name: Optional[str] = None,
+        contact_phone: Optional[str] = None,
+        hazardous_waste_license_qty: Optional[float] = None,
+        monthly_avg_receipt_ton: Optional[float] = None,
+        freight_amount: Optional[float] = None,
     ) -> Dict[str, Any]:
         """极简录入仅 name/地址；含省市区详址时走 tl_dict_geo_crud，经纬度默认天地图（未同时传经度+纬度时）。"""
         addr = _strip_optional_str(address)
@@ -430,6 +436,16 @@ class TLService:
                 "latitude": latitude,
                 "status": 1,
             }
+            if contact_name is not None:
+                payload["contact_name"] = str(contact_name).strip() or None
+            if contact_phone is not None:
+                payload["contact_phone"] = str(contact_phone).strip() or None
+            if hazardous_waste_license_qty is not None:
+                payload["hazardous_waste_license_qty"] = hazardous_waste_license_qty
+            if monthly_avg_receipt_ton is not None:
+                payload["monthly_avg_receipt_ton"] = monthly_avg_receipt_ton
+            if freight_amount is not None:
+                payload["freight_amount"] = freight_amount
             try:
                 res = _raise_tl_geo_crud_result(sa_wh_create(payload))
                 data = res.get("data") or {}
@@ -585,6 +601,11 @@ class TLService:
             "区": item.get("district") or "",
             "经度": item.get("longitude"),
             "纬度": item.get("latitude"),
+            "库房联系人": item.get("contactName") or "",
+            "电话": item.get("contactPhone") or "",
+            "危废经营许可数量": item.get("hazardousWasteLicenseQty"),
+            "月均收货": item.get("monthlyAvgReceiptTon"),
+            "运费": item.get("freightAmount"),
             "仓库类型id": wt_id,
             "类型": tname,
             "库房类型颜色配置": None,
@@ -710,6 +731,26 @@ class TLService:
     # ==================== 接口1b：修改仓库 ====================
 
     _WH_SITE_PATCH_KEYS = frozenset({"省", "市", "区", "经度", "纬度", "库房类型名"})
+    _WH_BUSINESS_PATCH_KEYS = frozenset(
+        {"库房联系人", "电话", "危废经营许可数量", "月均收货", "运费"}
+    )
+
+    def _business_warehouse_patch_cn_to_en(self, patch: Dict[str, Any]) -> Dict[str, Any]:
+        """库房扩展字段：中文请求键 → tl_dict_geo_crud 英文 patch。"""
+        out: Dict[str, Any] = {}
+        if "库房联系人" in patch:
+            v = patch.get("库房联系人")
+            out["contact_name"] = None if v is None else str(v).strip()
+        if "电话" in patch:
+            v = patch.get("电话")
+            out["contact_phone"] = None if v is None else str(v).strip()
+        if "危废经营许可数量" in patch:
+            out["hazardous_waste_license_qty"] = patch.get("危废经营许可数量")
+        if "月均收货" in patch:
+            out["monthly_avg_receipt_ton"] = patch.get("月均收货")
+        if "运费" in patch:
+            out["freight_amount"] = patch.get("运费")
+        return out
 
     def _build_site_warehouse_update_patch(self, patch: Dict[str, Any]) -> Dict[str, Any]:
         out: Dict[str, Any] = {}
@@ -765,27 +806,42 @@ class TLService:
         allowed = (
             {"仓库名", "is_active", "地址", "仓库类型id", "仓库颜色配置"}
             | self._WH_SITE_PATCH_KEYS
+            | self._WH_BUSINESS_PATCH_KEYS
         )
         keys = set(patch.keys()) & allowed
         if not keys:
             raise ValueError(
                 "至少需要提供一个待修改字段：仓库名、is_active、地址、仓库类型id、仓库颜色配置、"
-                "省、市、区、经度、纬度、库房类型名 之一"
+                "省、市、区、经度、纬度、库房类型名、"
+                "库房联系人、电话、危废经营许可数量、月均收货、运费 之一"
             )
 
+        biz_patch = self._business_warehouse_patch_cn_to_en(patch)
         use_site = bool(keys & self._WH_SITE_PATCH_KEYS)
         if use_site:
             try:
                 site_patch = self._build_site_warehouse_update_patch(patch)
-                if not site_patch:
+                merged = {**biz_patch, **site_patch}
+                if not merged:
                     raise ValueError("没有有效的修改项")
-                _raise_tl_geo_crud_result(sa_wh_update(warehouse_id, site_patch))
+                _raise_tl_geo_crud_result(sa_wh_update(warehouse_id, merged))
                 return {"code": 200, "msg": "仓库信息修改成功"}
             except ValueError:
                 raise
             except RuntimeError as e:
                 logger.error(f"修改仓库失败(地理落库): {e}")
                 raise
+
+        if biz_patch:
+            try:
+                _raise_tl_geo_crud_result(sa_wh_update(warehouse_id, biz_patch))
+            except ValueError:
+                raise
+            except RuntimeError as e:
+                logger.error(f"修改仓库扩展字段失败(地理落库): {e}")
+                raise
+            if not (keys - self._WH_BUSINESS_PATCH_KEYS):
+                return {"code": 200, "msg": "仓库信息修改成功"}
 
         try:
             with get_conn() as conn:
@@ -922,9 +978,16 @@ class TLService:
 
     # ==================== 库房单向关联（有向图边）====================
 
-    def bind_warehouse_link(self, from_wh_id: int, to_wh_id: int) -> Dict[str, Any]:
-        """新增出边：源库房 -> 目标库房。"""
-        res = _raise_tl_geo_crud_result(sa_wh_link_bind(from_wh_id, to_wh_id))
+    def bind_warehouse_link(
+        self,
+        from_wh_id: int,
+        to_wh_id: int,
+        tier_price_spread: Any = None,
+    ) -> Dict[str, Any]:
+        """新增出边：源库房 -> 对标库房。"""
+        res = _raise_tl_geo_crud_result(
+            sa_wh_link_bind(from_wh_id, to_wh_id, tier_price_spread=tier_price_spread)
+        )
         data = res.get("data") or {}
         return {
             "code": 200,
@@ -932,8 +995,30 @@ class TLService:
             "data": {
                 "关联id": data.get("linkId"),
                 "源库房id": data.get("fromWarehouseId"),
-                "目标库房id": data.get("toWarehouseId"),
+                "对标库房id": data.get("toWarehouseId"),
                 "创建时间": data.get("createTime"),
+                "阶梯价差": data.get("tierPriceSpread"),
+            },
+        }
+
+    def update_warehouse_link_tier_price_spread(
+        self,
+        from_wh_id: int,
+        to_wh_id: int,
+        tier_price_spread: Any,
+    ) -> Dict[str, Any]:
+        """修改源库房→对标库房边上的阶梯价差（传 null 清空）。"""
+        res = _raise_tl_geo_crud_result(
+            sa_wh_link_update_tier(from_wh_id, to_wh_id, tier_price_spread)
+        )
+        data = res.get("data") or {}
+        return {
+            "code": 200,
+            "msg": str(res.get("msg") or "修改成功"),
+            "data": {
+                "源库房id": data.get("fromWarehouseId"),
+                "对标库房id": data.get("toWarehouseId"),
+                "阶梯价差": data.get("tierPriceSpread"),
             },
         }
 
@@ -978,9 +1063,11 @@ class TLService:
                 {
                     "关联id": it.get("linkId"),
                     "源库房id": it.get("fromWarehouseId"),
-                    "目标库房id": it.get("toWarehouseId"),
+                    "对标库房id": it.get("toWarehouseId"),
                     "创建时间": it.get("createTime"),
-                    "目标库房": row,
+                    "距离千米": it.get("distanceKm"),
+                    "阶梯价差": it.get("tierPriceSpread"),
+                    "对标库房": row,
                 }
             )
         return {
@@ -1028,8 +1115,10 @@ class TLService:
                 {
                     "关联id": it.get("linkId"),
                     "源库房id": it.get("fromWarehouseId"),
-                    "目标库房id": it.get("toWarehouseId"),
+                    "对标库房id": it.get("toWarehouseId"),
                     "创建时间": it.get("createTime"),
+                    "距离千米": it.get("distanceKm"),
+                    "阶梯价差": it.get("tierPriceSpread"),
                     "源库房": row,
                 }
             )
@@ -1050,8 +1139,9 @@ class TLService:
         from_warehouse_id: Optional[int] = None,
         to_warehouse_id: Optional[int] = None,
         keyword: Optional[str] = None,
+        has_tier_price_spread: Optional[bool] = None,
     ) -> Dict[str, Any]:
-        """库房关联总列表（每条含源、目标库房摘要）；可选筛选。"""
+        """库房关联总列表（每条含源、对标库房摘要及距离、阶梯价差）；可选筛选。"""
         res = _raise_tl_geo_crud_result(
             sa_wh_links_list_all(
                 page=page,
@@ -1060,6 +1150,7 @@ class TLService:
                 from_warehouse_id=from_warehouse_id,
                 to_warehouse_id=to_warehouse_id,
                 keyword=keyword,
+                has_tier_price_spread=has_tier_price_spread,
             )
         )
         payload = res.get("data") or {}
@@ -1097,10 +1188,12 @@ class TLService:
                 {
                     "关联id": it.get("linkId"),
                     "源库房id": it.get("fromWarehouseId"),
-                    "目标库房id": it.get("toWarehouseId"),
+                    "对标库房id": it.get("toWarehouseId"),
                     "创建时间": it.get("createTime"),
+                    "距离千米": it.get("distanceKm"),
+                    "阶梯价差": it.get("tierPriceSpread"),
                     "源库房": src_tl,
-                    "目标库房": tgt_tl,
+                    "对标库房": tgt_tl,
                 }
             )
         return {
@@ -1111,6 +1204,27 @@ class TLService:
             "page": int(payload.get("page") or page),
             "size": int(payload.get("size") or size),
         }
+
+    def get_tier_price_spread_list(
+        self,
+        page: int = 1,
+        size: int = 50,
+        warehouse_id: Optional[int] = None,
+        from_warehouse_id: Optional[int] = None,
+        to_warehouse_id: Optional[int] = None,
+        keyword: Optional[str] = None,
+        has_tier_price_spread: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        """阶梯差价列表：结构与 get_warehouse_links_list 相同（含距离千米、阶梯价差）。"""
+        return self.get_warehouse_links_list(
+            page=page,
+            size=size,
+            warehouse_id=warehouse_id,
+            from_warehouse_id=from_warehouse_id,
+            to_warehouse_id=to_warehouse_id,
+            keyword=keyword,
+            has_tier_price_spread=has_tier_price_spread,
+        )
 
     def replace_warehouse_links_outbound(
         self,

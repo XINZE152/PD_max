@@ -260,38 +260,69 @@ class AddWarehouseRequest(BaseModel):
         None,
         description="仓库独立颜色（JSON，可选），与库房类型颜色并存；未传则不写入",
     )
+    库房联系人: Optional[str] = Field(None, description="联系人（完整地址落库时可选）")
+    电话: Optional[str] = Field(None, description="联系电话（完整地址落库时可选）")
+    危废经营许可数量: Optional[float] = Field(
+        None,
+        description="危废经营许可数量（完整地址落库时可选）",
+    )
+    月均收货: Optional[float] = Field(
+        None,
+        description="月均收货量（吨，完整地址落库时可选）",
+    )
+    运费: Optional[float] = Field(
+        None,
+        description="运费参考（元，完整地址落库时可选）",
+    )
 
 
 class WarehouseLinkBindRequest(BaseModel):
-    """库房单向关联：新增一条有向边（源 → 目标）"""
+    """库房单向关联：新增一条有向边（源 → 对标库房）"""
 
     model_config = ConfigDict(extra="ignore")
 
     源库房id: int = Field(..., ge=1, description="出边起点库房 id")
-    目标库房id: int = Field(..., ge=1, description="出边终点库房 id")
+    目标库房id: int = Field(..., ge=1, description="对标库房 id（原「目标库房」）")
+    阶梯价差: Optional[Any] = Field(
+        None,
+        description="JSON：阶梯价差，如按距离区间的价差数组；可与绑定同时写入",
+    )
+
+
+class WarehouseLinkUpdateTierRequest(BaseModel):
+    """修改已有边上的阶梯价差"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    源库房id: int = Field(..., ge=1)
+    对标库房id: int = Field(..., ge=1, description="与绑定接口中的目标库房 id 同义")
+    阶梯价差: Optional[Any] = Field(
+        None,
+        description="JSON；传 null 表示清空该边上的阶梯价差",
+    )
 
 
 class WarehouseLinksReplaceOutboundRequest(BaseModel):
-    """将某库房的全部出边替换为目标列表（整体覆盖，用于「改」）"""
+    """将某库房的全部出边替换为对标库房列表（整体覆盖，用于「改」）"""
 
     model_config = ConfigDict(extra="ignore")
 
     源库房id: int = Field(..., ge=1, description="出边起点库房 id")
     目标库房id列表: List[int] = Field(
         default_factory=list,
-        description="替换后的目标库房 id 列表；空列表表示清空该库房全部出边",
+        description="替换后的对标库房 id 列表（字段名沿用「目标库房」）；空列表表示清空该库房全部出边",
     )
 
 
 class WarehouseLinksBatchOutboundRequest(BaseModel):
-    """同一源库房对多个目标的一次性绑定或解绑（与 replace 不同：不删除未出现在列表中的其它出边）"""
+    """同一源库房对多个对标库房的一次性绑定或解绑（与 replace 不同：不删除未出现在列表中的其它出边）"""
 
     model_config = ConfigDict(extra="ignore")
 
     源库房id: int = Field(..., ge=1, description="出边起点库房 id")
     目标库房id列表: List[int] = Field(
         default_factory=list,
-        description="目标库房 id 列表；空列表时批量绑定/解绑均无操作（解绑返回删除 0）",
+        description="对标库房 id 列表（字段名沿用「目标库房」）；空列表时批量绑定/解绑均无操作（解绑返回删除 0）",
     )
 
 
@@ -328,6 +359,11 @@ class UpdateWarehouseRequest(BaseModel):
         None,
         description="仓库独立颜色（可选）；传 null 可清空；不传则不修改",
     )
+    库房联系人: Optional[str] = Field(None, description="联系人；传 null 可清空")
+    电话: Optional[str] = Field(None, description="电话；传 null 可清空")
+    危废经营许可数量: Optional[float] = Field(None, description="危废经营许可数量；传 null 可清空")
+    月均收货: Optional[float] = Field(None, description="月均收货（吨）；传 null 可清空")
+    运费: Optional[float] = Field(None, description="运费参考（元）；传 null 可清空")
 
 
 class AddWarehouseTypeRequest(BaseModel):
