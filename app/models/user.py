@@ -21,6 +21,7 @@ class UserInfoResponse(BaseModel):
     id: int
     username: str
     nickname: Optional[str]
+    role: str = Field("user", description="角色代码，与 users.role / role_definitions.code 一致")
     is_active: int
     created_at: str
 

@@ -41,7 +41,6 @@ from app.intelligent_prediction.services.dict_geo_lookup import (
     lookup_warehouse_smelter_dict_addresses,
 )
 from app.intelligent_prediction.services.prediction_service import PredictionService
-from app.intelligent_prediction.tasks.export_tasks import run_prediction_batch_task
 
 logger = get_logger(__name__)
 router = APIRouter()
@@ -146,7 +145,24 @@ async def predict_async(
         await session.flush()
         predict_id_str = batch.id
         try:
+            # 延迟导入：未安装 celery 时仍可启动应用（仅异步批量入队依赖 Celery）
+            from app.intelligent_prediction.tasks.export_tasks import (
+                run_prediction_batch_task,
+            )
+
             async_result = run_prediction_batch_task.delay(predict_id_str)
+        except ImportError as enqueue_err:
+            logger.exception(
+                "predict_async 无法加载 Celery 任务（请安装 celery 并配置 Broker）batch_id=%s",
+                predict_id_str,
+            )
+            batch.status = "failed"
+            batch.error_message = f"enqueue_failed: {enqueue_err}"[:2000]
+            batch.completed_at = datetime.now(timezone.utc)
+            await session.commit()
+            raise ServiceUnavailableBusinessException(
+                "异步预测需要 Celery：请执行 pip install celery，并配置 CELERY_BROKER_URL 与 Worker",
+            ) from enqueue_err
         except Exception as enqueue_err:
             logger.exception("predict_async celery enqueue failed batch_id=%s", predict_id_str)
             batch.status = "failed"

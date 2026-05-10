@@ -284,6 +284,52 @@ class PredictionService:
             )
         return items, parse_err
 
+    @staticmethod
+    def _fallback_weight_decimal(
+        stats: dict[str, Any],
+        history: list[PredictionHistoryPoint],
+    ) -> Decimal:
+        """当模型或解析给出 0 时，用历史统计兜底为正数（与历史量级相近）。"""
+        mw = stats.get("mean_weight")
+        if mw is not None and float(mw) > 0:
+            return Decimal(str(round(float(mw), 4)))
+        lw = stats.get("last_weight")
+        if lw is not None and float(lw) > 0:
+            return Decimal(str(round(float(lw), 4)))
+        pos = [float(h.weight) for h in history if float(h.weight) > 0]
+        if pos:
+            m = sum(pos) / len(pos)
+            return Decimal(str(round(m, 4)))
+        return Decimal("1")
+
+    def _ensure_positive_daily_weights(
+        self,
+        items: list[PredictionItem],
+        stats: dict[str, Any],
+        history: list[PredictionHistoryPoint],
+    ) -> list[PredictionItem]:
+        """保证每个预测日重量 > 0：0 或缺失时用历史基线替换并打标。"""
+        floor = self._fallback_weight_decimal(stats, history)
+        if floor <= 0:
+            floor = Decimal("1")
+        floor = floor.quantize(Decimal("0.0001"))
+        out: list[PredictionItem] = []
+        for it in sorted(items, key=lambda x: x.target_date):
+            if it.predicted_weight > 0:
+                out.append(it)
+                continue
+            warns = list(it.warnings or [])
+            warns.append("zero_replaced_with_historical_baseline")
+            out.append(
+                PredictionItem(
+                    target_date=it.target_date,
+                    predicted_weight=floor,
+                    confidence="low",
+                    warnings=warns,
+                )
+            )
+        return out
+
     async def predict_single(
         self,
         session: AsyncSession,
@@ -333,7 +379,16 @@ class PredictionService:
             cached = await self._cache.redis.get_json(redis_key)
             if isinstance(cached, dict):
                 try:
-                    return PredictionResultSchema.model_validate(cached)
+                    hit = PredictionResultSchema.model_validate(cached)
+                    stats_hit = self._prompt.analyze_history(req.history)
+                    return hit.model_copy(
+                        update={
+                            "items": self._ensure_positive_daily_weights(
+                                hit.items, stats_hit, req.history
+                            ),
+                            "cache_hit": True,
+                        }
+                    )
                 except Exception:
                     logger.warning("redis prediction cache schema mismatch, ignoring")
 
@@ -355,6 +410,7 @@ class PredictionService:
         if perr:
             parse_note = (parse_note + "|" if parse_note else "") + perr
         items = self._post_process_items(items, parse_note)
+        items = self._ensure_positive_daily_weights(items, stats, req.history)
 
         result = PredictionResultSchema(
             warehouse=req.warehouse,

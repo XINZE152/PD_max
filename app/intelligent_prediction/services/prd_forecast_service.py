@@ -55,6 +55,16 @@ def _mean(values: list[Decimal]) -> Decimal:
     return sum(values) / Decimal(len(values))
 
 
+def _series_positive_baseline(series: dict[date, Decimal]) -> Decimal:
+    """序列在窗口内若有正送货量，取其均值作下限；否则用 1 占位（避免预测日为 0）。"""
+    vals = [v for v in series.values() if v > 0]
+    if not vals:
+        return Decimal("1")
+    m = sum(vals) / Decimal(len(vals))
+    q = m.quantize(Decimal("0.01"))
+    return q if q > 0 else Decimal("1")
+
+
 def _weekday_coefs(
     daily_wh_totals: dict[tuple[str, date], Decimal],
     warehouses: set[str],
@@ -198,11 +208,14 @@ class PrdForecastService:
         for wh, v, sm_k in wv_keys:
             rm = rm_map.get((wh, v, sm_k)) or "未分配"
             series = dict(daily_wv.get((wh, v, sm_k), {}))
+            baseline = _series_positive_baseline(series)
             for d in _daterange_inclusive(q.date_from, q.date_to):
                 wma = _linear_wma(series, d, 30)
                 wd = d.weekday()
                 c = coefs.get((wh, wd), Decimal("1"))
                 pred = (wma * c).quantize(Decimal("0.01"))
+                if pred <= 0:
+                    pred = max(baseline, Decimal("0.01")).quantize(Decimal("0.01"))
                 detail_rows.append(
                     PrdForecastDetailRow(
                         target_date=d,
