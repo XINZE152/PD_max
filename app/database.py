@@ -165,6 +165,11 @@ TABLE_STATEMENTS = [
         color_config JSON DEFAULT NULL COMMENT '仓库独立颜色配置（JSON），可与库房类型颜色并存',
         longitude DECIMAL(11, 8) DEFAULT NULL COMMENT '经度',
         latitude DECIMAL(10, 8) DEFAULT NULL COMMENT '纬度',
+        contact_name VARCHAR(64) DEFAULT NULL COMMENT '库房联系人',
+        contact_phone VARCHAR(32) DEFAULT NULL COMMENT '电话',
+        hazardous_waste_license_qty DECIMAL(14, 4) DEFAULT NULL COMMENT '危废经营许可数量',
+        monthly_avg_receipt_ton DECIMAL(14, 4) DEFAULT NULL COMMENT '月均收货(吨)',
+        freight_amount DECIMAL(14, 4) DEFAULT NULL COMMENT '运费参考(元)',
         is_active TINYINT(1) DEFAULT 1 COMMENT '是否启用',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -179,7 +184,8 @@ TABLE_STATEMENTS = [
     CREATE TABLE IF NOT EXISTS dict_warehouse_links (
         id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '边ID',
         from_warehouse_id INT NOT NULL COMMENT '源库房（出边起点）',
-        to_warehouse_id INT NOT NULL COMMENT '目标库房（单向指向）',
+        to_warehouse_id INT NOT NULL COMMENT '对标库房（单向指向终点）',
+        tier_price_spread JSON DEFAULT NULL COMMENT '阶梯价差（JSON，可按距离区间维护价差）',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
         UNIQUE KEY uk_wh_link_from_to (from_warehouse_id, to_warehouse_id),
         INDEX idx_wh_link_from (from_warehouse_id),
@@ -1091,6 +1097,98 @@ def create_tables() -> None:
         ensure_dict_warehouse_links_table()
     except Exception:
         logger.exception("检查/创建 dict_warehouse_links 库房关联边表失败")
+    try:
+        ensure_dict_warehouses_business_columns()
+    except Exception:
+        logger.exception("检查/添加 dict_warehouses 业务扩展列失败")
+    try:
+        ensure_dict_warehouse_links_tier_price_spread_column()
+    except Exception:
+        logger.exception("检查/添加 dict_warehouse_links.tier_price_spread 失败")
+
+
+def ensure_dict_warehouses_business_columns() -> None:
+    """联系人、电话、危废许可量、月均收货、参考运费（旧库补列）。"""
+    config_dict = get_mysql_config()
+    connection = pymysql.connect(**config_dict)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SHOW TABLES LIKE 'dict_warehouses'")
+            if cursor.fetchone() is None:
+                return
+
+            def _has_col(col: str) -> bool:
+                cursor.execute(
+                    "SELECT COUNT(*) FROM information_schema.columns "
+                    "WHERE table_schema = DATABASE() AND table_name = 'dict_warehouses' "
+                    "AND column_name = %s",
+                    (col,),
+                )
+                return cursor.fetchone()[0] > 0
+
+            if not _has_col("contact_name"):
+                cursor.execute(
+                    "ALTER TABLE dict_warehouses ADD COLUMN contact_name VARCHAR(64) DEFAULT NULL "
+                    "COMMENT '库房联系人' AFTER latitude"
+                )
+                logger.info("已为 dict_warehouses 添加 contact_name")
+            if not _has_col("contact_phone"):
+                cursor.execute(
+                    "ALTER TABLE dict_warehouses ADD COLUMN contact_phone VARCHAR(32) DEFAULT NULL "
+                    "COMMENT '电话' AFTER contact_name"
+                )
+                logger.info("已为 dict_warehouses 添加 contact_phone")
+            if not _has_col("hazardous_waste_license_qty"):
+                cursor.execute(
+                    "ALTER TABLE dict_warehouses ADD COLUMN hazardous_waste_license_qty "
+                    "DECIMAL(14, 4) DEFAULT NULL COMMENT '危废经营许可数量' AFTER contact_phone"
+                )
+                logger.info("已为 dict_warehouses 添加 hazardous_waste_license_qty")
+            if not _has_col("monthly_avg_receipt_ton"):
+                cursor.execute(
+                    "ALTER TABLE dict_warehouses ADD COLUMN monthly_avg_receipt_ton "
+                    "DECIMAL(14, 4) DEFAULT NULL COMMENT '月均收货(吨)' AFTER hazardous_waste_license_qty"
+                )
+                logger.info("已为 dict_warehouses 添加 monthly_avg_receipt_ton")
+            if not _has_col("freight_amount"):
+                cursor.execute(
+                    "ALTER TABLE dict_warehouses ADD COLUMN freight_amount DECIMAL(14, 4) DEFAULT NULL "
+                    "COMMENT '运费参考(元)' AFTER monthly_avg_receipt_ton"
+                )
+                logger.info("已为 dict_warehouses 添加 freight_amount")
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def ensure_dict_warehouse_links_tier_price_spread_column() -> None:
+    """库房关联边阶梯价差 JSON。"""
+    config_dict = get_mysql_config()
+    connection = pymysql.connect(**config_dict)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SHOW TABLES LIKE 'dict_warehouse_links'")
+            if cursor.fetchone() is None:
+                return
+
+            def _has_col(col: str) -> bool:
+                cursor.execute(
+                    "SELECT COUNT(*) FROM information_schema.columns "
+                    "WHERE table_schema = DATABASE() AND table_name = 'dict_warehouse_links' "
+                    "AND column_name = %s",
+                    (col,),
+                )
+                return cursor.fetchone()[0] > 0
+
+            if not _has_col("tier_price_spread"):
+                cursor.execute(
+                    "ALTER TABLE dict_warehouse_links ADD COLUMN tier_price_spread JSON DEFAULT NULL "
+                    "COMMENT '阶梯价差（JSON）' AFTER to_warehouse_id"
+                )
+                logger.info("已为 dict_warehouse_links 添加 tier_price_spread")
+        connection.commit()
+    finally:
+        connection.close()
 
 
 def ensure_dict_warehouse_links_table() -> None:
@@ -1104,7 +1202,8 @@ def ensure_dict_warehouse_links_table() -> None:
                 CREATE TABLE IF NOT EXISTS dict_warehouse_links (
                     id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '边ID',
                     from_warehouse_id INT NOT NULL COMMENT '源库房（出边起点）',
-                    to_warehouse_id INT NOT NULL COMMENT '目标库房（单向指向）',
+                    to_warehouse_id INT NOT NULL COMMENT '对标库房（单向指向终点）',
+                    tier_price_spread JSON DEFAULT NULL COMMENT '阶梯价差（JSON）',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
                     UNIQUE KEY uk_wh_link_from_to (from_warehouse_id, to_warehouse_id),
                     INDEX idx_wh_link_from (from_warehouse_id),

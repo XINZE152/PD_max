@@ -11,8 +11,9 @@ TL比价模块路由
   1c2.DELETE /tl/purge_warehouse        - 永久删除仓库（硬删除）
   1d.库房单向关联（有向图）：POST /tl/bind_warehouse_link、DELETE /tl/unbind_warehouse_link、
       POST /tl/batch_bind_warehouse_links、POST /tl/batch_unbind_warehouse_links、
-      GET /tl/get_warehouse_links_list、GET /tl/get_warehouse_links_outbound、GET /tl/get_warehouse_links_inbound、
-      PUT /tl/replace_warehouse_links_outbound
+      GET /tl/get_warehouse_links_list、GET /tl/get_tier_price_spread_list（阶梯差价列表）、
+      GET /tl/get_warehouse_links_outbound、GET /tl/get_warehouse_links_inbound、
+      PUT /tl/replace_warehouse_links_outbound、PUT /tl/update_warehouse_link_tier
   1e.POST /tl/add_smelter              - 新建冶炼厂
   2. GET  /tl/get_smelters             - 获取冶炼厂列表（size 最大 200；含循融宝发货）
   2a. GET  /tl/get_smelter              - 获取单个冶炼厂详情（含循融宝、is_active）
@@ -72,6 +73,7 @@ from app.models.tl import (
     AddWarehouseTypeRequest,
     UpdateWarehouseRequest,
     WarehouseLinkBindRequest,
+    WarehouseLinkUpdateTierRequest,
     WarehouseLinksBatchOutboundRequest,
     WarehouseLinksReplaceOutboundRequest,
     UpdateWarehouseTypeRequest,
@@ -186,6 +188,11 @@ def add_warehouse(
             longitude=body.经度,
             latitude=body.纬度,
             warehouse_type_name=body.库房类型名,
+            contact_name=body.库房联系人,
+            contact_phone=body.电话,
+            hazardous_waste_license_qty=body.危废经营许可数量,
+            monthly_avg_receipt_ton=body.月均收货,
+            freight_amount=body.运费,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -519,9 +526,13 @@ def bind_warehouse_link(
     body: WarehouseLinkBindRequest,
     service: TLService = Depends(get_tl_service),
 ):
-    """一条有向边：源库房 → 目标库房；重复绑定返回错误。"""
+    """一条有向边：源库房 → 对标库房；可附带阶梯价差 JSON；重复绑定返回错误。"""
     try:
-        return service.bind_warehouse_link(body.源库房id, body.目标库房id)
+        return service.bind_warehouse_link(
+            body.源库房id,
+            body.目标库房id,
+            tier_price_spread=body.阶梯价差,
+        )
     except ValueError as e:
         raise _tl_value_error_http(e)
     except RuntimeError as e:
@@ -533,7 +544,7 @@ def bind_warehouse_link(
 @router.delete("/unbind_warehouse_link", summary="解绑库房单向关联（删除出边）")
 def unbind_warehouse_link(
     from_warehouse_id: int = Query(..., ge=1, description="源库房 id"),
-    to_warehouse_id: int = Query(..., ge=1, description="目标库房 id"),
+    to_warehouse_id: int = Query(..., ge=1, description="对标库房 id"),
     service: TLService = Depends(get_tl_service),
 ):
     """删除 ``from_warehouse_id → to_warehouse_id`` 这一条边。"""
@@ -595,15 +606,19 @@ def get_warehouse_links_list(
     to_warehouse_id: Optional[int] = Query(
         None,
         ge=1,
-        description="仅目标库房 id 等于该值的边",
+        description="仅对标库房 id 等于该值的边",
     ),
     keyword: Optional[str] = Query(
         None,
         description="源或目标库房名称模糊匹配（可选）",
     ),
+    has_tier_price_spread: Optional[bool] = Query(
+        None,
+        description="true=仅已配置阶梯差价；false=仅未配置；不传=全部",
+    ),
     service: TLService = Depends(get_tl_service),
 ):
-    """每条记录包含源库房、目标库房摘要及关联 id；可与出边/入边列表接口配合使用。"""
+    """每条记录包含源库房、对标库房摘要及关联 id、距离千米、阶梯价差；可与出边/入边列表配合。"""
     try:
         return service.get_warehouse_links_list(
             page=page,
@@ -612,6 +627,54 @@ def get_warehouse_links_list(
             from_warehouse_id=from_warehouse_id,
             to_warehouse_id=to_warehouse_id,
             keyword=keyword,
+            has_tier_price_spread=has_tier_price_spread,
+        )
+    except ValueError as e:
+        raise _tl_value_error_http(e)
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/get_tier_price_spread_list", summary="查询阶梯差价列表")
+def get_tier_price_spread_list(
+    page: int = Query(1, ge=1),
+    size: int = Query(50, ge=1, le=200),
+    warehouse_id: Optional[int] = Query(
+        None,
+        description="涉及该库房 id 的关联（作为源或对标）；不传则不限定",
+    ),
+    from_warehouse_id: Optional[int] = Query(
+        None,
+        ge=1,
+        description="仅源库房 id 等于该值的边",
+    ),
+    to_warehouse_id: Optional[int] = Query(
+        None,
+        ge=1,
+        description="仅对标库房 id 等于该值的边",
+    ),
+    keyword: Optional[str] = Query(
+        None,
+        description="源或对标库房名称模糊匹配（可选）",
+    ),
+    has_tier_price_spread: Optional[bool] = Query(
+        None,
+        description="true=仅已配置阶梯差价；false=仅未配置；不传=全部",
+    ),
+    service: TLService = Depends(get_tl_service),
+):
+    """分页返回各边上的源库房、对标库房、距离千米、阶梯价差；筛选与 get_warehouse_links_list 一致。"""
+    try:
+        return service.get_tier_price_spread_list(
+            page=page,
+            size=size,
+            warehouse_id=warehouse_id,
+            from_warehouse_id=from_warehouse_id,
+            to_warehouse_id=to_warehouse_id,
+            keyword=keyword,
+            has_tier_price_spread=has_tier_price_spread,
         )
     except ValueError as e:
         raise _tl_value_error_http(e)
@@ -649,6 +712,26 @@ def get_warehouse_links_inbound(
     """分页返回以该库房为终点的全部有向边及源库房摘要。"""
     try:
         return service.get_warehouse_links_inbound(warehouse_id, page=page, size=size)
+    except ValueError as e:
+        raise _tl_value_error_http(e)
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.put("/update_warehouse_link_tier", summary="修改库房关联边上的阶梯价差")
+def update_warehouse_link_tier(
+    body: WarehouseLinkUpdateTierRequest,
+    service: TLService = Depends(get_tl_service),
+):
+    """修改源库房→对标库房边上的阶梯价差 JSON；传 null 清空。"""
+    try:
+        return service.update_warehouse_link_tier_price_spread(
+            body.源库房id,
+            body.对标库房id,
+            body.阶梯价差,
+        )
     except ValueError as e:
         raise _tl_value_error_http(e)
     except RuntimeError as e:
