@@ -20,7 +20,8 @@ class PromptBuilder:
         " JSON 必须可被 json.loads 解析，键名使用英文小写与下划线。"
         " 字段结构：{\"items\":[{\"target_date\":\"YYYY-MM-DD\",\"predicted_weight\":数字,"
         "\"confidence\":\"high|medium|low\",\"warnings\":[\"可选字符串\"]}]}。"
-        " predicted_weight 必须为非负数；若无把握请降低 confidence 并在 warnings 说明。"
+        " predicted_weight 每个目标日必须为大于 0 的数；历史有送货时禁止输出 0，"
+        "可贴近历史均值/近期水平；若无把握请降低 confidence 并在 warnings 说明。"
     )
 
     def analyze_history(self, points: list[PredictionHistoryPoint]) -> dict[str, Any]:
@@ -110,6 +111,7 @@ class PromptBuilder:
             f"历史统计: {stats}\n"
             f"最近历史记录（最多30笔）:\n{hist_lines or '（无）'}\n"
             "请为每个目标日期输出一条 items，target_date 必须与上述日期一致且为 YYYY-MM-DD。"
+            " 各日 predicted_weight 不得为 0（数据少时可取与历史均值相近的正数）。"
             " 若相邻日期预测波动可能很大，请在 warnings 标注可能原因。"
         )
 
