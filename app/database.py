@@ -427,6 +427,84 @@ TABLE_STATEMENTS = [
         INDEX idx_ip_audit_created (created_at)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='智能预测-操作审计';
     """,
+    # 省份「对标城市」定价历史（同一省份多条记录时默认取 price_date 最新，同日取 id 最大）
+    """
+    CREATE TABLE IF NOT EXISTS pd_province_benchmark_prices (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '主键',
+        province VARCHAR(64) NOT NULL COMMENT '省份（与 dict_warehouses.province 展示口径一致）',
+        benchmark_city VARCHAR(128) NOT NULL COMMENT '对标城市',
+        benchmark_price DECIMAL(18, 4) NOT NULL COMMENT '对标城市定价',
+        price_date DATE NOT NULL COMMENT '定价日期',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '上传时间',
+        INDEX idx_pbp_province_date (province, price_date)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='省份对标城市定价历史';
+    """,
+    # 冶炼厂标定价格历史（按厂+日期；当前有效取最新日期同日最大 id）
+    """
+    CREATE TABLE IF NOT EXISTS pd_smelter_calibration_prices (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '主键',
+        factory_id INT NOT NULL COMMENT '冶炼厂ID',
+        calibration_price DECIMAL(18, 4) NOT NULL COMMENT '标定价格',
+        price_date DATE NOT NULL COMMENT '定价日期',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '上传时间',
+        CONSTRAINT fk_scp_factory FOREIGN KEY (factory_id) REFERENCES dict_factories (id)
+            ON UPDATE CASCADE ON DELETE RESTRICT,
+        INDEX idx_scp_factory_date (factory_id, price_date)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='冶炼厂标定价格历史';
+    """,
+    # 库房对标城市差额与毛利（配置版），每库房一行
+    """
+    CREATE TABLE IF NOT EXISTS pd_warehouse_spread_configs (
+        id INT AUTO_INCREMENT PRIMARY KEY COMMENT '主键',
+        warehouse_id INT NOT NULL COMMENT '库房ID',
+        benchmark_city VARCHAR(128) NOT NULL DEFAULT '' COMMENT '对标城市（人工配置）',
+        city_spread DECIMAL(18, 4) NOT NULL DEFAULT 0.0000 COMMENT '对标城市差额（可负）',
+        gross_margin_config DECIMAL(18, 4) DEFAULT NULL COMMENT '毛利（配置版）',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        CONSTRAINT fk_wsc_wh FOREIGN KEY (warehouse_id) REFERENCES dict_warehouses (id)
+            ON UPDATE CASCADE ON DELETE CASCADE,
+        UNIQUE KEY uk_wsc_warehouse (warehouse_id),
+        INDEX idx_wsc_wh (warehouse_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='库房对标差额与毛利配置';
+    """,
+    # AI 定价对标分析快照头
+    """
+    CREATE TABLE IF NOT EXISTS pd_ai_pricing_snapshots (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '主键',
+        title VARCHAR(255) DEFAULT NULL COMMENT '快照标题',
+        as_of_date DATE DEFAULT NULL COMMENT '口径日期（解析基准价/运费的上限日）',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+        INDEX idx_aps_created (created_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='AI定价对标分析快照';
+    """,
+    # AI 定价对标分析快照明细（落库时固化各字段）
+    """
+    CREATE TABLE IF NOT EXISTS pd_ai_pricing_snapshot_items (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '主键',
+        snapshot_id BIGINT NOT NULL COMMENT '快照ID',
+        warehouse_id INT NOT NULL COMMENT '库房ID',
+        warehouse_name VARCHAR(100) NOT NULL DEFAULT '' COMMENT '库房名称',
+        province VARCHAR(64) DEFAULT NULL COMMENT '省',
+        city VARCHAR(64) DEFAULT NULL COMMENT '市',
+        district VARCHAR(64) DEFAULT NULL COMMENT '区',
+        benchmark_city VARCHAR(128) DEFAULT NULL COMMENT '对标城市（配置）',
+        benchmark_city_price DECIMAL(18, 4) DEFAULT NULL COMMENT '对标城市定价',
+        city_spread DECIMAL(18, 4) DEFAULT NULL COMMENT '对标城市差额',
+        gross_margin_config DECIMAL(18, 4) DEFAULT NULL COMMENT '毛利（配置版）',
+        calibration_price DECIMAL(18, 4) DEFAULT NULL COMMENT '冶炼厂标定价格（金利）',
+        freight DECIMAL(18, 4) DEFAULT NULL COMMENT '库房运费',
+        warehouse_price DECIMAL(18, 4) DEFAULT NULL COMMENT '库房定价=对标城市定价+对标城市差额',
+        gross_margin_computed DECIMAL(18, 4) DEFAULT NULL COMMENT '毛利（计算版）=标定-运费-库房定价',
+        remark TEXT DEFAULT NULL COMMENT '备注',
+        CONSTRAINT fk_apsi_snap FOREIGN KEY (snapshot_id) REFERENCES pd_ai_pricing_snapshots (id)
+            ON DELETE CASCADE ON UPDATE CASCADE,
+        CONSTRAINT fk_apsi_wh FOREIGN KEY (warehouse_id) REFERENCES dict_warehouses (id)
+            ON UPDATE CASCADE ON DELETE RESTRICT,
+        INDEX idx_apsi_snapshot (snapshot_id),
+        INDEX idx_apsi_wh (warehouse_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='AI定价对标分析快照明细';
+    """,
 ]
 
 
@@ -1029,6 +1107,101 @@ def ensure_ai_detection_history_stored_image_column() -> None:
         connection.close()
 
 
+def ensure_pd_pricing_benchmark_tables() -> None:
+    """旧库补建：对标定价 / 库房差额 / AI 分析快照等表（新建库已由 TABLE_STATEMENTS 创建）。"""
+    config_dict = get_mysql_config()
+    connection = pymysql.connect(**config_dict)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pd_province_benchmark_prices (
+                    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '主键',
+                    province VARCHAR(64) NOT NULL COMMENT '省份',
+                    benchmark_city VARCHAR(128) NOT NULL COMMENT '对标城市',
+                    benchmark_price DECIMAL(18, 4) NOT NULL COMMENT '对标城市定价',
+                    price_date DATE NOT NULL COMMENT '定价日期',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '上传时间',
+                    INDEX idx_pbp_province_date (province, price_date)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='省份对标城市定价历史';
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pd_smelter_calibration_prices (
+                    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '主键',
+                    factory_id INT NOT NULL COMMENT '冶炼厂ID',
+                    calibration_price DECIMAL(18, 4) NOT NULL COMMENT '标定价格',
+                    price_date DATE NOT NULL COMMENT '定价日期',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '上传时间',
+                    CONSTRAINT fk_scp_factory FOREIGN KEY (factory_id) REFERENCES dict_factories (id)
+                        ON UPDATE CASCADE ON DELETE RESTRICT,
+                    INDEX idx_scp_factory_date (factory_id, price_date)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='冶炼厂标定价格历史';
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pd_warehouse_spread_configs (
+                    id INT AUTO_INCREMENT PRIMARY KEY COMMENT '主键',
+                    warehouse_id INT NOT NULL COMMENT '库房ID',
+                    benchmark_city VARCHAR(128) NOT NULL DEFAULT '' COMMENT '对标城市',
+                    city_spread DECIMAL(18, 4) NOT NULL DEFAULT 0.0000 COMMENT '对标城市差额',
+                    gross_margin_config DECIMAL(18, 4) DEFAULT NULL COMMENT '毛利（配置版）',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    CONSTRAINT fk_wsc_wh FOREIGN KEY (warehouse_id) REFERENCES dict_warehouses (id)
+                        ON UPDATE CASCADE ON DELETE CASCADE,
+                    UNIQUE KEY uk_wsc_warehouse (warehouse_id),
+                    INDEX idx_wsc_wh (warehouse_id)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='库房对标差额与毛利配置';
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pd_ai_pricing_snapshots (
+                    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '主键',
+                    title VARCHAR(255) DEFAULT NULL COMMENT '快照标题',
+                    as_of_date DATE DEFAULT NULL COMMENT '口径日期',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+                    INDEX idx_aps_created (created_at)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='AI定价对标分析快照';
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pd_ai_pricing_snapshot_items (
+                    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '主键',
+                    snapshot_id BIGINT NOT NULL COMMENT '快照ID',
+                    warehouse_id INT NOT NULL COMMENT '库房ID',
+                    warehouse_name VARCHAR(100) NOT NULL DEFAULT '' COMMENT '库房名称',
+                    province VARCHAR(64) DEFAULT NULL COMMENT '省',
+                    city VARCHAR(64) DEFAULT NULL COMMENT '市',
+                    district VARCHAR(64) DEFAULT NULL COMMENT '区',
+                    benchmark_city VARCHAR(128) DEFAULT NULL COMMENT '对标城市',
+                    benchmark_city_price DECIMAL(18, 4) DEFAULT NULL COMMENT '对标城市定价',
+                    city_spread DECIMAL(18, 4) DEFAULT NULL COMMENT '对标城市差额',
+                    gross_margin_config DECIMAL(18, 4) DEFAULT NULL COMMENT '毛利（配置版）',
+                    calibration_price DECIMAL(18, 4) DEFAULT NULL COMMENT '冶炼厂标定价格',
+                    freight DECIMAL(18, 4) DEFAULT NULL COMMENT '库房运费',
+                    warehouse_price DECIMAL(18, 4) DEFAULT NULL COMMENT '库房定价',
+                    gross_margin_computed DECIMAL(18, 4) DEFAULT NULL COMMENT '毛利（计算版）',
+                    remark TEXT DEFAULT NULL COMMENT '备注',
+                    CONSTRAINT fk_apsi_snap FOREIGN KEY (snapshot_id) REFERENCES pd_ai_pricing_snapshots (id)
+                        ON DELETE CASCADE ON UPDATE CASCADE,
+                    CONSTRAINT fk_apsi_wh FOREIGN KEY (warehouse_id) REFERENCES dict_warehouses (id)
+                        ON UPDATE CASCADE ON DELETE RESTRICT,
+                    INDEX idx_apsi_snapshot (snapshot_id),
+                    INDEX idx_apsi_wh (warehouse_id)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='AI定价对标分析快照明细';
+                """
+            )
+        connection.commit()
+        logger.info("pd_* 对标定价相关表已就绪")
+    finally:
+        connection.close()
+
+
 def create_tables() -> None:
     create_database_if_not_exists()
     config_dict = get_mysql_config()
@@ -1105,6 +1278,10 @@ def create_tables() -> None:
         ensure_dict_warehouse_links_tier_price_spread_column()
     except Exception:
         logger.exception("检查/添加 dict_warehouse_links.tier_price_spread 失败")
+    try:
+        ensure_pd_pricing_benchmark_tables()
+    except Exception:
+        logger.exception("检查/创建 pd_* 对标定价相关表失败")
 
 
 def ensure_dict_warehouses_business_columns() -> None:

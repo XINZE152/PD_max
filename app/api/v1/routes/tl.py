@@ -45,6 +45,13 @@ TL比价模块路由
   7b.POST /tl/update_category_row      - 按行修改品类别名（改名/设主名称）
   7c.DELETE /tl/delete_category        - 删除品类分组（软删除）
   7d.DELETE /tl/delete_category_row    - 删除单条品类别名（软删除）
+  8. 对标定价 / 标定价格 / 库房差额 / AI 分析快照：
+      GET/POST/PUT/DELETE /tl/province_benchmark_prices — 省份对标城市定价历史
+      GET/POST/PUT/DELETE /tl/smelter_calibration_prices — 冶炼厂标定价格历史
+      GET/POST/PUT/DELETE /tl/warehouse_spread_configs — 库房对标差额与毛利配置
+      GET /tl/ai_pricing_analysis — 实时聚合分析（公式：库房定价=对标城市定价+差额；毛利计算版=标定−运费−库房定价）
+      GET/POST /tl/ai_pricing_snapshots、GET/PUT/DELETE /tl/ai_pricing_snapshots/{id} — 快照 CRUD
+      PUT/DELETE /tl/ai_pricing_snapshots/{id}/items/{item_id} — 明细备注/删除
 """
 import asyncio
 import io
@@ -58,6 +65,9 @@ from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Query, 
 from fastapi.responses import StreamingResponse
 
 from app.models.tl import (
+    AiPricingSnapshotCreate,
+    AiPricingSnapshotItemRemarkBody,
+    AiPricingSnapshotUpdate,
     BatchSmelterIdsRequest,
     BatchWarehouseIdsRequest,
     ComparisonRequest,
@@ -86,7 +96,13 @@ from app.models.tl import (
     VlmFullData,
     TaxRateItem,
     TaxRateUpsertRequest,
+    ProvinceBenchmarkPriceCreate,
+    ProvinceBenchmarkPriceUpdate,
     QuoteDetailsFilterRequest,
+    SmelterCalibrationPriceCreate,
+    SmelterCalibrationPriceUpdate,
+    WarehouseSpreadConfigCreate,
+    WarehouseSpreadConfigUpdate,
 )
 from app.services.partner_warehouse_excel import (
     PartnerWarehouseExcelError,
@@ -1628,6 +1644,376 @@ def delete_category_row(
 ):
     try:
         return service.delete_category_row(row_id=行id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ===================== 对标定价 / 标定价格 / 库房差额 / AI 分析快照 =====================
+
+
+@router.get("/province_benchmark_prices", summary="省份对标城市定价列表（含历史）")
+def province_benchmark_prices(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=500),
+    province: Optional[str] = Query(None, description="省份精确匹配"),
+    date_from: Optional[str] = Query(None, description="定价日起 YYYY-MM-DD"),
+    date_to: Optional[str] = Query(None, description="定价日止 YYYY-MM-DD"),
+    only_latest: bool = Query(
+        False,
+        description="为 true 时每省仅保留当前有效的一条（price_date 最大，同日 id 最大）",
+    ),
+    service: TLService = Depends(get_tl_service),
+):
+    try:
+        return service.list_province_benchmark_prices(
+            page=page,
+            page_size=page_size,
+            province=province,
+            date_from=date_from,
+            date_to=date_to,
+            only_latest=only_latest,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/province_benchmark_prices", summary="新增省份对标城市定价")
+def province_benchmark_prices_create(
+    body: ProvinceBenchmarkPriceCreate,
+    service: TLService = Depends(get_tl_service),
+):
+    try:
+        return service.create_province_benchmark_price(
+            province=body.省份,
+            benchmark_city=body.对标城市,
+            benchmark_price=body.对标城市定价,
+            price_date=body.定价日期,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.put("/province_benchmark_prices/{price_id}", summary="修改省份对标定价历史行")
+def province_benchmark_prices_update(
+    price_id: int,
+    body: ProvinceBenchmarkPriceUpdate,
+    service: TLService = Depends(get_tl_service),
+):
+    try:
+        patch = body.model_dump(exclude_unset=True)
+        return service.update_province_benchmark_price(
+            price_id,
+            province=patch.get("省份"),
+            benchmark_city=patch.get("对标城市"),
+            benchmark_price=patch.get("对标城市定价"),
+            price_date=patch.get("定价日期"),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/province_benchmark_prices/{price_id}", summary="删除省份对标定价历史行")
+def province_benchmark_prices_delete(
+    price_id: int,
+    service: TLService = Depends(get_tl_service),
+):
+    try:
+        return service.delete_province_benchmark_price(price_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/smelter_calibration_prices", summary="冶炼厂标定价格列表")
+def smelter_calibration_prices(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=500),
+    factory_id: Optional[int] = Query(None, description="冶炼厂 id"),
+    date_from: Optional[str] = Query(None),
+    date_to: Optional[str] = Query(None),
+    service: TLService = Depends(get_tl_service),
+):
+    try:
+        return service.list_smelter_calibration_prices(
+            page=page,
+            page_size=page_size,
+            factory_id=factory_id,
+            date_from=date_from,
+            date_to=date_to,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/smelter_calibration_prices", summary="新增冶炼厂标定价格")
+def smelter_calibration_prices_create(
+    body: SmelterCalibrationPriceCreate,
+    service: TLService = Depends(get_tl_service),
+):
+    try:
+        return service.create_smelter_calibration_price(
+            factory_id=body.冶炼厂id,
+            calibration_price=body.标定价格,
+            price_date=body.定价日期,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.put("/smelter_calibration_prices/{price_id}", summary="修改冶炼厂标定价格历史行")
+def smelter_calibration_prices_update(
+    price_id: int,
+    body: SmelterCalibrationPriceUpdate,
+    service: TLService = Depends(get_tl_service),
+):
+    try:
+        patch = body.model_dump(exclude_unset=True)
+        return service.update_smelter_calibration_price(
+            price_id,
+            factory_id=patch.get("冶炼厂id"),
+            calibration_price=patch.get("标定价格"),
+            price_date=patch.get("定价日期"),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/smelter_calibration_prices/{price_id}", summary="删除冶炼厂标定价格历史行")
+def smelter_calibration_prices_delete(
+    price_id: int,
+    service: TLService = Depends(get_tl_service),
+):
+    try:
+        return service.delete_smelter_calibration_price(price_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/warehouse_spread_configs", summary="库房对标差额与毛利配置列表")
+def warehouse_spread_configs(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=500),
+    warehouse_id: Optional[int] = Query(None, description="按库房 id 筛选"),
+    service: TLService = Depends(get_tl_service),
+):
+    try:
+        return service.list_warehouse_spread_configs(
+            page=page,
+            page_size=page_size,
+            warehouse_id=warehouse_id,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/warehouse_spread_configs", summary="新增库房对标差额配置")
+def warehouse_spread_configs_create(
+    body: WarehouseSpreadConfigCreate,
+    service: TLService = Depends(get_tl_service),
+):
+    try:
+        return service.create_warehouse_spread_config(
+            warehouse_id=body.库房id,
+            benchmark_city=body.对标城市,
+            city_spread=body.对标城市差额,
+            gross_margin_config=body.毛利配置版,
+        )
+    except ValueError as e:
+        if "已有配置" in str(e):
+            raise HTTPException(status_code=409, detail=str(e)) from e
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.put("/warehouse_spread_configs/{config_id}", summary="修改库房对标差额配置")
+def warehouse_spread_configs_update(
+    config_id: int,
+    body: WarehouseSpreadConfigUpdate,
+    service: TLService = Depends(get_tl_service),
+):
+    try:
+        patch = body.model_dump(exclude_unset=True)
+        return service.update_warehouse_spread_config(
+            config_id,
+            benchmark_city=patch.get("对标城市"),
+            city_spread=patch.get("对标城市差额"),
+            gross_margin_config=patch.get("毛利配置版"),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/warehouse_spread_configs/{config_id}", summary="删除库房对标差额配置")
+def warehouse_spread_configs_delete(
+    config_id: int,
+    service: TLService = Depends(get_tl_service),
+):
+    try:
+        return service.delete_warehouse_spread_config(config_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/ai_pricing_analysis", summary="库房 AI 定价对标分析（实时计算，不落库）")
+def ai_pricing_analysis(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=500),
+    as_of_date: Optional[str] = Query(
+        None,
+        description="口径日期 YYYY-MM-DD；解析对标价、标定价、运费时取该日及以前最新一条",
+    ),
+    warehouse_ids: Optional[List[int]] = Query(
+        None,
+        description="仅分析列出的库房 id；可重复 query 参数",
+    ),
+    service: TLService = Depends(get_tl_service),
+):
+    try:
+        return service.get_ai_pricing_analysis(
+            page=page,
+            page_size=page_size,
+            warehouse_ids=warehouse_ids,
+            as_of_date=as_of_date,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/ai_pricing_snapshots", summary="生成 AI 定价对标分析快照")
+def ai_pricing_snapshots_create(
+    body: AiPricingSnapshotCreate,
+    service: TLService = Depends(get_tl_service),
+):
+    try:
+        return service.create_ai_pricing_snapshot(
+            title=body.标题,
+            as_of_date=body.口径日期,
+            warehouse_ids=body.库房id列表,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/ai_pricing_snapshots", summary="AI 定价对标分析快照列表")
+def ai_pricing_snapshots_list(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=200),
+    service: TLService = Depends(get_tl_service),
+):
+    try:
+        return service.list_ai_pricing_snapshots(page=page, page_size=page_size)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/ai_pricing_snapshots/{snapshot_id}", summary="快照详情（含明细）")
+def ai_pricing_snapshots_detail(
+    snapshot_id: int,
+    service: TLService = Depends(get_tl_service),
+):
+    try:
+        return service.get_ai_pricing_snapshot_detail(snapshot_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.put("/ai_pricing_snapshots/{snapshot_id}", summary="更新快照元数据")
+def ai_pricing_snapshots_update_meta(
+    snapshot_id: int,
+    body: AiPricingSnapshotUpdate,
+    service: TLService = Depends(get_tl_service),
+):
+    try:
+        patch = body.model_dump(exclude_unset=True)
+        return service.update_ai_pricing_snapshot(
+            snapshot_id,
+            title=patch.get("标题"),
+            as_of_date=patch.get("口径日期"),
+            _set_title=("标题" in patch),
+            _set_as_of_date=("口径日期" in patch),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/ai_pricing_snapshots/{snapshot_id}", summary="删除快照（级联删明细）")
+def ai_pricing_snapshots_delete(
+    snapshot_id: int,
+    service: TLService = Depends(get_tl_service),
+):
+    try:
+        return service.delete_ai_pricing_snapshot(snapshot_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.put(
+    "/ai_pricing_snapshots/{snapshot_id}/items/{item_id}",
+    summary="修改快照明细备注",
+)
+def ai_pricing_snapshots_item_update_remark(
+    snapshot_id: int,
+    item_id: int,
+    body: AiPricingSnapshotItemRemarkBody,
+    service: TLService = Depends(get_tl_service),
+):
+    try:
+        return service.update_ai_pricing_snapshot_item_remark(
+            snapshot_id, item_id, body.备注
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete(
+    "/ai_pricing_snapshots/{snapshot_id}/items/{item_id}",
+    summary="删除快照明细行",
+)
+def ai_pricing_snapshots_item_delete(
+    snapshot_id: int,
+    item_id: int,
+    service: TLService = Depends(get_tl_service),
+):
+    try:
+        return service.delete_ai_pricing_snapshot_item(snapshot_id, item_id)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:

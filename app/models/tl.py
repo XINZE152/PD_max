@@ -799,3 +799,102 @@ class BatchSmelterIdsRequest(BaseModel):
     """批量停用冶炼厂（软删除）"""
 
     冶炼厂id列表: List[int] = Field(..., min_length=1, description="冶炼厂主键列表")
+
+
+# ---------- 对标定价 / 标定价格 / 库房差额 / AI 分析快照 ----------
+
+
+class ProvinceBenchmarkPriceCreate(BaseModel):
+    """新增省份对标城市定价"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    省份: str = Field(..., description="省份名称")
+    对标城市: str = Field(..., description="对标城市")
+    对标城市定价: float = Field(..., description="对标城市定价")
+    定价日期: Optional[str] = Field(None, description="YYYY-MM-DD，默认当天（QUOTE_COMPARISON_TZ）")
+
+
+class ProvinceBenchmarkPriceUpdate(BaseModel):
+    """修改某条省份对标定价历史"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    省份: Optional[str] = None
+    对标城市: Optional[str] = None
+    对标城市定价: Optional[float] = None
+    定价日期: Optional[str] = None
+
+
+class SmelterCalibrationPriceCreate(BaseModel):
+    """新增冶炼厂标定价格"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    冶炼厂id: int = Field(..., ge=1, description="dict_factories.id")
+    标定价格: float = Field(..., description="标定价格")
+    定价日期: Optional[str] = Field(None, description="YYYY-MM-DD，默认当天")
+
+
+class SmelterCalibrationPriceUpdate(BaseModel):
+    """修改冶炼厂标定价格历史记录"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    冶炼厂id: Optional[int] = Field(None, ge=1)
+    标定价格: Optional[float] = None
+    定价日期: Optional[str] = None
+
+
+class WarehouseSpreadConfigCreate(BaseModel):
+    """新增库房对标差额与毛利配置（每库房一行）"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    库房id: int = Field(..., ge=1)
+    对标城市: str = Field("", description="对标城市（人工配置）")
+    对标城市差额: float = Field(0, description="可正可负")
+    毛利配置版: Optional[float] = Field(None, description="毛利（配置版），可选")
+
+
+class WarehouseSpreadConfigUpdate(BaseModel):
+    """修改库房对标差额配置"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    对标城市: Optional[str] = None
+    对标城市差额: Optional[float] = None
+    毛利配置版: Optional[float] = None
+
+
+class AiPricingSnapshotCreate(BaseModel):
+    """生成 AI 定价对标分析快照"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    标题: Optional[str] = Field(None, description="快照标题")
+    口径日期: Optional[str] = Field(
+        None,
+        description="解析省份对标价、标定价、运费的截止日期 YYYY-MM-DD；默认当天",
+    )
+    库房id列表: Optional[List[int]] = Field(
+        None,
+        description="仅纳入列出的启用库房；省略则纳入全部启用库房",
+    )
+
+
+class AiPricingSnapshotUpdate(BaseModel):
+    """更新快照元数据（不重算明细）"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    标题: Optional[str] = None
+    口径日期: Optional[str] = Field(None, description="设为 null 可清空：传 JSON null")
+
+
+class AiPricingSnapshotItemRemarkBody(BaseModel):
+    """快照明细备注"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    备注: Optional[str] = None

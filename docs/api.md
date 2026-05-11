@@ -887,6 +887,33 @@ file: [报价单1.jpg]
 
 ---
 
+## 对标定价 / 标定价格 / 库房差额 / AI 分析快照（TL）
+
+前缀均为 `/tl`。默认日期与 TL 比价一致：环境变量 **`QUOTE_COMPARISON_TZ`**（默认 `Asia/Shanghai`）。分析接口依赖字典中存在名称为 **「金利」** 的冶炼厂（`dict_factories.name`）。
+
+### 计算公式（实时分析与快照生成一致）
+
+- **库房定价** = 对标城市定价 + 对标城市差额（差额来自库房配置 `pd_warehouse_spread_configs`；无配置则无差额参与合成）
+- **毛利（计算版）** = 冶炼厂标定价格（金利最新标定） − 库房运费 − 库房定价
+
+**库房运费**：优先 `freight_rates` 中（金利、`warehouse_id`）在口径日及以前的最新 `price_per_ton`；否则回退 `dict_warehouses.freight_amount`。
+
+### 主要路由（详见 Swagger `/docs`）
+
+| 说明 | 方法 | 路径 |
+|------|------|------|
+| 省份对标定价列表 | GET | `/tl/province_benchmark_prices` |
+| 新增 / 改 / 删省份对标定价 | POST、PUT、DELETE | `/tl/province_benchmark_prices`、`/tl/province_benchmark_prices/{price_id}` |
+| 冶炼厂标定价格 CRUD | GET/POST/PUT/DELETE | `/tl/smelter_calibration_prices`、`.../{price_id}` |
+| 库房差额与毛利配置 CRUD | GET/POST/PUT/DELETE | `/tl/warehouse_spread_configs`、`.../{config_id}` |
+| 实时 AI 对标分析（不落库） | GET | `/tl/ai_pricing_analysis` |
+| 快照列表 / 创建 / 详情 / 更新元数据 / 删除 | GET/POST/PUT/DELETE | `/tl/ai_pricing_snapshots`、`/tl/ai_pricing_snapshots/{snapshot_id}` |
+| 快照明细备注 / 删除明细 | PUT/DELETE | `/tl/ai_pricing_snapshots/{snapshot_id}/items/{item_id}` |
+
+响应与其它 TL 接口一致时多为 `{ "code": 200, "data": ... }`；列表内含 `total`、`list`、`page` 等分页字段。数据库表说明见 **[数据库文档.md](./数据库文档.md)**。
+
+---
+
 ## 补充说明
 1. 所有JSON中的 `code: 200` 为通用成功状态码
 2. 需登录的接口请求头须携带 `Authorization: Bearer <token>`

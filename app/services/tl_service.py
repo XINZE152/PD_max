@@ -5542,6 +5542,968 @@ class TLService:
 
         return {"code": 200, "data": {"suggestion": suggestion, "raw": raw}}
 
+    # ==================== 对标定价 / 标定价格 / 库房差额 / AI 分析快照 ====================
+
+    def _pricing_calendar_date(self) -> date:
+        tz_name = (os.getenv("QUOTE_COMPARISON_TZ") or "Asia/Shanghai").strip() or "Asia/Shanghai"
+        try:
+            from zoneinfo import ZoneInfo
+
+            return datetime.now(ZoneInfo(tz_name)).date()
+        except Exception:
+            return datetime.utcnow().date()
+
+    def _jinli_factory_id(self, cur) -> int:
+        cur.execute(
+            "SELECT id FROM dict_factories WHERE name = %s AND is_active = 1 LIMIT 1",
+            ("金利",),
+        )
+        row = cur.fetchone()
+        if not row:
+            cur.execute("SELECT id FROM dict_factories WHERE name = %s LIMIT 1", ("金利",))
+            row = cur.fetchone()
+        if not row:
+            raise ValueError("字典中不存在名称为「金利」的冶炼厂，请先添加冶炼厂")
+        return int(row[0])
+
+    def _latest_province_benchmark_row(
+        self, cur, province: Optional[str], as_of: date
+    ) -> Optional[Dict[str, Any]]:
+        pv = _strip_nonempty(province) if province else None
+        if not pv:
+            return None
+        cur.execute(
+            """
+            SELECT benchmark_city, benchmark_price, price_date, id
+            FROM pd_province_benchmark_prices
+            WHERE TRIM(province) = %s AND price_date <= %s
+            ORDER BY price_date DESC, id DESC
+            LIMIT 1
+            """,
+            (pv.strip(), as_of),
+        )
+        r = cur.fetchone()
+        if not r:
+            return None
+        return {
+            "benchmark_city": r[0],
+            "benchmark_price": r[1],
+            "price_date": r[2],
+            "id": r[3],
+        }
+
+    def _latest_smelter_calibration_price(
+        self, cur, factory_id: int, as_of: date
+    ) -> Optional[Decimal]:
+        cur.execute(
+            """
+            SELECT calibration_price
+            FROM pd_smelter_calibration_prices
+            WHERE factory_id = %s AND price_date <= %s
+            ORDER BY price_date DESC, id DESC
+            LIMIT 1
+            """,
+            (factory_id, as_of),
+        )
+        row = cur.fetchone()
+        if not row or row[0] is None:
+            return None
+        return Decimal(str(row[0]))
+
+    def _resolve_freight_jinli_warehouse(
+        self, cur, jinli_id: int, warehouse_id: int, as_of: date
+    ) -> Optional[Decimal]:
+        cur.execute(
+            """
+            SELECT price_per_ton
+            FROM freight_rates
+            WHERE factory_id = %s AND warehouse_id = %s AND effective_date <= %s
+            ORDER BY effective_date DESC, id DESC
+            LIMIT 1
+            """,
+            (jinli_id, warehouse_id, as_of),
+        )
+        row = cur.fetchone()
+        if row and row[0] is not None:
+            return Decimal(str(row[0]))
+        cur.execute(
+            "SELECT freight_amount FROM dict_warehouses WHERE id = %s",
+            (warehouse_id,),
+        )
+        row2 = cur.fetchone()
+        if row2 and row2[0] is not None:
+            return Decimal(str(row2[0]))
+        return None
+
+    def _compute_ai_pricing_core(
+        self,
+        cur,
+        *,
+        warehouse_id: int,
+        warehouse_name: str,
+        province: Optional[str],
+        city: Optional[str],
+        district: Optional[str],
+        jinli_id: int,
+        as_of: date,
+    ) -> Dict[str, Any]:
+        bench = self._latest_province_benchmark_row(cur, province, as_of)
+        bench_city_p = bench["benchmark_city"] if bench else None
+        bench_price = (
+            Decimal(str(bench["benchmark_price"]))
+            if bench and bench["benchmark_price"] is not None
+            else None
+        )
+
+        cur.execute(
+            "SELECT benchmark_city, city_spread, gross_margin_config "
+            "FROM pd_warehouse_spread_configs WHERE warehouse_id = %s",
+            (warehouse_id,),
+        )
+        cfg = cur.fetchone()
+        cfg_benchmark_city = None
+        spread_dec: Optional[Decimal] = None
+        gmc: Optional[Decimal] = None
+        if cfg:
+            cfg_benchmark_city = (cfg[0] or "").strip() or None
+            spread_dec = Decimal(str(cfg[1])) if cfg[1] is not None else None
+            gmc = Decimal(str(cfg[2])) if cfg[2] is not None else None
+
+        display_benchmark_city = cfg_benchmark_city or bench_city_p
+
+        cal_price = self._latest_smelter_calibration_price(cur, jinli_id, as_of)
+        freight = self._resolve_freight_jinli_warehouse(cur, jinli_id, warehouse_id, as_of)
+
+        wh_price: Optional[Decimal] = None
+        if bench_price is not None and spread_dec is not None:
+            wh_price = bench_price + spread_dec
+
+        gm_comp: Optional[Decimal] = None
+        if cal_price is not None and freight is not None and wh_price is not None:
+            gm_comp = cal_price - freight - wh_price
+
+        return {
+            "库房id": warehouse_id,
+            "库房名称": warehouse_name or "",
+            "库房省份": _strip_nonempty(province) or "",
+            "库房城市": _strip_nonempty(city) or "",
+            "库房区": _strip_nonempty(district) or "",
+            "对标城市": display_benchmark_city or "",
+            "冶炼厂标定价格": cal_price,
+            "库房运费": freight,
+            "对标城市差额": spread_dec,
+            "毛利（配置版）": gmc,
+            "库房定价": wh_price,
+            "毛利（计算版）": gm_comp,
+            "对标城市定价": bench_price,
+        }
+
+    def _compute_ai_pricing_fields(
+        self,
+        cur,
+        *,
+        warehouse_id: int,
+        warehouse_name: str,
+        province: Optional[str],
+        city: Optional[str],
+        district: Optional[str],
+        jinli_id: int,
+        as_of: date,
+    ) -> Dict[str, Any]:
+        raw = self._compute_ai_pricing_core(
+            cur,
+            warehouse_id=warehouse_id,
+            warehouse_name=warehouse_name,
+            province=province,
+            city=city,
+            district=district,
+            jinli_id=jinli_id,
+            as_of=as_of,
+        )
+        return {
+            "库房id": raw["库房id"],
+            "库房名称": raw["库房名称"],
+            "库房省份": raw["库房省份"],
+            "库房城市": raw["库房城市"],
+            "库房区": raw["库房区"],
+            "对标城市": raw["对标城市"],
+            "冶炼厂标定价格": _cell_json(raw["冶炼厂标定价格"]),
+            "库房运费": _cell_json(raw["库房运费"]),
+            "对标城市差额": _cell_json(raw["对标城市差额"]),
+            "毛利（配置版）": _cell_json(raw["毛利（配置版）"]),
+            "库房定价": _cell_json(raw["库房定价"]),
+            "毛利（计算版）": _cell_json(raw["毛利（计算版）"]),
+            "对标城市定价": _cell_json(raw["对标城市定价"]),
+        }
+
+    def list_province_benchmark_prices(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 20,
+        province: Optional[str] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+        only_latest: bool = False,
+    ) -> Dict[str, Any]:
+        if page < 1:
+            raise ValueError("page 必须 >= 1")
+        page_size = min(max(page_size, 1), 500)
+        d_from: Optional[date] = None
+        d_to: Optional[date] = None
+        if date_from:
+            d_from = date.fromisoformat(str(date_from).strip())
+        if date_to:
+            d_to = date.fromisoformat(str(date_to).strip())
+        if d_from and d_to and d_from > d_to:
+            raise ValueError("date_from 不能晚于 date_to")
+
+        conditions: List[str] = ["1=1"]
+        params: List[Any] = []
+        if province and str(province).strip():
+            conditions.append("TRIM(p.province) = %s")
+            params.append(str(province).strip())
+        if d_from is not None:
+            conditions.append("p.price_date >= %s")
+            params.append(d_from)
+        if d_to is not None:
+            conditions.append("p.price_date <= %s")
+            params.append(d_to)
+
+        where_sql = " AND ".join(conditions)
+        latest_filter = ""
+        if only_latest:
+            latest_filter = (
+                " AND p.id IN ("
+                "SELECT MAX(p1.id) FROM pd_province_benchmark_prices p1 "
+                "INNER JOIN ("
+                "  SELECT TRIM(province) AS pv, MAX(price_date) AS md "
+                "  FROM pd_province_benchmark_prices GROUP BY TRIM(province)"
+                ") t ON TRIM(p1.province) = t.pv AND p1.price_date = t.md "
+                "GROUP BY TRIM(p1.province))"
+            )
+
+        offset = (page - 1) * page_size
+        base = (
+            f"FROM pd_province_benchmark_prices p WHERE {where_sql} {latest_filter}"
+        )
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(f"SELECT COUNT(*) {base}", tuple(params))
+                    total = cur.fetchone()[0]
+
+                    cur.execute(
+                        f"""
+                        SELECT p.id, p.province, p.benchmark_city, p.benchmark_price,
+                               p.price_date, p.created_at,
+                               CASE WHEN p.id = (
+                                   SELECT p2.id FROM pd_province_benchmark_prices p2
+                                   WHERE TRIM(p2.province) = TRIM(p.province)
+                                   ORDER BY p2.price_date DESC, p2.id DESC LIMIT 1
+                               ) THEN 1 ELSE 0 END AS is_latest
+                        {base}
+                        ORDER BY TRIM(p.province) ASC, p.price_date DESC, p.id DESC
+                        LIMIT %s OFFSET %s
+                        """,
+                        tuple(params) + (page_size, offset),
+                    )
+                    rows_out: List[Dict[str, Any]] = []
+                    for r in cur.fetchall():
+                        rows_out.append(
+                            {
+                                "id": r[0],
+                                "省份": r[1],
+                                "对标城市": r[2],
+                                "对标城市定价": _cell_json(r[3]),
+                                "定价日期": r[4].isoformat() if r[4] else None,
+                                "上传时间": r[5].isoformat() if r[5] else None,
+                                "是否当前省份最新": bool(r[6]),
+                            }
+                        )
+            return {"code": 200, "data": {"total": total, "list": rows_out, "page": page, "page_size": page_size}}
+        except ValueError:
+            raise
+        except Exception as e:
+            logger.error("list_province_benchmark_prices: %s", e)
+            raise
+
+    def create_province_benchmark_price(
+        self,
+        *,
+        province: str,
+        benchmark_city: str,
+        benchmark_price: Any,
+        price_date: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        pv = _strip_nonempty(province)
+        bc = _strip_nonempty(benchmark_city)
+        if not pv or not bc:
+            raise ValueError("省份、对标城市不能为空")
+        pd_day = self._pricing_calendar_date()
+        if price_date and str(price_date).strip():
+            pd_day = date.fromisoformat(str(price_date).strip())
+        bp = Decimal(str(benchmark_price))
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO pd_province_benchmark_prices
+                    (province, benchmark_city, benchmark_price, price_date)
+                    VALUES (%s, %s, %s, %s)
+                    """,
+                    (pv, bc, bp, pd_day),
+                )
+                new_id = cur.lastrowid
+        return {"code": 200, "msg": "已新增省份对标定价", "data": {"id": new_id}}
+
+    def update_province_benchmark_price(
+        self,
+        price_id: int,
+        *,
+        province: Optional[str] = None,
+        benchmark_city: Optional[str] = None,
+        benchmark_price: Any = None,
+        price_date: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        if price_id < 1:
+            raise ValueError("id 无效")
+        updates: List[str] = []
+        params: List[Any] = []
+        if province is not None:
+            pv = _strip_nonempty(province)
+            if not pv:
+                raise ValueError("省份不能为空")
+            updates.append("province = %s")
+            params.append(pv)
+        if benchmark_city is not None:
+            bc = _strip_nonempty(benchmark_city)
+            if not bc:
+                raise ValueError("对标城市不能为空")
+            updates.append("benchmark_city = %s")
+            params.append(bc)
+        if benchmark_price is not None:
+            updates.append("benchmark_price = %s")
+            params.append(Decimal(str(benchmark_price)))
+        if price_date is not None and str(price_date).strip():
+            updates.append("price_date = %s")
+            params.append(date.fromisoformat(str(price_date).strip()))
+        if not updates:
+            raise ValueError("无修改字段")
+        params.append(price_id)
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"UPDATE pd_province_benchmark_prices SET {', '.join(updates)} WHERE id = %s",
+                    tuple(params),
+                )
+                if cur.rowcount == 0:
+                    raise ValueError("记录不存在")
+        return {"code": 200, "msg": "已更新省份对标定价"}
+
+    def delete_province_benchmark_price(self, price_id: int) -> Dict[str, Any]:
+        if price_id < 1:
+            raise ValueError("id 无效")
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM pd_province_benchmark_prices WHERE id = %s", (price_id,))
+                if cur.rowcount == 0:
+                    raise ValueError("记录不存在")
+        return {"code": 200, "msg": "已删除省份对标定价"}
+
+    def list_smelter_calibration_prices(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 20,
+        factory_id: Optional[int] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        if page < 1:
+            raise ValueError("page 必须 >= 1")
+        page_size = min(max(page_size, 1), 500)
+        d_from: Optional[date] = None
+        d_to: Optional[date] = None
+        if date_from:
+            d_from = date.fromisoformat(str(date_from).strip())
+        if date_to:
+            d_to = date.fromisoformat(str(date_to).strip())
+
+        conditions: List[str] = ["1=1"]
+        params: List[Any] = []
+        if factory_id is not None:
+            conditions.append("p.factory_id = %s")
+            params.append(int(factory_id))
+        if d_from is not None:
+            conditions.append("p.price_date >= %s")
+            params.append(d_from)
+        if d_to is not None:
+            conditions.append("p.price_date <= %s")
+            params.append(d_to)
+        where_sql = " AND ".join(conditions)
+        offset = (page - 1) * page_size
+        base = (
+            "FROM pd_smelter_calibration_prices p "
+            "JOIN dict_factories df ON df.id = p.factory_id "
+            f"WHERE {where_sql}"
+        )
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT COUNT(*) {base}", tuple(params))
+                total = cur.fetchone()[0]
+                cur.execute(
+                    f"""
+                    SELECT p.id, df.name, p.factory_id, p.calibration_price, p.price_date, p.created_at,
+                           CASE WHEN p.id = (
+                               SELECT p2.id FROM pd_smelter_calibration_prices p2
+                               WHERE p2.factory_id = p.factory_id
+                               ORDER BY p2.price_date DESC, p2.id DESC LIMIT 1
+                           ) THEN 1 ELSE 0 END
+                    {base}
+                    ORDER BY p.factory_id ASC, p.price_date DESC, p.id DESC
+                    LIMIT %s OFFSET %s
+                    """,
+                    tuple(params) + (page_size, offset),
+                )
+                rows_out = []
+                for r in cur.fetchall():
+                    rows_out.append(
+                        {
+                            "id": r[0],
+                            "冶炼厂": r[1],
+                            "冶炼厂id": r[2],
+                            "标定价格": _cell_json(r[3]),
+                            "定价日期": r[4].isoformat() if r[4] else None,
+                            "上传时间": r[5].isoformat() if r[5] else None,
+                            "是否当前冶炼厂最新": bool(r[6]),
+                        }
+                    )
+        return {"code": 200, "data": {"total": total, "list": rows_out, "page": page, "page_size": page_size}}
+
+    def create_smelter_calibration_price(
+        self,
+        *,
+        factory_id: int,
+        calibration_price: Any,
+        price_date: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        if factory_id < 1:
+            raise ValueError("冶炼厂 id 无效")
+        pd_day = self._pricing_calendar_date()
+        if price_date and str(price_date).strip():
+            pd_day = date.fromisoformat(str(price_date).strip())
+        cp = Decimal(str(calibration_price))
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id FROM dict_factories WHERE id = %s",
+                    (factory_id,),
+                )
+                if not cur.fetchone():
+                    raise ValueError("冶炼厂不存在")
+                cur.execute(
+                    """
+                    INSERT INTO pd_smelter_calibration_prices (factory_id, calibration_price, price_date)
+                    VALUES (%s, %s, %s)
+                    """,
+                    (factory_id, cp, pd_day),
+                )
+                new_id = cur.lastrowid
+        return {"code": 200, "msg": "已新增冶炼厂标定价格", "data": {"id": new_id}}
+
+    def update_smelter_calibration_price(
+        self,
+        price_id: int,
+        *,
+        factory_id: Optional[int] = None,
+        calibration_price: Any = None,
+        price_date: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        if price_id < 1:
+            raise ValueError("id 无效")
+        updates: List[str] = []
+        params: List[Any] = []
+        if factory_id is not None:
+            updates.append("factory_id = %s")
+            params.append(int(factory_id))
+        if calibration_price is not None:
+            updates.append("calibration_price = %s")
+            params.append(Decimal(str(calibration_price)))
+        if price_date is not None and str(price_date).strip():
+            updates.append("price_date = %s")
+            params.append(date.fromisoformat(str(price_date).strip()))
+        if not updates:
+            raise ValueError("无修改字段")
+        params.append(price_id)
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                if factory_id is not None:
+                    cur.execute("SELECT id FROM dict_factories WHERE id = %s", (factory_id,))
+                    if not cur.fetchone():
+                        raise ValueError("冶炼厂不存在")
+                cur.execute(
+                    f"UPDATE pd_smelter_calibration_prices SET {', '.join(updates)} WHERE id = %s",
+                    tuple(params),
+                )
+                if cur.rowcount == 0:
+                    raise ValueError("记录不存在")
+        return {"code": 200, "msg": "已更新冶炼厂标定价格"}
+
+    def delete_smelter_calibration_price(self, price_id: int) -> Dict[str, Any]:
+        if price_id < 1:
+            raise ValueError("id 无效")
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM pd_smelter_calibration_prices WHERE id = %s", (price_id,))
+                if cur.rowcount == 0:
+                    raise ValueError("记录不存在")
+        return {"code": 200, "msg": "已删除冶炼厂标定价格"}
+
+    def list_warehouse_spread_configs(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 20,
+        warehouse_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        if page < 1:
+            raise ValueError("page 必须 >= 1")
+        page_size = min(max(page_size, 1), 500)
+        conditions: List[str] = ["1=1"]
+        params: List[Any] = []
+        if warehouse_id is not None:
+            conditions.append("wsc.warehouse_id = %s")
+            params.append(int(warehouse_id))
+        where_sql = " AND ".join(conditions)
+        offset = (page - 1) * page_size
+        base = (
+            "FROM pd_warehouse_spread_configs wsc "
+            "JOIN dict_warehouses dw ON dw.id = wsc.warehouse_id "
+            f"WHERE {where_sql}"
+        )
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT COUNT(*) {base}", tuple(params))
+                total = cur.fetchone()[0]
+                cur.execute(
+                    f"""
+                    SELECT wsc.id, wsc.warehouse_id, dw.name, dw.province, dw.city,
+                           wsc.benchmark_city, wsc.city_spread, wsc.gross_margin_config,
+                           wsc.created_at, wsc.updated_at
+                    {base}
+                    ORDER BY wsc.id DESC
+                    LIMIT %s OFFSET %s
+                    """,
+                    tuple(params) + (page_size, offset),
+                )
+                rows_out = []
+                for r in cur.fetchall():
+                    rows_out.append(
+                        {
+                            "id": r[0],
+                            "库房id": r[1],
+                            "库房名称": r[2],
+                            "库房省份": r[3] or "",
+                            "库房城市": r[4] or "",
+                            "对标城市": r[5] or "",
+                            "对标城市差额": _cell_json(r[6]),
+                            "毛利（配置版）": _cell_json(r[7]),
+                            "创建时间": r[8].isoformat() if r[8] else None,
+                            "更新时间": r[9].isoformat() if r[9] else None,
+                        }
+                    )
+        return {"code": 200, "data": {"total": total, "list": rows_out, "page": page, "page_size": page_size}}
+
+    def create_warehouse_spread_config(
+        self,
+        *,
+        warehouse_id: int,
+        benchmark_city: str,
+        city_spread: Any,
+        gross_margin_config: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        if warehouse_id < 1:
+            raise ValueError("库房 id 无效")
+        bc = (benchmark_city or "").strip()
+        sp = Decimal(str(city_spread))
+        gmc = None
+        if gross_margin_config is not None and str(gross_margin_config).strip() != "":
+            gmc = Decimal(str(gross_margin_config))
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM dict_warehouses WHERE id = %s", (warehouse_id,))
+                if not cur.fetchone():
+                    raise ValueError("库房不存在")
+                try:
+                    cur.execute(
+                        """
+                        INSERT INTO pd_warehouse_spread_configs
+                        (warehouse_id, benchmark_city, city_spread, gross_margin_config)
+                        VALUES (%s, %s, %s, %s)
+                        """,
+                        (warehouse_id, bc, sp, gmc),
+                    )
+                    new_id = cur.lastrowid
+                except PyMySQLIntegrityError:
+                    raise ValueError("该库房已有配置，请使用更新接口") from None
+        return {"code": 200, "msg": "已新增库房差额配置", "data": {"id": new_id}}
+
+    def update_warehouse_spread_config(
+        self,
+        config_id: int,
+        *,
+        benchmark_city: Optional[str] = None,
+        city_spread: Any = None,
+        gross_margin_config: Any = None,
+    ) -> Dict[str, Any]:
+        if config_id < 1:
+            raise ValueError("id 无效")
+        updates: List[str] = []
+        params: List[Any] = []
+        if benchmark_city is not None:
+            updates.append("benchmark_city = %s")
+            params.append((benchmark_city or "").strip())
+        if city_spread is not None:
+            updates.append("city_spread = %s")
+            params.append(Decimal(str(city_spread)))
+        if gross_margin_config is not None:
+            if str(gross_margin_config).strip() == "":
+                updates.append("gross_margin_config = %s")
+                params.append(None)
+            else:
+                updates.append("gross_margin_config = %s")
+                params.append(Decimal(str(gross_margin_config)))
+        if not updates:
+            raise ValueError("无修改字段")
+        params.append(config_id)
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"UPDATE pd_warehouse_spread_configs SET {', '.join(updates)} WHERE id = %s",
+                    tuple(params),
+                )
+                if cur.rowcount == 0:
+                    raise ValueError("记录不存在")
+        return {"code": 200, "msg": "已更新库房差额配置"}
+
+    def delete_warehouse_spread_config(self, config_id: int) -> Dict[str, Any]:
+        if config_id < 1:
+            raise ValueError("id 无效")
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM pd_warehouse_spread_configs WHERE id = %s", (config_id,))
+                if cur.rowcount == 0:
+                    raise ValueError("记录不存在")
+        return {"code": 200, "msg": "已删除库房差额配置"}
+
+    def get_ai_pricing_analysis(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 50,
+        warehouse_ids: Optional[List[int]] = None,
+        as_of_date: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        if page < 1:
+            raise ValueError("page 必须 >= 1")
+        page_size = min(max(page_size, 1), 500)
+        as_of = self._pricing_calendar_date()
+        if as_of_date and str(as_of_date).strip():
+            as_of = date.fromisoformat(str(as_of_date).strip())
+
+        cond_wh = "dw.is_active = 1"
+        params_ls: List[Any] = []
+        if warehouse_ids:
+            placeholders = ",".join(["%s"] * len(warehouse_ids))
+            cond_wh += f" AND dw.id IN ({placeholders})"
+            params_ls.extend(int(x) for x in warehouse_ids)
+
+        offset = (page - 1) * page_size
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                jinli_id = self._jinli_factory_id(cur)
+                cur.execute(f"SELECT COUNT(*) FROM dict_warehouses dw WHERE {cond_wh}", tuple(params_ls))
+                total = cur.fetchone()[0]
+                cur.execute(
+                    f"""
+                    SELECT dw.id, dw.name, dw.province, dw.city, dw.district
+                    FROM dict_warehouses dw
+                    WHERE {cond_wh}
+                    ORDER BY dw.id ASC
+                    LIMIT %s OFFSET %s
+                    """,
+                    tuple(params_ls) + (page_size, offset),
+                )
+                wh_rows = cur.fetchall()
+                rows_out: List[Dict[str, Any]] = []
+                for wr in wh_rows:
+                    row_dict = self._compute_ai_pricing_fields(
+                        cur,
+                        warehouse_id=int(wr[0]),
+                        warehouse_name=str(wr[1] or ""),
+                        province=wr[2],
+                        city=wr[3],
+                        district=wr[4],
+                        jinli_id=jinli_id,
+                        as_of=as_of,
+                    )
+                    row_dict["口径日期"] = as_of.isoformat()
+                    rows_out.append(row_dict)
+
+        return {
+            "code": 200,
+            "data": {
+                "total": total,
+                "list": rows_out,
+                "page": page,
+                "page_size": page_size,
+                "as_of_date": as_of.isoformat(),
+                "jinli_factory_id": jinli_id,
+            },
+        }
+
+    def create_ai_pricing_snapshot(
+        self,
+        *,
+        title: Optional[str] = None,
+        as_of_date: Optional[str] = None,
+        warehouse_ids: Optional[List[int]] = None,
+    ) -> Dict[str, Any]:
+        as_of = self._pricing_calendar_date()
+        if as_of_date and str(as_of_date).strip():
+            as_of = date.fromisoformat(str(as_of_date).strip())
+
+        cond_wh = "dw.is_active = 1"
+        params_ls: List[Any] = []
+        if warehouse_ids:
+            placeholders = ",".join(["%s"] * len(warehouse_ids))
+            cond_wh += f" AND dw.id IN ({placeholders})"
+            params_ls.extend(int(x) for x in warehouse_ids)
+
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                jinli_id = self._jinli_factory_id(cur)
+                cur.execute(
+                    "INSERT INTO pd_ai_pricing_snapshots (title, as_of_date) VALUES (%s, %s)",
+                    ((title or "").strip() or None, as_of),
+                )
+                snap_id = cur.lastrowid
+                cur.execute(
+                    f"""
+                    SELECT dw.id, dw.name, dw.province, dw.city, dw.district
+                    FROM dict_warehouses dw WHERE {cond_wh}
+                    ORDER BY dw.id ASC
+                    """,
+                    tuple(params_ls),
+                )
+                wh_rows = cur.fetchall()
+                for wr in wh_rows:
+                    drow = self._compute_ai_pricing_core(
+                        cur,
+                        warehouse_id=int(wr[0]),
+                        warehouse_name=str(wr[1] or ""),
+                        province=wr[2],
+                        city=wr[3],
+                        district=wr[4],
+                        jinli_id=jinli_id,
+                        as_of=as_of,
+                    )
+                    cur.execute(
+                        """
+                        INSERT INTO pd_ai_pricing_snapshot_items (
+                          snapshot_id, warehouse_id, warehouse_name, province, city, district,
+                          benchmark_city, benchmark_city_price, city_spread, gross_margin_config,
+                          calibration_price, freight, warehouse_price, gross_margin_computed
+                        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        """,
+                        (
+                            snap_id,
+                            drow["库房id"],
+                            drow["库房名称"],
+                            drow["库房省份"] or None,
+                            drow["库房城市"] or None,
+                            drow["库房区"] or None,
+                            (drow["对标城市"] or "") or None,
+                            drow["对标城市定价"],
+                            drow["对标城市差额"],
+                            drow["毛利（配置版）"],
+                            drow["冶炼厂标定价格"],
+                            drow["库房运费"],
+                            drow["库房定价"],
+                            drow["毛利（计算版）"],
+                        ),
+                    )
+        return {"code": 200, "msg": "快照已创建", "data": {"snapshot_id": snap_id}}
+
+    def list_ai_pricing_snapshots(
+        self, *, page: int = 1, page_size: int = 20
+    ) -> Dict[str, Any]:
+        if page < 1:
+            raise ValueError("page 必须 >= 1")
+        page_size = min(max(page_size, 1), 200)
+        offset = (page - 1) * page_size
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM pd_ai_pricing_snapshots")
+                total = cur.fetchone()[0]
+                cur.execute(
+                    """
+                    SELECT id, title, as_of_date, created_at
+                    FROM pd_ai_pricing_snapshots
+                    ORDER BY id DESC
+                    LIMIT %s OFFSET %s
+                    """,
+                    (page_size, offset),
+                )
+                rows_out = []
+                for r in cur.fetchall():
+                    rows_out.append(
+                        {
+                            "snapshot_id": r[0],
+                            "title": r[1],
+                            "as_of_date": r[2].isoformat() if r[2] else None,
+                            "created_at": r[3].isoformat() if r[3] else None,
+                        }
+                    )
+        return {"code": 200, "data": {"total": total, "list": rows_out, "page": page, "page_size": page_size}}
+
+    def get_ai_pricing_snapshot_detail(self, snapshot_id: int) -> Dict[str, Any]:
+        if snapshot_id < 1:
+            raise ValueError("snapshot_id 无效")
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, title, as_of_date, created_at FROM pd_ai_pricing_snapshots WHERE id = %s",
+                    (snapshot_id,),
+                )
+                head = cur.fetchone()
+                if not head:
+                    raise ValueError("快照不存在")
+                cur.execute(
+                    """
+                    SELECT id, warehouse_id, warehouse_name, province, city, district,
+                           benchmark_city, benchmark_city_price, city_spread, gross_margin_config,
+                           calibration_price, freight, warehouse_price, gross_margin_computed, remark
+                    FROM pd_ai_pricing_snapshot_items
+                    WHERE snapshot_id = %s
+                    ORDER BY warehouse_id ASC
+                    """,
+                    (snapshot_id,),
+                )
+                items = []
+                for r in cur.fetchall():
+                    items.append(
+                        {
+                            "item_id": r[0],
+                            "库房id": r[1],
+                            "库房名称": r[2],
+                            "库房省份": r[3] or "",
+                            "库房城市": r[4] or "",
+                            "库房区": r[5] or "",
+                            "对标城市": r[6] or "",
+                            "对标城市定价": _cell_json(r[7]),
+                            "对标城市差额": _cell_json(r[8]),
+                            "毛利（配置版）": _cell_json(r[9]),
+                            "冶炼厂标定价格": _cell_json(r[10]),
+                            "库房运费": _cell_json(r[11]),
+                            "库房定价": _cell_json(r[12]),
+                            "毛利（计算版）": _cell_json(r[13]),
+                            "备注": r[14],
+                        }
+                    )
+        return {
+            "code": 200,
+            "data": {
+                "snapshot_id": head[0],
+                "title": head[1],
+                "as_of_date": head[2].isoformat() if head[2] else None,
+                "created_at": head[3].isoformat() if head[3] else None,
+                "items": items,
+            },
+        }
+
+    def update_ai_pricing_snapshot(
+        self,
+        snapshot_id: int,
+        *,
+        title: Any = None,
+        as_of_date: Any = None,
+        _set_title: bool = False,
+        _set_as_of_date: bool = False,
+    ) -> Dict[str, Any]:
+        if snapshot_id < 1:
+            raise ValueError("snapshot_id 无效")
+        updates: List[str] = []
+        params: List[Any] = []
+        if _set_title:
+            updates.append("title = %s")
+            if title is None:
+                params.append(None)
+            else:
+                tv = str(title).strip()
+                params.append(tv if tv else None)
+        if _set_as_of_date:
+            updates.append("as_of_date = %s")
+            if as_of_date is None or (isinstance(as_of_date, str) and str(as_of_date).strip() == ""):
+                params.append(None)
+            else:
+                params.append(date.fromisoformat(str(as_of_date).strip()))
+        if not updates:
+            raise ValueError("无修改字段")
+        params.append(snapshot_id)
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"UPDATE pd_ai_pricing_snapshots SET {', '.join(updates)} WHERE id = %s",
+                    tuple(params),
+                )
+                if cur.rowcount == 0:
+                    raise ValueError("快照不存在")
+        return {"code": 200, "msg": "已更新快照"}
+
+    def delete_ai_pricing_snapshot(self, snapshot_id: int) -> Dict[str, Any]:
+        if snapshot_id < 1:
+            raise ValueError("snapshot_id 无效")
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM pd_ai_pricing_snapshots WHERE id = %s", (snapshot_id,))
+                if cur.rowcount == 0:
+                    raise ValueError("快照不存在")
+        return {"code": 200, "msg": "已删除快照"}
+
+    def update_ai_pricing_snapshot_item_remark(
+        self, snapshot_id: int, item_id: int, remark: Optional[str]
+    ) -> Dict[str, Any]:
+        if snapshot_id < 1 or item_id < 1:
+            raise ValueError("参数无效")
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id FROM pd_ai_pricing_snapshot_items WHERE id = %s AND snapshot_id = %s",
+                    (item_id, snapshot_id),
+                )
+                if not cur.fetchone():
+                    raise ValueError("明细不存在")
+                cur.execute(
+                    "UPDATE pd_ai_pricing_snapshot_items SET remark = %s WHERE id = %s AND snapshot_id = %s",
+                    (remark, item_id, snapshot_id),
+                )
+        return {"code": 200, "msg": "已更新备注"}
+
+    def delete_ai_pricing_snapshot_item(self, snapshot_id: int, item_id: int) -> Dict[str, Any]:
+        if snapshot_id < 1 or item_id < 1:
+            raise ValueError("参数无效")
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM pd_ai_pricing_snapshot_items WHERE id = %s AND snapshot_id = %s",
+                    (item_id, snapshot_id),
+                )
+                if cur.rowcount == 0:
+                    raise ValueError("明细不存在")
+        return {"code": 200, "msg": "已删除明细"}
+
 
 # ==================== 单例工厂 ====================
 

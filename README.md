@@ -25,6 +25,7 @@ app/
 └── quote_price_sources.py
 docs/api.md                 # TL 接口说明与 JSON 示例
 docs/后端接口文档.md       # 交付用：全模块路由总览（TL / 认证 / 智能预测 / 鉴伪）
+docs/数据库文档.md         # 主要业务表说明（含对标定价相关表）
 docs/docker.md              # Compose / 部署
 ```
 
@@ -60,6 +61,12 @@ Docker 见 [docs/docker.md](docs/docker.md)。
 | `factory_tax_rates` | 冶炼厂税率 |
 | `ai_detection_history` | 鉴伪历史 |
 | `warehouse_inventories` / `factory_demands` 等 | 预留 |
+| `pd_province_benchmark_prices` | 省份对标城市定价历史 |
+| `pd_smelter_calibration_prices` | 冶炼厂标定价格历史 |
+| `pd_warehouse_spread_configs` | 库房对标差额与毛利配置 |
+| `pd_ai_pricing_snapshots` / `pd_ai_pricing_snapshot_items` | AI 定价对标分析快照及明细 |
+
+表字段说明与计算规则见 **[docs/数据库文档.md](docs/数据库文档.md)**。
 
 ## 报价识别流程（与实现对齐）
 
