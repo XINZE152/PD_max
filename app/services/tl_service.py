@@ -6197,6 +6197,27 @@ class TLService:
                     raise ValueError("记录不存在")
         return {"code": 200, "msg": "已删除库房差额配置"}
 
+    @staticmethod
+    def _append_warehouse_region_filters(
+        cond: str,
+        params: List[Any],
+        *,
+        province: Optional[str] = None,
+        city: Optional[str] = None,
+        district: Optional[str] = None,
+        table_alias: str = "dw",
+    ) -> str:
+        if province is not None and str(province).strip():
+            cond += f" AND {table_alias}.province = %s"
+            params.append(str(province).strip())
+        if city is not None and str(city).strip():
+            cond += f" AND {table_alias}.city = %s"
+            params.append(str(city).strip())
+        if district is not None and str(district).strip():
+            cond += f" AND {table_alias}.district = %s"
+            params.append(str(district).strip())
+        return cond
+
     def get_ai_pricing_analysis(
         self,
         *,
@@ -6204,6 +6225,9 @@ class TLService:
         page_size: int = 50,
         warehouse_ids: Optional[List[int]] = None,
         as_of_date: Optional[str] = None,
+        province: Optional[str] = None,
+        city: Optional[str] = None,
+        district: Optional[str] = None,
     ) -> Dict[str, Any]:
         if page < 1:
             raise ValueError("page 必须 >= 1")
@@ -6218,6 +6242,13 @@ class TLService:
             placeholders = ",".join(["%s"] * len(warehouse_ids))
             cond_wh += f" AND dw.id IN ({placeholders})"
             params_ls.extend(int(x) for x in warehouse_ids)
+        cond_wh = self._append_warehouse_region_filters(
+            cond_wh,
+            params_ls,
+            province=province,
+            city=city,
+            district=district,
+        )
 
         offset = (page - 1) * page_size
         with get_conn() as conn:
