@@ -1384,6 +1384,8 @@ def smelter_create(payload: Dict[str, Any]) -> Dict[str, Any]:
         lon = payload.get("longitude")
         lat = payload.get("latitude")
         status = payload.get("status")
+        uxb_raw = payload.get("use_xunrongbao")
+        use_xrb = False if uxb_raw is None else bool(uxb_raw)
 
         if not name:
             return _err(CODE_VALIDATION, "冶炼厂名称不能为空")
@@ -1420,8 +1422,8 @@ def smelter_create(payload: Dict[str, Any]) -> Dict[str, Any]:
 
                 cur.execute(
                     "INSERT INTO dict_factories (name, province, city, district, address, "
-                    "color_config, longitude, latitude, is_active) "
-                    "VALUES (%s,%s,%s,%s,%s,NULL,%s,%s,%s)",
+                    "color_config, longitude, latitude, use_xunrongbao, is_active) "
+                    "VALUES (%s,%s,%s,%s,%s,NULL,%s,%s,%s,%s)",
                     (
                         name,
                         province,
@@ -1430,6 +1432,7 @@ def smelter_create(payload: Dict[str, Any]) -> Dict[str, Any]:
                         address,
                         rx_lon,
                         rx_lat,
+                        1 if use_xrb else 0,
                         st,
                     ),
                 )

@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import uuid
+from collections import OrderedDict
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -36,6 +37,12 @@ from app.price_tax_utils import (
     merge_factory_rates,
     net_from_inclusive,
     parse_price_basis_from_remark,
+)
+from app.services.warehouse_spread_excel import (
+    SpreadImportRow,
+    WarehouseSpreadExcelError,
+    canonical_warehouse_key,
+    parse_warehouse_spread_workbook,
 )
 from app.services.tl_dict_geo_crud import (
     CODE_DB as SA_CODE_DB,
@@ -507,8 +514,10 @@ class TLService:
         district: Optional[str] = None,
         longitude: Optional[float] = None,
         latitude: Optional[float] = None,
+        *,
+        use_xunrongbao: bool = False,
     ) -> Dict[str, Any]:
-        """全地址落库时经纬度由天地图解析；未传经度/纬度或只传其一由 maybe_geocode 处理（可回退为 NULL）。"""
+        """全地址落库时经纬度由天地图解析；未传经度/纬度或只传其一由 maybe_geocode 处理（可回退为 NULL）。use_xunrongbao 写入循融宝发货开关。"""
         addr = _strip_optional_str(address)
         if _full_cn_site_address(province, city, district, addr):
             payload = {
@@ -520,6 +529,7 @@ class TLService:
                 "longitude": longitude,
                 "latitude": latitude,
                 "status": 1,
+                "use_xunrongbao": bool(use_xunrongbao),
             }
             try:
                 res = _raise_tl_geo_crud_result(sa_smelter_create(payload))
@@ -544,15 +554,18 @@ class TLService:
                         smelter_id, is_active = row
                         if is_active == 1:
                             return {"code": 200, "msg": "冶炼厂已存在", "冶炼厂id": smelter_id, "新建": False}
+                        xrb = 1 if use_xunrongbao else 0
                         cur.execute(
-                            "UPDATE dict_factories SET is_active = 1 WHERE id = %s",
-                            (smelter_id,),
+                            "UPDATE dict_factories SET is_active = 1, use_xunrongbao = %s WHERE id = %s",
+                            (xrb, smelter_id),
                         )
                         return {"code": 200, "msg": "冶炼厂已恢复启用", "冶炼厂id": smelter_id, "新建": False}
 
+                    xrb = 1 if use_xunrongbao else 0
                     cur.execute(
-                        "INSERT INTO dict_factories (name, address, is_active) VALUES (%s, %s, 1)",
-                        (name, addr),
+                        "INSERT INTO dict_factories (name, address, is_active, use_xunrongbao) "
+                        "VALUES (%s, %s, 1, %s)",
+                        (name, addr, xrb),
                     )
                     return {"code": 200, "msg": "冶炼厂新建成功", "冶炼厂id": cur.lastrowid, "新建": True}
         except Exception as e:
@@ -2843,19 +2856,63 @@ class TLService:
                 return (cat_id, row_id)
         return None
 
+    @staticmethod
+    def _fuzzy_match_quote_category_id_from_rows(
+        rows: List[Tuple[Any, ...]],
+        cat_name: str,
+    ) -> Optional[int]:
+        """
+        见 _fuzzy_match_quote_category_id；rows 为 (category_id, name) 启用品类列表。
+        """
+        c = cat_name.strip()
+        if len(c) < 2:
+            return None
+        scored: Dict[int, int] = {}
+        for category_id, db_name in rows:
+            n = str(db_name or "").strip()
+            if len(n) < 2:
+                continue
+            ok = False
+            if len(c) < len(n) and c in n:
+                ok = True
+            elif len(n) >= 4 and len(n) < len(c) and n in c:
+                ok = True
+            if not ok:
+                continue
+            score = max(len(n), len(c))
+            cid = int(category_id)
+            prev = scored.get(cid)
+            if prev is None or score > prev:
+                scored[cid] = score
+        if not scored:
+            return None
+        best_score = max(scored.values())
+        candidates = sorted(cid for cid, sc in scored.items() if sc == best_score)
+        return candidates[0]
+
+    @classmethod
+    def _fuzzy_match_quote_category_id(cls, cur: Any, cat_name: str) -> Optional[int]:
+        cur.execute(
+            "SELECT category_id, name FROM dict_categories WHERE is_active = 1"
+        )
+        rows = cur.fetchall()
+        return cls._fuzzy_match_quote_category_id_from_rows(rows, cat_name)
+
     def _resolve_quote_category_main_name(
         self,
         cur: Any,
         raw_name: Any,
         *,
         allow_create: bool,
+        active_name_rows: Optional[List[Tuple[Any, ...]]] = None,
     ) -> Tuple[str, int]:
         """
         报价落库前将识别/录入的品类名归一到启用主名称。
 
         - 命中启用别名：返回同 category_id 下的启用主名称；
         - 命中停用别名：拒绝写入；
-        - 未命中：按现有确认报价逻辑可新建为主名称（allow_create=True）。
+        - 精确未命中时尝试子串归并到已有品类（见 _fuzzy_match_quote_category_id）；
+        - 仍未命中：按现有确认报价逻辑可新建为主名称（allow_create=True）。
         """
         cat_name = str(raw_name or "").strip()
         if not cat_name:
@@ -2882,6 +2939,24 @@ class TLService:
             if not main_row or not str(main_row[0]).strip():
                 raise ValueError(f"品类「{cat_name}」所在分组没有启用名称，请先维护品类。")
             return str(main_row[0]).strip(), int(category_id)
+
+        fuzzy_cid = None
+        if active_name_rows is not None:
+            fuzzy_cid = self._fuzzy_match_quote_category_id_from_rows(
+                active_name_rows, cat_name
+            )
+        else:
+            fuzzy_cid = self._fuzzy_match_quote_category_id(cur, cat_name)
+        if fuzzy_cid is not None:
+            cur.execute(
+                "SELECT name FROM dict_categories "
+                "WHERE category_id = %s AND is_active = 1 "
+                "ORDER BY is_main DESC, row_id ASC LIMIT 1",
+                (fuzzy_cid,),
+            )
+            main_row = cur.fetchone()
+            if main_row and str(main_row[0]).strip():
+                return str(main_row[0]).strip(), int(fuzzy_cid)
 
         if not allow_create:
             raise ValueError(f"品类不存在或未启用: {cat_name}")
@@ -3441,11 +3516,25 @@ class TLService:
 
     # ==================== 接口5b：确认价格表写入数据库 ====================
 
+    _QUOTE_ROW_PRICE_KEYS_CN = (
+        "价格",
+        "价格_1pct增值税",
+        "价格_3pct增值税",
+        "价格_13pct增值税",
+        "普通发票价格",
+        "反向发票价格",
+    )
+
+    @classmethod
+    def _quote_item_has_any_price(cls, item: Dict[str, Any]) -> bool:
+        return any(item.get(k) is not None for k in cls._QUOTE_ROW_PRICE_KEYS_CN)
+
     def confirm_price_table(
         self,
         quote_date_str: str,
         items: List[Dict[str, Any]],
         full_data: Optional[Dict[str, Any]] = None,
+        replace_factory_quotes_on_date: bool = False,
     ) -> Dict[str, Any]:
         if not items:
             raise ValueError("报价数据不能为空")
@@ -3455,10 +3544,21 @@ class TLService:
         except (ValueError, TypeError):
             raise ValueError(f"日期格式不正确: {quote_date_str}，应为 YYYY-MM-DD")
 
+        for idx, item in enumerate(items):
+            if not self._quote_item_has_any_price(item):
+                raise ValueError(
+                    f"第 {idx + 1} 条报价缺少任意价格列（须至少填写：基准价、某一档含税价、普票或反向发票价之一）"
+                )
+
         try:
             with get_conn() as conn:
                 with conn.cursor() as cur:
                     inserted, updated = 0, 0
+
+                    cur.execute(
+                        "SELECT category_id, name FROM dict_categories WHERE is_active = 1"
+                    )
+                    active_cat_name_rows = cur.fetchall()
 
                     for item in items:
                         # 1. 冶炼厂：须已在字典中存在且名称与库中完全一致；禁止确认写入时静默新建
@@ -3504,11 +3604,29 @@ class TLService:
                             cur,
                             original_cat_name,
                             allow_create=True,
+                            active_name_rows=active_cat_name_rows,
                         )
                         item["品类名"] = main_cat_name
                         item["品类id"] = category_id
                         if original_cat_name and original_cat_name != main_cat_name:
                             item["识别品类名"] = original_cat_name
+
+                    # 2b. 同日同厂+品种去重：后者覆盖前者（避免同批重复写入）
+                    deduped: "OrderedDict[tuple, Dict[str, Any]]" = OrderedDict()
+                    for item in items:
+                        key = (int(item["冶炼厂id"]), str(item["品类名"]).strip(), quote_dt)
+                        deduped[key] = item
+                    items = list(deduped.values())
+
+                    if replace_factory_quotes_on_date:
+                        fids = sorted({int(i["冶炼厂id"]) for i in items})
+                        if fids:
+                            ph = ",".join(["%s"] * len(fids))
+                            cur.execute(
+                                f"DELETE FROM quote_details WHERE quote_date = %s "
+                                f"AND factory_id IN ({ph})",
+                                (quote_dt, *fids),
+                            )
 
                     # 3. 存储全量元数据（如果有 full_data）
                     metadata_id = None
@@ -3676,9 +3794,33 @@ class TLService:
         quote_date_str: str,
         items: List[Dict[str, Any]],
         full_data: Optional[Dict[str, Any]] = None,
+        replace_factory_quotes_on_date: bool = False,
     ) -> Dict[str, Any]:
         """手写/表格录入报价，逻辑与 confirm_price_table 相同（可不传 full_data）。"""
-        return self.confirm_price_table(quote_date_str, items, full_data)
+        return self.confirm_price_table(
+            quote_date_str,
+            items,
+            full_data,
+            replace_factory_quotes_on_date=replace_factory_quotes_on_date,
+        )
+
+    def delete_quote_detail(self, detail_id: int) -> Dict[str, Any]:
+        """按主键删除一条 quote_details（报价数据查询/纠错用）。"""
+        if detail_id < 1:
+            raise ValueError("明细 id 无效")
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("DELETE FROM quote_details WHERE id = %s", (detail_id,))
+                    if cur.rowcount == 0:
+                        raise ValueError(f"报价明细不存在: id={detail_id}")
+            log_finance_event("报价明细删除 | id=%s", detail_id)
+            return {"code": 200, "msg": "删除成功"}
+        except ValueError:
+            raise
+        except Exception as e:
+            logger.error(f"删除报价明细失败: {e}")
+            raise
 
     def _quote_detail_row_to_item(self, row: Tuple[Any, ...]) -> Dict[str, Any]:
         """SELECT quote_details 一行 → confirm 用的中文键条目（不含冶炼厂名）。"""
@@ -5553,18 +5695,140 @@ class TLService:
         except Exception:
             return datetime.utcnow().date()
 
+    _JINLI_FACTORY_NAMES: Tuple[str, ...] = (
+        "河南金利金铅集团有限公司",
+        "金利",
+    )
+
     def _jinli_factory_id(self, cur) -> int:
-        cur.execute(
-            "SELECT id FROM dict_factories WHERE name = %s AND is_active = 1 LIMIT 1",
-            ("金利",),
-        )
-        row = cur.fetchone()
-        if not row:
-            cur.execute("SELECT id FROM dict_factories WHERE name = %s LIMIT 1", ("金利",))
+        for name in self._JINLI_FACTORY_NAMES:
+            cur.execute(
+                "SELECT id FROM dict_factories WHERE name = %s AND is_active = 1 LIMIT 1",
+                (name,),
+            )
             row = cur.fetchone()
-        if not row:
-            raise ValueError("字典中不存在名称为「金利」的冶炼厂，请先添加冶炼厂")
-        return int(row[0])
+            if not row:
+                cur.execute(
+                    "SELECT id FROM dict_factories WHERE name = %s LIMIT 1",
+                    (name,),
+                )
+                row = cur.fetchone()
+            if row:
+                return int(row[0])
+        raise ValueError(
+            "字典中不存在名称为「河南金利金铅集团有限公司」（或历史名称「金利」）的冶炼厂，请先添加冶炼厂"
+        )
+
+    def _build_ai_pricing_warehouse_clause(
+        self,
+        *,
+        warehouse_id: Optional[int] = None,
+        warehouse_ids: Optional[List[int]] = None,
+        province: Optional[str] = None,
+        province_keyword: Optional[str] = None,
+        city: Optional[str] = None,
+        city_keyword: Optional[str] = None,
+        district: Optional[str] = None,
+        district_keyword: Optional[str] = None,
+        warehouse_name: Optional[str] = None,
+        warehouse_name_keyword: Optional[str] = None,
+        warehouse_type_id: Optional[int] = None,
+        is_active: Optional[int] = 1,
+        benchmark_city: Optional[str] = None,
+        benchmark_city_keyword: Optional[str] = None,
+        keyword: Optional[str] = None,
+        city_spread_min: Optional[Any] = None,
+        city_spread_max: Optional[Any] = None,
+        gross_margin_min: Optional[Any] = None,
+        gross_margin_max: Optional[Any] = None,
+        has_gross_margin: Optional[bool] = None,
+        has_spread_config: Optional[bool] = None,
+    ) -> Tuple[str, List[Any]]:
+        conditions: List[str] = ["1=1"]
+        params: List[Any] = []
+        if warehouse_id is not None:
+            conditions.append("dw.id = %s")
+            params.append(int(warehouse_id))
+        if warehouse_ids:
+            clean_ids = [int(x) for x in warehouse_ids if x is not None]
+            if clean_ids:
+                ph = ",".join(["%s"] * len(clean_ids))
+                conditions.append(f"dw.id IN ({ph})")
+                params.extend(clean_ids)
+        if province and str(province).strip():
+            conditions.append("TRIM(dw.province) = %s")
+            params.append(str(province).strip())
+        pvk = (province_keyword or "").strip()
+        if pvk:
+            conditions.append("dw.province LIKE %s")
+            params.append(f"%{pvk}%")
+        if city and str(city).strip():
+            conditions.append("TRIM(dw.city) = %s")
+            params.append(str(city).strip())
+        cvk = (city_keyword or "").strip()
+        if cvk:
+            conditions.append("dw.city LIKE %s")
+            params.append(f"%{cvk}%")
+        if district and str(district).strip():
+            conditions.append("TRIM(dw.district) = %s")
+            params.append(str(district).strip())
+        dvk = (district_keyword or "").strip()
+        if dvk:
+            conditions.append("dw.district LIKE %s")
+            params.append(f"%{dvk}%")
+        if warehouse_name and str(warehouse_name).strip():
+            conditions.append("TRIM(dw.name) = %s")
+            params.append(str(warehouse_name).strip())
+        wnk = (warehouse_name_keyword or "").strip()
+        if wnk:
+            conditions.append("dw.name LIKE %s")
+            params.append(f"%{wnk}%")
+        if warehouse_type_id is not None:
+            conditions.append("dw.warehouse_type_id = %s")
+            params.append(int(warehouse_type_id))
+        if is_active is not None:
+            conditions.append("dw.is_active = %s")
+            params.append(1 if int(is_active) else 0)
+        if benchmark_city and str(benchmark_city).strip():
+            conditions.append("TRIM(wsc.benchmark_city) = %s")
+            params.append(str(benchmark_city).strip())
+        bck = (benchmark_city_keyword or "").strip()
+        if bck:
+            conditions.append("wsc.benchmark_city LIKE %s")
+            params.append(f"%{bck}%")
+        kw = (keyword or "").strip()
+        if kw:
+            like = f"%{kw}%"
+            conditions.append(
+                "(dw.name LIKE %s OR dw.province LIKE %s OR dw.city LIKE %s OR "
+                "dw.district LIKE %s OR wsc.benchmark_city LIKE %s)"
+            )
+            params.extend([like, like, like, like, like])
+        if city_spread_min is not None and str(city_spread_min).strip() != "":
+            conditions.append("wsc.city_spread >= %s")
+            params.append(Decimal(str(city_spread_min)))
+        if city_spread_max is not None and str(city_spread_max).strip() != "":
+            conditions.append("wsc.city_spread <= %s")
+            params.append(Decimal(str(city_spread_max)))
+        if gross_margin_min is not None and str(gross_margin_min).strip() != "":
+            conditions.append("wsc.gross_margin_config >= %s")
+            params.append(Decimal(str(gross_margin_min)))
+        if gross_margin_max is not None and str(gross_margin_max).strip() != "":
+            conditions.append("wsc.gross_margin_config <= %s")
+            params.append(Decimal(str(gross_margin_max)))
+        if has_gross_margin is True:
+            conditions.append("wsc.gross_margin_config IS NOT NULL")
+        elif has_gross_margin is False:
+            conditions.append("wsc.gross_margin_config IS NULL")
+        if has_spread_config is True:
+            conditions.append("wsc.id IS NOT NULL")
+        elif has_spread_config is False:
+            conditions.append("wsc.id IS NULL")
+        from_sql = (
+            "FROM dict_warehouses dw "
+            "LEFT JOIN pd_warehouse_spread_configs wsc ON wsc.warehouse_id = dw.id"
+        )
+        return f"{from_sql} WHERE {' AND '.join(conditions)}", params
 
     def _latest_province_benchmark_row(
         self, cur, province: Optional[str], as_of: date
@@ -5742,8 +6006,17 @@ class TLService:
         page: int = 1,
         page_size: int = 20,
         province: Optional[str] = None,
+        province_keyword: Optional[str] = None,
+        benchmark_city: Optional[str] = None,
+        benchmark_city_keyword: Optional[str] = None,
+        keyword: Optional[str] = None,
+        price_id: Optional[int] = None,
         date_from: Optional[str] = None,
         date_to: Optional[str] = None,
+        created_from: Optional[str] = None,
+        created_to: Optional[str] = None,
+        benchmark_price_min: Optional[Any] = None,
+        benchmark_price_max: Optional[Any] = None,
         only_latest: bool = False,
     ) -> Dict[str, Any]:
         if page < 1:
@@ -5758,17 +6031,59 @@ class TLService:
         if d_from and d_to and d_from > d_to:
             raise ValueError("date_from 不能晚于 date_to")
 
+        cr_from: Optional[date] = None
+        cr_to: Optional[date] = None
+        if created_from:
+            cr_from = date.fromisoformat(str(created_from).strip())
+        if created_to:
+            cr_to = date.fromisoformat(str(created_to).strip())
+        if cr_from and cr_to and cr_from > cr_to:
+            raise ValueError("created_from 不能晚于 created_to")
+
         conditions: List[str] = ["1=1"]
         params: List[Any] = []
+        if price_id is not None:
+            conditions.append("p.id = %s")
+            params.append(int(price_id))
         if province and str(province).strip():
             conditions.append("TRIM(p.province) = %s")
             params.append(str(province).strip())
+        pk = (province_keyword or "").strip()
+        if pk:
+            conditions.append("TRIM(p.province) LIKE %s")
+            params.append(f"%{pk}%")
+        if benchmark_city and str(benchmark_city).strip():
+            conditions.append("TRIM(p.benchmark_city) = %s")
+            params.append(str(benchmark_city).strip())
+        bck = (benchmark_city_keyword or "").strip()
+        if bck:
+            conditions.append("p.benchmark_city LIKE %s")
+            params.append(f"%{bck}%")
+        kw = (keyword or "").strip()
+        if kw:
+            conditions.append(
+                "(TRIM(p.province) LIKE %s OR p.benchmark_city LIKE %s)"
+            )
+            like = f"%{kw}%"
+            params.extend([like, like])
         if d_from is not None:
             conditions.append("p.price_date >= %s")
             params.append(d_from)
         if d_to is not None:
             conditions.append("p.price_date <= %s")
             params.append(d_to)
+        if cr_from is not None:
+            conditions.append("DATE(p.created_at) >= %s")
+            params.append(cr_from)
+        if cr_to is not None:
+            conditions.append("DATE(p.created_at) <= %s")
+            params.append(cr_to)
+        if benchmark_price_min is not None and str(benchmark_price_min).strip() != "":
+            conditions.append("p.benchmark_price >= %s")
+            params.append(Decimal(str(benchmark_price_min)))
+        if benchmark_price_max is not None and str(benchmark_price_max).strip() != "":
+            conditions.append("p.benchmark_price <= %s")
+            params.append(Decimal(str(benchmark_price_max)))
 
         where_sql = " AND ".join(conditions)
         latest_filter = ""
@@ -5866,40 +6181,73 @@ class TLService:
         benchmark_price: Any = None,
         price_date: Optional[str] = None,
     ) -> Dict[str, Any]:
+        """基于指定历史行修订：保留源记录，插入合并后的新历史行（同日以 id 最大为当前有效）。"""
         if price_id < 1:
             raise ValueError("id 无效")
-        updates: List[str] = []
-        params: List[Any] = []
-        if province is not None:
-            pv = _strip_nonempty(province)
-            if not pv:
-                raise ValueError("省份不能为空")
-            updates.append("province = %s")
-            params.append(pv)
-        if benchmark_city is not None:
-            bc = _strip_nonempty(benchmark_city)
-            if not bc:
-                raise ValueError("对标城市不能为空")
-            updates.append("benchmark_city = %s")
-            params.append(bc)
-        if benchmark_price is not None:
-            updates.append("benchmark_price = %s")
-            params.append(Decimal(str(benchmark_price)))
-        if price_date is not None and str(price_date).strip():
-            updates.append("price_date = %s")
-            params.append(date.fromisoformat(str(price_date).strip()))
-        if not updates:
+        has_patch = any(
+            x is not None for x in (province, benchmark_city, benchmark_price, price_date)
+        )
+        if not has_patch:
             raise ValueError("无修改字段")
-        params.append(price_id)
+
         with get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    f"UPDATE pd_province_benchmark_prices SET {', '.join(updates)} WHERE id = %s",
-                    tuple(params),
+                    """
+                    SELECT province, benchmark_city, benchmark_price, price_date
+                    FROM pd_province_benchmark_prices WHERE id = %s
+                    """,
+                    (price_id,),
                 )
-                if cur.rowcount == 0:
+                row = cur.fetchone()
+                if not row:
                     raise ValueError("记录不存在")
-        return {"code": 200, "msg": "已更新省份对标定价"}
+
+                old_province, old_city, old_price, old_date = row
+                new_province = old_province
+                if province is not None:
+                    pv = _strip_nonempty(province)
+                    if not pv:
+                        raise ValueError("省份不能为空")
+                    new_province = pv
+                new_city = old_city
+                if benchmark_city is not None:
+                    bc = _strip_nonempty(benchmark_city)
+                    if not bc:
+                        raise ValueError("对标城市不能为空")
+                    new_city = bc
+                new_price = (
+                    Decimal(str(old_price))
+                    if benchmark_price is None
+                    else Decimal(str(benchmark_price))
+                )
+                new_date = old_date
+                if price_date is not None and str(price_date).strip():
+                    new_date = date.fromisoformat(str(price_date).strip())
+
+                if (
+                    str(new_province).strip() == str(old_province).strip()
+                    and str(new_city).strip() == str(old_city).strip()
+                    and new_price == Decimal(str(old_price))
+                    and new_date == old_date
+                ):
+                    raise ValueError("修订内容与源记录一致")
+
+                cur.execute(
+                    """
+                    INSERT INTO pd_province_benchmark_prices
+                    (province, benchmark_city, benchmark_price, price_date)
+                    VALUES (%s, %s, %s, %s)
+                    """,
+                    (new_province, new_city, new_price, new_date),
+                )
+                new_id = cur.lastrowid
+
+        return {
+            "code": 200,
+            "msg": "已基于历史记录新增修订行",
+            "data": {"id": new_id, "源记录id": price_id},
+        }
 
     def delete_province_benchmark_price(self, price_id: int) -> Dict[str, Any]:
         if price_id < 1:
@@ -6020,35 +6368,66 @@ class TLService:
         calibration_price: Any = None,
         price_date: Optional[str] = None,
     ) -> Dict[str, Any]:
+        """基于指定历史行修订：保留源记录，插入合并后的新历史行（同日以 id 最大为当前有效）。"""
         if price_id < 1:
             raise ValueError("id 无效")
-        updates: List[str] = []
-        params: List[Any] = []
-        if factory_id is not None:
-            updates.append("factory_id = %s")
-            params.append(int(factory_id))
-        if calibration_price is not None:
-            updates.append("calibration_price = %s")
-            params.append(Decimal(str(calibration_price)))
-        if price_date is not None and str(price_date).strip():
-            updates.append("price_date = %s")
-            params.append(date.fromisoformat(str(price_date).strip()))
-        if not updates:
+        has_patch = any(x is not None for x in (factory_id, calibration_price, price_date))
+        if not has_patch:
             raise ValueError("无修改字段")
-        params.append(price_id)
+
         with get_conn() as conn:
             with conn.cursor() as cur:
-                if factory_id is not None:
-                    cur.execute("SELECT id FROM dict_factories WHERE id = %s", (factory_id,))
+                cur.execute(
+                    """
+                    SELECT factory_id, calibration_price, price_date
+                    FROM pd_smelter_calibration_prices WHERE id = %s
+                    """,
+                    (price_id,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    raise ValueError("记录不存在")
+
+                old_factory_id, old_price, old_date = int(row[0]), row[1], row[2]
+                new_factory_id = int(factory_id) if factory_id is not None else old_factory_id
+                if new_factory_id < 1:
+                    raise ValueError("冶炼厂 id 无效")
+                new_price = (
+                    Decimal(str(old_price))
+                    if calibration_price is None
+                    else Decimal(str(calibration_price))
+                )
+                new_date = old_date
+                if price_date is not None and str(price_date).strip():
+                    new_date = date.fromisoformat(str(price_date).strip())
+
+                if new_factory_id != old_factory_id:
+                    cur.execute("SELECT id FROM dict_factories WHERE id = %s", (new_factory_id,))
                     if not cur.fetchone():
                         raise ValueError("冶炼厂不存在")
+
+                if (
+                    new_factory_id == old_factory_id
+                    and new_price == Decimal(str(old_price))
+                    and new_date == old_date
+                ):
+                    raise ValueError("修订内容与源记录一致")
+
                 cur.execute(
-                    f"UPDATE pd_smelter_calibration_prices SET {', '.join(updates)} WHERE id = %s",
-                    tuple(params),
+                    """
+                    INSERT INTO pd_smelter_calibration_prices
+                    (factory_id, calibration_price, price_date)
+                    VALUES (%s, %s, %s)
+                    """,
+                    (new_factory_id, new_price, new_date),
                 )
-                if cur.rowcount == 0:
-                    raise ValueError("记录不存在")
-        return {"code": 200, "msg": "已更新冶炼厂标定价格"}
+                new_id = cur.lastrowid
+
+        return {
+            "code": 200,
+            "msg": "已基于历史记录新增修订行",
+            "data": {"id": new_id, "源记录id": price_id},
+        }
 
     def delete_smelter_calibration_price(self, price_id: int) -> Dict[str, Any]:
         if price_id < 1:
@@ -6065,16 +6444,143 @@ class TLService:
         *,
         page: int = 1,
         page_size: int = 20,
+        config_id: Optional[int] = None,
         warehouse_id: Optional[int] = None,
+        warehouse_ids: Optional[List[int]] = None,
+        province: Optional[str] = None,
+        province_keyword: Optional[str] = None,
+        city: Optional[str] = None,
+        city_keyword: Optional[str] = None,
+        district: Optional[str] = None,
+        district_keyword: Optional[str] = None,
+        warehouse_name: Optional[str] = None,
+        warehouse_name_keyword: Optional[str] = None,
+        warehouse_type_id: Optional[int] = None,
+        is_active: Optional[int] = None,
+        benchmark_city: Optional[str] = None,
+        benchmark_city_keyword: Optional[str] = None,
+        keyword: Optional[str] = None,
+        city_spread_min: Optional[Any] = None,
+        city_spread_max: Optional[Any] = None,
+        gross_margin_min: Optional[Any] = None,
+        gross_margin_max: Optional[Any] = None,
+        has_gross_margin: Optional[bool] = None,
+        created_from: Optional[str] = None,
+        created_to: Optional[str] = None,
+        updated_from: Optional[str] = None,
+        updated_to: Optional[str] = None,
     ) -> Dict[str, Any]:
         if page < 1:
             raise ValueError("page 必须 >= 1")
         page_size = min(max(page_size, 1), 500)
+        cr_from: Optional[date] = None
+        cr_to: Optional[date] = None
+        if created_from:
+            cr_from = date.fromisoformat(str(created_from).strip())
+        if created_to:
+            cr_to = date.fromisoformat(str(created_to).strip())
+        if cr_from and cr_to and cr_from > cr_to:
+            raise ValueError("created_from 不能晚于 created_to")
+        up_from: Optional[date] = None
+        up_to: Optional[date] = None
+        if updated_from:
+            up_from = date.fromisoformat(str(updated_from).strip())
+        if updated_to:
+            up_to = date.fromisoformat(str(updated_to).strip())
+        if up_from and up_to and up_from > up_to:
+            raise ValueError("updated_from 不能晚于 updated_to")
+
         conditions: List[str] = ["1=1"]
         params: List[Any] = []
+        if config_id is not None:
+            conditions.append("wsc.id = %s")
+            params.append(int(config_id))
         if warehouse_id is not None:
             conditions.append("wsc.warehouse_id = %s")
             params.append(int(warehouse_id))
+        if warehouse_ids:
+            clean_ids = [int(x) for x in warehouse_ids if x is not None]
+            if clean_ids:
+                ph = ",".join(["%s"] * len(clean_ids))
+                conditions.append(f"wsc.warehouse_id IN ({ph})")
+                params.extend(clean_ids)
+        if province and str(province).strip():
+            conditions.append("TRIM(dw.province) = %s")
+            params.append(str(province).strip())
+        pvk = (province_keyword or "").strip()
+        if pvk:
+            conditions.append("dw.province LIKE %s")
+            params.append(f"%{pvk}%")
+        if city and str(city).strip():
+            conditions.append("TRIM(dw.city) = %s")
+            params.append(str(city).strip())
+        cvk = (city_keyword or "").strip()
+        if cvk:
+            conditions.append("dw.city LIKE %s")
+            params.append(f"%{cvk}%")
+        if district and str(district).strip():
+            conditions.append("TRIM(dw.district) = %s")
+            params.append(str(district).strip())
+        dvk = (district_keyword or "").strip()
+        if dvk:
+            conditions.append("dw.district LIKE %s")
+            params.append(f"%{dvk}%")
+        if warehouse_name and str(warehouse_name).strip():
+            conditions.append("TRIM(dw.name) = %s")
+            params.append(str(warehouse_name).strip())
+        wnk = (warehouse_name_keyword or "").strip()
+        if wnk:
+            conditions.append("dw.name LIKE %s")
+            params.append(f"%{wnk}%")
+        if warehouse_type_id is not None:
+            conditions.append("dw.warehouse_type_id = %s")
+            params.append(int(warehouse_type_id))
+        if is_active is not None:
+            conditions.append("dw.is_active = %s")
+            params.append(1 if int(is_active) else 0)
+        if benchmark_city and str(benchmark_city).strip():
+            conditions.append("TRIM(wsc.benchmark_city) = %s")
+            params.append(str(benchmark_city).strip())
+        bck = (benchmark_city_keyword or "").strip()
+        if bck:
+            conditions.append("wsc.benchmark_city LIKE %s")
+            params.append(f"%{bck}%")
+        kw = (keyword or "").strip()
+        if kw:
+            like = f"%{kw}%"
+            conditions.append(
+                "(dw.name LIKE %s OR dw.province LIKE %s OR dw.city LIKE %s OR "
+                "dw.district LIKE %s OR wsc.benchmark_city LIKE %s)"
+            )
+            params.extend([like, like, like, like, like])
+        if city_spread_min is not None and str(city_spread_min).strip() != "":
+            conditions.append("wsc.city_spread >= %s")
+            params.append(Decimal(str(city_spread_min)))
+        if city_spread_max is not None and str(city_spread_max).strip() != "":
+            conditions.append("wsc.city_spread <= %s")
+            params.append(Decimal(str(city_spread_max)))
+        if gross_margin_min is not None and str(gross_margin_min).strip() != "":
+            conditions.append("wsc.gross_margin_config >= %s")
+            params.append(Decimal(str(gross_margin_min)))
+        if gross_margin_max is not None and str(gross_margin_max).strip() != "":
+            conditions.append("wsc.gross_margin_config <= %s")
+            params.append(Decimal(str(gross_margin_max)))
+        if has_gross_margin is True:
+            conditions.append("wsc.gross_margin_config IS NOT NULL")
+        elif has_gross_margin is False:
+            conditions.append("wsc.gross_margin_config IS NULL")
+        if cr_from is not None:
+            conditions.append("DATE(wsc.created_at) >= %s")
+            params.append(cr_from)
+        if cr_to is not None:
+            conditions.append("DATE(wsc.created_at) <= %s")
+            params.append(cr_to)
+        if up_from is not None:
+            conditions.append("DATE(wsc.updated_at) >= %s")
+            params.append(up_from)
+        if up_to is not None:
+            conditions.append("DATE(wsc.updated_at) <= %s")
+            params.append(up_to)
         where_sql = " AND ".join(conditions)
         offset = (page - 1) * page_size
         base = (
@@ -6197,12 +6703,328 @@ class TLService:
                     raise ValueError("记录不存在")
         return {"code": 200, "msg": "已删除库房差额配置"}
 
+    _REGION_PROVINCE_PREFIXES: Tuple[str, ...] = (
+        "黑龙江",
+        "内蒙古",
+        "河北",
+        "山西",
+        "辽宁",
+        "吉林",
+        "江苏",
+        "浙江",
+        "安徽",
+        "福建",
+        "江西",
+        "山东",
+        "河南",
+        "湖北",
+        "湖南",
+        "广东",
+        "海南",
+        "四川",
+        "贵州",
+        "云南",
+        "陕西",
+        "甘肃",
+        "青海",
+        "台湾",
+        "广西",
+        "西藏",
+        "宁夏",
+        "新疆",
+        "北京",
+        "天津",
+        "上海",
+        "重庆",
+        "香港",
+        "澳门",
+    )
+
+    def _region_to_province(self, region: Optional[str]) -> Optional[str]:
+        s = (region or "").strip()
+        if not s:
+            return None
+        s = re.sub(r"\s+", "", s)
+        for prefix in self._REGION_PROVINCE_PREFIXES:
+            if s.startswith(prefix):
+                return prefix
+        return None
+
+    def _province_benchmark_lookup_keys(self, province: Optional[str]) -> List[str]:
+        s = (province or "").strip()
+        if not s:
+            return []
+        keys: List[str] = []
+        seen: Set[str] = set()
+
+        def _add(v: str) -> None:
+            v = v.strip()
+            if v and v not in seen:
+                seen.add(v)
+                keys.append(v)
+
+        _add(s)
+        if s.endswith("省") or s.endswith("市"):
+            _add(s[:-1])
+        elif not s.endswith("自治区"):
+            _add(f"{s}省")
+            _add(f"{s}市")
+        return keys
+
+    def _latest_province_benchmark_for_lookup(
+        self, cur, province: Optional[str], as_of: date
+    ) -> Optional[Dict[str, Any]]:
+        for key in self._province_benchmark_lookup_keys(province):
+            row = self._latest_province_benchmark_row(cur, key, as_of)
+            if row:
+                return row
+        return None
+
+    def _load_warehouse_match_indexes(self, cur) -> Tuple[Dict[str, int], Dict[str, List[int]], Dict[int, str]]:
+        cur.execute("SELECT id, name, province FROM dict_warehouses")
+        exact: Dict[str, int] = {}
+        canon: Dict[str, List[int]] = {}
+        provinces: Dict[int, str] = {}
+        for wid, name, province in cur.fetchall():
+            n = (name or "").strip()
+            if not n:
+                continue
+            if n not in exact:
+                exact[n] = int(wid)
+            ck = canonical_warehouse_key(n)
+            canon.setdefault(ck, []).append(int(wid))
+            provinces[int(wid)] = (province or "").strip()
+        return exact, canon, provinces
+
+    def _match_warehouse_id(
+        self,
+        excel_name: str,
+        exact: Dict[str, int],
+        canon: Dict[str, List[int]],
+    ) -> Tuple[Optional[int], str]:
+        s = excel_name.strip()
+        if s in exact:
+            return exact[s], "exact"
+        ck = canonical_warehouse_key(s)
+        ids = canon.get(ck) or []
+        if len(ids) == 1:
+            return ids[0], "canonical"
+        if len(ids) > 1:
+            return None, "ambiguous"
+        return None, "missing"
+
+    def _finalize_spread_import_row(
+        self,
+        cur,
+        row: SpreadImportRow,
+        *,
+        warehouse_id: int,
+        warehouse_province: str,
+        as_of: date,
+    ) -> Optional[SpreadImportRow]:
+        benchmark_city = (row.benchmark_city or "").strip()
+        city_spread = row.city_spread
+        gross_margin = row.gross_margin_config
+
+        if city_spread is None and row.warehouse_price is not None:
+            province = warehouse_province or self._region_to_province(row.region) or ""
+            bench = self._latest_province_benchmark_for_lookup(cur, province or None, as_of)
+            if bench and bench.get("benchmark_price") is not None:
+                bench_price = Decimal(str(bench["benchmark_price"]))
+                city_spread = row.warehouse_price - bench_price
+                if not benchmark_city:
+                    benchmark_city = (bench.get("benchmark_city") or "").strip()
+
+        if city_spread is None and gross_margin is None and not benchmark_city:
+            return None
+
+        return SpreadImportRow(
+            warehouse_name=row.warehouse_name,
+            sheet_name=row.sheet_name,
+            excel_row=row.excel_row,
+            benchmark_city=benchmark_city or None,
+            city_spread=city_spread,
+            gross_margin_config=gross_margin,
+            warehouse_price=row.warehouse_price,
+            region=row.region,
+        )
+
+    def import_warehouse_spread_excel(
+        self,
+        content: bytes,
+        *,
+        overwrite: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        读取工作簿全部工作表，解析库房对标差额与毛利后写入 pd_warehouse_spread_configs。
+        库房按名称匹配 dict_warehouses（不自动新建）；差额缺省时可由「定价/库房报价」减省份对标价推算。
+        """
+        try:
+            merged, sheet_summaries = parse_warehouse_spread_workbook(content)
+        except WarehouseSpreadExcelError as e:
+            raise ValueError(str(e)) from e
+
+        as_of = self._pricing_calendar_date()
+        stats: Dict[str, Any] = {
+            "parsed_warehouses": len(merged),
+            "inserted": 0,
+            "updated": 0,
+            "skipped_missing_wh": 0,
+            "skipped_ambiguous_wh": 0,
+            "skipped_no_data": 0,
+            "skipped_exists": 0,
+        }
+        errors: List[str] = []
+        samples: List[Dict[str, Any]] = []
+
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                exact, canon, wh_provinces = self._load_warehouse_match_indexes(cur)
+
+                for wh_name, raw in merged.items():
+                    wid, how = self._match_warehouse_id(wh_name, exact, canon)
+                    if how == "missing":
+                        stats["skipped_missing_wh"] += 1
+                        continue
+                    if how == "ambiguous":
+                        stats["skipped_ambiguous_wh"] += 1
+                        ck = canonical_warehouse_key(wh_name)
+                        errors.append(
+                            f"「{wh_name}」名称歧义，对应多库房 id：{canon.get(ck, [])}"
+                        )
+                        continue
+                    assert wid is not None
+
+                    finalized = self._finalize_spread_import_row(
+                        cur,
+                        raw,
+                        warehouse_id=wid,
+                        warehouse_province=wh_provinces.get(wid, ""),
+                        as_of=as_of,
+                    )
+                    if finalized is None:
+                        stats["skipped_no_data"] += 1
+                        continue
+
+                    cur.execute(
+                        "SELECT id, benchmark_city, city_spread, gross_margin_config "
+                        "FROM pd_warehouse_spread_configs WHERE warehouse_id = %s",
+                        (wid,),
+                    )
+                    existing = cur.fetchone()
+
+                    if existing and not overwrite:
+                        stats["skipped_exists"] += 1
+                        continue
+
+                    benchmark_city = (finalized.benchmark_city or "").strip()
+                    city_spread = finalized.city_spread
+                    gross_margin = finalized.gross_margin_config
+
+                    if existing:
+                        cfg_id = int(existing[0])
+                        updates: List[str] = []
+                        params: List[Any] = []
+                        if finalized.benchmark_city is not None:
+                            updates.append("benchmark_city = %s")
+                            params.append(benchmark_city)
+                        if city_spread is not None:
+                            updates.append("city_spread = %s")
+                            params.append(city_spread)
+                        if gross_margin is not None:
+                            updates.append("gross_margin_config = %s")
+                            params.append(gross_margin)
+                        if not updates:
+                            stats["skipped_no_data"] += 1
+                            continue
+                        params.append(cfg_id)
+                        cur.execute(
+                            f"UPDATE pd_warehouse_spread_configs SET {', '.join(updates)} WHERE id = %s",
+                            tuple(params),
+                        )
+                        stats["updated"] += 1
+                        action = "updated"
+                    else:
+                        cur.execute(
+                            """
+                            INSERT INTO pd_warehouse_spread_configs
+                            (warehouse_id, benchmark_city, city_spread, gross_margin_config)
+                            VALUES (%s, %s, %s, %s)
+                            """,
+                            (
+                                wid,
+                                benchmark_city,
+                                city_spread if city_spread is not None else Decimal("0"),
+                                gross_margin,
+                            ),
+                        )
+                        stats["inserted"] += 1
+                        action = "inserted"
+
+                    if len(samples) < 20:
+                        samples.append(
+                            {
+                                "库房": wh_name,
+                                "库房id": wid,
+                                "工作表": finalized.sheet_name,
+                                "Excel行": finalized.excel_row,
+                                "操作": action,
+                                "对标城市": benchmark_city or None,
+                                "对标城市差额": _cell_json(city_spread),
+                                "毛利（配置版）": _cell_json(gross_margin),
+                            }
+                        )
+
+        sheets_out = []
+        for s in sheet_summaries:
+            sheets_out.append(
+                {
+                    "工作表": s.sheet_name,
+                    "解析行数": s.parsed_rows,
+                    "跳过行数": s.skipped_rows,
+                    "列映射": s.columns,
+                }
+            )
+
+        return {
+            "code": 200,
+            "msg": "库房差额与毛利导入完成",
+            "data": {
+                "as_of_date": as_of.isoformat(),
+                "overwrite": overwrite,
+                "stats": stats,
+                "sheets": sheets_out,
+                "samples": samples,
+                "errors": errors[:50],
+            },
+        }
+
     def get_ai_pricing_analysis(
         self,
         *,
         page: int = 1,
         page_size: int = 50,
+        warehouse_id: Optional[int] = None,
         warehouse_ids: Optional[List[int]] = None,
+        province: Optional[str] = None,
+        province_keyword: Optional[str] = None,
+        city: Optional[str] = None,
+        city_keyword: Optional[str] = None,
+        district: Optional[str] = None,
+        district_keyword: Optional[str] = None,
+        warehouse_name: Optional[str] = None,
+        warehouse_name_keyword: Optional[str] = None,
+        warehouse_type_id: Optional[int] = None,
+        is_active: Optional[int] = None,
+        benchmark_city: Optional[str] = None,
+        benchmark_city_keyword: Optional[str] = None,
+        keyword: Optional[str] = None,
+        city_spread_min: Optional[Any] = None,
+        city_spread_max: Optional[Any] = None,
+        gross_margin_min: Optional[Any] = None,
+        gross_margin_max: Optional[Any] = None,
+        has_gross_margin: Optional[bool] = None,
+        has_spread_config: Optional[bool] = None,
         as_of_date: Optional[str] = None,
     ) -> Dict[str, Any]:
         if page < 1:
@@ -6212,24 +7034,40 @@ class TLService:
         if as_of_date and str(as_of_date).strip():
             as_of = date.fromisoformat(str(as_of_date).strip())
 
-        cond_wh = "dw.is_active = 1"
-        params_ls: List[Any] = []
-        if warehouse_ids:
-            placeholders = ",".join(["%s"] * len(warehouse_ids))
-            cond_wh += f" AND dw.id IN ({placeholders})"
-            params_ls.extend(int(x) for x in warehouse_ids)
+        wh_sql, params_ls = self._build_ai_pricing_warehouse_clause(
+            warehouse_id=warehouse_id,
+            warehouse_ids=warehouse_ids,
+            province=province,
+            province_keyword=province_keyword,
+            city=city,
+            city_keyword=city_keyword,
+            district=district,
+            district_keyword=district_keyword,
+            warehouse_name=warehouse_name,
+            warehouse_name_keyword=warehouse_name_keyword,
+            warehouse_type_id=warehouse_type_id,
+            is_active=1 if is_active is None else is_active,
+            benchmark_city=benchmark_city,
+            benchmark_city_keyword=benchmark_city_keyword,
+            keyword=keyword,
+            city_spread_min=city_spread_min,
+            city_spread_max=city_spread_max,
+            gross_margin_min=gross_margin_min,
+            gross_margin_max=gross_margin_max,
+            has_gross_margin=has_gross_margin,
+            has_spread_config=has_spread_config,
+        )
 
         offset = (page - 1) * page_size
         with get_conn() as conn:
             with conn.cursor() as cur:
                 jinli_id = self._jinli_factory_id(cur)
-                cur.execute(f"SELECT COUNT(*) FROM dict_warehouses dw WHERE {cond_wh}", tuple(params_ls))
+                cur.execute(f"SELECT COUNT(*) {wh_sql}", tuple(params_ls))
                 total = cur.fetchone()[0]
                 cur.execute(
                     f"""
                     SELECT dw.id, dw.name, dw.province, dw.city, dw.district
-                    FROM dict_warehouses dw
-                    WHERE {cond_wh}
+                    {wh_sql}
                     ORDER BY dw.id ASC
                     LIMIT %s OFFSET %s
                     """,

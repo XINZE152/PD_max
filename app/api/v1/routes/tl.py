@@ -14,7 +14,7 @@ TL比价模块路由
       GET /tl/get_warehouse_links_list、GET /tl/get_tier_price_spread_list（阶梯差价列表）、
       GET /tl/get_warehouse_links_outbound、GET /tl/get_warehouse_links_inbound、
       PUT /tl/replace_warehouse_links_outbound、PUT /tl/update_warehouse_link_tier
-  1e.POST /tl/add_smelter              - 新建冶炼厂
+  1e.POST /tl/add_smelter              - 新建冶炼厂（可选循融宝发货，默认否）
   2. GET  /tl/get_smelters             - 获取冶炼厂列表（size 最大 200；含循融宝发货）
   2a. GET  /tl/get_smelter              - 获取单个冶炼厂详情（含循融宝、is_active）
   2a1.GET  /tl/list_smelter_xunrongbao  - 查询全部冶炼厂循融宝状态及加价元/吨
@@ -32,6 +32,7 @@ TL比价模块路由
   5b.POST /tl/confirm_price_table      - 确认写入报价数据（冶炼厂须字典名称精确匹配；品类缺失仍可自动新建）
   5b2.POST /tl/manual_quote            - 手写录入报价（无 OCR；请求体与 confirm 相同，full_data 可省略）
   5b3.POST /tl/update_quote_detail     - 按明细 id 修改报价（改价后按冶炼厂税率重算各档含税价）
+  5b4.DELETE /tl/quote_detail/{detail_id} - 按 id 删除单条报价明细（报价查询纠错）
   5c.GET  /tl/get_quote_details_list   - 报价数据列表（分页、筛选）
   5d.GET  /tl/export_quote_details_excel - 导出报价数据 Excel（与查询条件一致）
   6. POST /tl/upload_freight           - 上传运费
@@ -49,6 +50,7 @@ TL比价模块路由
       GET/POST/PUT/DELETE /tl/province_benchmark_prices — 省份对标城市定价历史
       GET/POST/PUT/DELETE /tl/smelter_calibration_prices — 冶炼厂标定价格历史
       GET/POST/PUT/DELETE /tl/warehouse_spread_configs — 库房对标差额与毛利配置
+      POST /tl/import_warehouse_spread_excel — 导入库房差额与毛利（xlsx，读取全部工作表）
       GET /tl/ai_pricing_analysis — 实时聚合分析（公式：库房定价=对标城市定价+差额；毛利计算版=标定−运费−库房定价）
       GET/POST /tl/ai_pricing_snapshots、GET/PUT/DELETE /tl/ai_pricing_snapshots/{id} — 快照 CRUD
       PUT/DELETE /tl/ai_pricing_snapshots/{id}/items/{item_id} — 明细备注/删除
@@ -782,7 +784,7 @@ def add_smelter(
     body: AddSmelterRequest,
     service: TLService = Depends(get_tl_service),
 ):
-    """省市区+详址齐全时落库并无标记色；经度/纬度默认不传，由天地图解析（若同时传经度+纬度则用手写值）。"""
+    """省市区+详址齐全时落库并无标记色；经度/纬度默认不传，由天地图解析（若同时传经度+纬度则用手写值）。可选传循融宝发货。"""
     try:
         return service.add_smelter(
             name=body.冶炼厂名,
@@ -792,6 +794,7 @@ def add_smelter(
             district=body.区,
             longitude=body.经度,
             latitude=body.纬度,
+            use_xunrongbao=body.循融宝发货,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -956,7 +959,7 @@ def batch_set_smelters_xunrongbao(
     body: BatchSetSmeltersXunrongbaoRequest,
     service: TLService = Depends(get_tl_service),
 ):
-    """同一请求可提交多条，分别指定各冶炼厂是否循融宝发货（新建冶炼厂默认为否）。"""
+    """同一请求可提交多条，分别指定各冶炼厂是否循融宝发货。"""
     try:
         items = [x.model_dump() for x in body.列表]
         return service.batch_set_smelters_xunrongbao(items)
@@ -1214,6 +1217,7 @@ def confirm_price_table(
             quote_date_str=body.报价日期,
             items=items,
             full_data=full_data,
+            replace_factory_quotes_on_date=body.同冶炼厂当日整表覆盖,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -1234,6 +1238,7 @@ def manual_quote(
             quote_date_str=body.报价日期,
             items=items,
             full_data=full_data,
+            replace_factory_quotes_on_date=body.同冶炼厂当日整表覆盖,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -1249,6 +1254,23 @@ def update_quote_detail(
     """修改后按冶炼厂税率重算 1%/3%/13% 含税列与不含税基准（锚点为本次请求中实际提交的价格列）。"""
     try:
         return service.update_quote_detail(body)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete(
+    "/quote_detail/{detail_id}",
+    summary="按 id 删除单条报价明细",
+)
+def delete_quote_detail(
+    detail_id: int,
+    service: TLService = Depends(get_tl_service),
+):
+    """删除 quote_details 一行；用于报价数据查询中清理错误/重复数据。"""
+    try:
+        return service.delete_quote_detail(detail_id)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -1657,9 +1679,26 @@ def delete_category_row(
 def province_benchmark_prices(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=500),
-    province: Optional[str] = Query(None, description="省份精确匹配"),
+    province: Optional[str] = Query(None, description="省份精确匹配（TRIM）"),
+    province_keyword: Optional[str] = Query(None, description="省份模糊（LIKE）"),
+    benchmark_city: Optional[str] = Query(None, description="对标城市精确匹配（TRIM）"),
+    benchmark_city_keyword: Optional[str] = Query(None, description="对标城市模糊（LIKE）"),
+    keyword: Optional[str] = Query(
+        None,
+        description="省份或对标城市模糊（OR，LIKE）",
+    ),
+    row_id: Optional[int] = Query(
+        None,
+        ge=1,
+        description="主键 id 精确筛选",
+        alias="id",
+    ),
     date_from: Optional[str] = Query(None, description="定价日起 YYYY-MM-DD"),
     date_to: Optional[str] = Query(None, description="定价日止 YYYY-MM-DD"),
+    created_from: Optional[str] = Query(None, description="上传日期起 YYYY-MM-DD（按 DATE(created_at)）"),
+    created_to: Optional[str] = Query(None, description="上传日期止 YYYY-MM-DD"),
+    benchmark_price_min: Optional[float] = Query(None, description="对标城市定价下限（含）"),
+    benchmark_price_max: Optional[float] = Query(None, description="对标城市定价上限（含）"),
     only_latest: bool = Query(
         False,
         description="为 true 时每省仅保留当前有效的一条（price_date 最大，同日 id 最大）",
@@ -1671,8 +1710,17 @@ def province_benchmark_prices(
             page=page,
             page_size=page_size,
             province=province,
+            province_keyword=province_keyword,
+            benchmark_city=benchmark_city,
+            benchmark_city_keyword=benchmark_city_keyword,
+            keyword=keyword,
+            price_id=row_id,
             date_from=date_from,
             date_to=date_to,
+            created_from=created_from,
+            created_to=created_to,
+            benchmark_price_min=benchmark_price_min,
+            benchmark_price_max=benchmark_price_max,
             only_latest=only_latest,
         )
     except ValueError as e:
@@ -1699,12 +1747,16 @@ def province_benchmark_prices_create(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.put("/province_benchmark_prices/{price_id}", summary="修改省份对标定价历史行")
+@router.put(
+    "/province_benchmark_prices/{price_id}",
+    summary="修订省份对标定价历史行（保留源记录，新增一条历史）",
+)
 def province_benchmark_prices_update(
     price_id: int,
     body: ProvinceBenchmarkPriceUpdate,
     service: TLService = Depends(get_tl_service),
 ):
+    """按 `price_id` 取源行，与请求体合并后**插入**新历史行；源行不修改。同日多条时 id 最大者为当前有效。"""
     try:
         patch = body.model_dump(exclude_unset=True)
         return service.update_province_benchmark_price(
@@ -1773,12 +1825,16 @@ def smelter_calibration_prices_create(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.put("/smelter_calibration_prices/{price_id}", summary="修改冶炼厂标定价格历史行")
+@router.put(
+    "/smelter_calibration_prices/{price_id}",
+    summary="修订冶炼厂标定价格历史行（保留源记录，新增一条历史）",
+)
 def smelter_calibration_prices_update(
     price_id: int,
     body: SmelterCalibrationPriceUpdate,
     service: TLService = Depends(get_tl_service),
 ):
+    """按 `price_id` 取源行，与请求体合并后**插入**新历史行；源行不修改。同日多条时 id 最大者为当前有效。"""
     try:
         patch = body.model_dump(exclude_unset=True)
         return service.update_smelter_calibration_price(
@@ -1810,14 +1866,81 @@ def smelter_calibration_prices_delete(
 def warehouse_spread_configs(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=500),
-    warehouse_id: Optional[int] = Query(None, description="按库房 id 筛选"),
+    config_row_id: Optional[int] = Query(
+        None,
+        ge=1,
+        description="配置主键 wsc.id",
+        alias="id",
+    ),
+    warehouse_id: Optional[int] = Query(None, ge=1, description="库房 id 精确"),
+    warehouse_ids: Optional[List[int]] = Query(
+        None,
+        description="库房 id 列表（可重复 query 参数，如 warehouse_ids=1&warehouse_ids=2）",
+    ),
+    province: Optional[str] = Query(None, description="库房所在省精确（TRIM）"),
+    province_keyword: Optional[str] = Query(None, description="省模糊（LIKE）"),
+    city: Optional[str] = Query(None, description="库房所在市精确（TRIM）"),
+    city_keyword: Optional[str] = Query(None, description="市模糊（LIKE）"),
+    district: Optional[str] = Query(None, description="库房所在区县精确（TRIM）"),
+    district_keyword: Optional[str] = Query(None, description="区县模糊（LIKE）"),
+    warehouse_name: Optional[str] = Query(None, description="库房名称精确（TRIM）"),
+    warehouse_name_keyword: Optional[str] = Query(None, description="库房名称模糊（LIKE）"),
+    warehouse_type_id: Optional[int] = Query(None, ge=1, description="库房类型 id"),
+    is_active: Optional[int] = Query(
+        None,
+        ge=0,
+        le=1,
+        description="库房启用：1 启用 0 停用；不传不限定",
+    ),
+    benchmark_city: Optional[str] = Query(None, description="配置对标城市精确（TRIM）"),
+    benchmark_city_keyword: Optional[str] = Query(None, description="对标城市模糊（LIKE）"),
+    keyword: Optional[str] = Query(
+        None,
+        description="库房名/省/市/区/对标城市 合一模糊（OR，LIKE）",
+    ),
+    city_spread_min: Optional[float] = Query(None, description="对标城市差额下限（含）"),
+    city_spread_max: Optional[float] = Query(None, description="对标城市差额上限（含）"),
+    gross_margin_min: Optional[float] = Query(None, description="毛利（配置版）下限（含）"),
+    gross_margin_max: Optional[float] = Query(None, description="毛利（配置版）上限（含）"),
+    has_gross_margin: Optional[bool] = Query(
+        None,
+        description="true=仅已填毛利配置；false=仅未填；不传不限定",
+    ),
+    created_from: Optional[str] = Query(None, description="配置创建日起 YYYY-MM-DD"),
+    created_to: Optional[str] = Query(None, description="配置创建日止 YYYY-MM-DD"),
+    updated_from: Optional[str] = Query(None, description="配置更新日起 YYYY-MM-DD"),
+    updated_to: Optional[str] = Query(None, description="配置更新日止 YYYY-MM-DD"),
     service: TLService = Depends(get_tl_service),
 ):
     try:
         return service.list_warehouse_spread_configs(
             page=page,
             page_size=page_size,
+            config_id=config_row_id,
             warehouse_id=warehouse_id,
+            warehouse_ids=warehouse_ids,
+            province=province,
+            province_keyword=province_keyword,
+            city=city,
+            city_keyword=city_keyword,
+            district=district,
+            district_keyword=district_keyword,
+            warehouse_name=warehouse_name,
+            warehouse_name_keyword=warehouse_name_keyword,
+            warehouse_type_id=warehouse_type_id,
+            is_active=is_active,
+            benchmark_city=benchmark_city,
+            benchmark_city_keyword=benchmark_city_keyword,
+            keyword=keyword,
+            city_spread_min=city_spread_min,
+            city_spread_max=city_spread_max,
+            gross_margin_min=gross_margin_min,
+            gross_margin_max=gross_margin_max,
+            has_gross_margin=has_gross_margin,
+            created_from=created_from,
+            created_to=created_to,
+            updated_from=updated_from,
+            updated_to=updated_to,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -1878,6 +2001,39 @@ def warehouse_spread_configs_delete(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.post("/import_warehouse_spread_excel", summary="导入库房对标差额与毛利（Excel xlsx）")
+async def import_warehouse_spread_excel(
+    file: UploadFile = File(..., description="库房分析类 xlsx；读取工作簿内全部工作表"),
+    overwrite: bool = Form(
+        True,
+        description="true=已存在配置则按 Excel 非空字段更新；false=跳过已有配置的库房",
+    ),
+    service: TLService = Depends(get_tl_service),
+):
+    """
+    解析「库房分析」类 Excel（含多个工作表），写入 ``pd_warehouse_spread_configs``。
+
+    列识别：库房名称、毛利/保底毛利、定价/库房报价、对比/对标差额列；差额缺省时可由定价减省份对标价推算。
+    库房按名称匹配 ``dict_warehouses``（不自动新建）。
+    """
+    fn = (file.filename or "").lower()
+    if not fn.endswith((".xlsx", ".xlsm")):
+        raise HTTPException(status_code=400, detail="请上传 .xlsx 或 .xlsm 文件")
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="文件内容为空")
+    try:
+        return await asyncio.to_thread(
+            service.import_warehouse_spread_excel,
+            raw,
+            overwrite=overwrite,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/ai_pricing_analysis", summary="库房 AI 定价对标分析（实时计算，不落库）")
 def ai_pricing_analysis(
     page: int = Query(1, ge=1),
@@ -1886,9 +2042,43 @@ def ai_pricing_analysis(
         None,
         description="口径日期 YYYY-MM-DD；解析对标价、标定价、运费时取该日及以前最新一条",
     ),
+    warehouse_id: Optional[int] = Query(None, ge=1, description="库房 id 精确"),
     warehouse_ids: Optional[List[int]] = Query(
         None,
-        description="仅分析列出的库房 id；可重复 query 参数",
+        description="库房 id 列表（可重复 query 参数，如 warehouse_ids=1&warehouse_ids=2）",
+    ),
+    province: Optional[str] = Query(None, description="库房所在省精确（TRIM）"),
+    province_keyword: Optional[str] = Query(None, description="省模糊（LIKE）"),
+    city: Optional[str] = Query(None, description="库房所在市精确（TRIM）"),
+    city_keyword: Optional[str] = Query(None, description="市模糊（LIKE）"),
+    district: Optional[str] = Query(None, description="库房所在区县精确（TRIM）"),
+    district_keyword: Optional[str] = Query(None, description="区县模糊（LIKE）"),
+    warehouse_name: Optional[str] = Query(None, description="库房名称精确（TRIM）"),
+    warehouse_name_keyword: Optional[str] = Query(None, description="库房名称模糊（LIKE）"),
+    warehouse_type_id: Optional[int] = Query(None, ge=1, description="库房类型 id"),
+    is_active: Optional[int] = Query(
+        None,
+        ge=0,
+        le=1,
+        description="库房启用：1 启用 0 停用；不传则默认仅启用库房",
+    ),
+    benchmark_city: Optional[str] = Query(None, description="配置对标城市精确（TRIM）"),
+    benchmark_city_keyword: Optional[str] = Query(None, description="对标城市模糊（LIKE）"),
+    keyword: Optional[str] = Query(
+        None,
+        description="库房名/省/市/区/对标城市 合一模糊（OR，LIKE）",
+    ),
+    city_spread_min: Optional[float] = Query(None, description="对标城市差额下限（含）"),
+    city_spread_max: Optional[float] = Query(None, description="对标城市差额上限（含）"),
+    gross_margin_min: Optional[float] = Query(None, description="毛利（配置版）下限（含）"),
+    gross_margin_max: Optional[float] = Query(None, description="毛利（配置版）上限（含）"),
+    has_gross_margin: Optional[bool] = Query(
+        None,
+        description="true=仅已填毛利配置；false=仅未填；不传不限定",
+    ),
+    has_spread_config: Optional[bool] = Query(
+        None,
+        description="true=仅已有差额配置；false=仅未配置；不传不限定",
     ),
     service: TLService = Depends(get_tl_service),
 ):
@@ -1896,7 +2086,27 @@ def ai_pricing_analysis(
         return service.get_ai_pricing_analysis(
             page=page,
             page_size=page_size,
+            warehouse_id=warehouse_id,
             warehouse_ids=warehouse_ids,
+            province=province,
+            province_keyword=province_keyword,
+            city=city,
+            city_keyword=city_keyword,
+            district=district,
+            district_keyword=district_keyword,
+            warehouse_name=warehouse_name,
+            warehouse_name_keyword=warehouse_name_keyword,
+            warehouse_type_id=warehouse_type_id,
+            is_active=is_active,
+            benchmark_city=benchmark_city,
+            benchmark_city_keyword=benchmark_city_keyword,
+            keyword=keyword,
+            city_spread_min=city_spread_min,
+            city_spread_max=city_spread_max,
+            gross_margin_min=gross_margin_min,
+            gross_margin_max=gross_margin_max,
+            has_gross_margin=has_gross_margin,
+            has_spread_config=has_spread_config,
             as_of_date=as_of_date,
         )
     except ValueError as e:

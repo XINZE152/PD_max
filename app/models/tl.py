@@ -386,6 +386,10 @@ class UpdateWarehouseTypeRequest(BaseModel):
 class AddSmelterRequest(BaseModel):
     """新建冶炼厂（比价侧不设标记颜色；经纬度默认由天地图根据地址解析）"""
     冶炼厂名: str = Field(..., description="冶炼厂名称")
+    循融宝发货: bool = Field(
+        False,
+        description="是否循融宝发货；与修改冶炼厂中该字段含义一致，新建默认否",
+    )
     地址: Optional[str] = Field(None, description="详细地址（与省市区一并传时走完整落库）")
     省: Optional[str] = None
     市: Optional[str] = None
@@ -673,12 +677,43 @@ class ConfirmPriceTableRequest(BaseModel):
     报价日期: str = Field(..., description="报价日期，格式 YYYY-MM-DD")
     full_data: Optional[VlmFullData] = Field(None, description="VLM提取的完整原始数据，存入元数据表")
     数据: List[ConfirmPriceTableItem] = Field(..., description="报价明细列表（前端确认/修改后）")
+    同冶炼厂当日整表覆盖: bool = Field(
+        False,
+        description=(
+            "为 true 时，在写入前删除「本次请求中出现的冶炼厂」在该报价日期下的全部 quote_details，"
+            "再写入当前明细，避免同日同厂残留旧品种或别称重复行；整单上传/Excel 确认建议传 true。"
+            "为 false（默认）时仅按 (厂+品种+日期) 逐条插入或更新，不删除未出现在本批中的品种。"
+        ),
+    )
 
 
 class ManualQuoteRequest(ConfirmPriceTableRequest):
     """手写录入报价：字段与 confirm_price_table 相同；无需上传图片，full_data 可省略。"""
 
     model_config = ConfigDict(extra="ignore")
+
+    @model_validator(mode="after")
+    def _manual_quote_stricter(self) -> "ManualQuoteRequest":
+        price_keys = (
+            "价格",
+            "价格_1pct增值税",
+            "价格_3pct增值税",
+            "价格_13pct增值税",
+            "普通发票价格",
+            "反向发票价格",
+        )
+        for idx, row in enumerate(self.数据):
+            sm = str(row.冶炼厂名 or "").strip()
+            cat = str(row.品类名 or "").strip()
+            if len(sm) < 2:
+                raise ValueError(f"第 {idx + 1} 条：冶炼厂名称过短或为空（至少 2 个字符）")
+            if len(cat) < 2:
+                raise ValueError(f"第 {idx + 1} 条：品类名称过短或为空（至少 2 个字符）")
+            if not any(getattr(row, k) is not None for k in price_keys):
+                raise ValueError(
+                    f"第 {idx + 1} 条：须至少填写基准价、某一档 1%/3%/13% 含税价、普票或反向发票价之一"
+                )
+        return self
 
 
 class UpdateQuoteDetailRequest(BaseModel):
@@ -816,7 +851,7 @@ class ProvinceBenchmarkPriceCreate(BaseModel):
 
 
 class ProvinceBenchmarkPriceUpdate(BaseModel):
-    """修改某条省份对标定价历史"""
+    """修订某条省份对标定价历史（保留源记录，服务端插入合并后的新历史行）"""
 
     model_config = ConfigDict(extra="ignore")
 
@@ -837,7 +872,7 @@ class SmelterCalibrationPriceCreate(BaseModel):
 
 
 class SmelterCalibrationPriceUpdate(BaseModel):
-    """修改冶炼厂标定价格历史记录"""
+    """修订冶炼厂标定价格历史（保留源记录，服务端插入合并后的新历史行）"""
 
     model_config = ConfigDict(extra="ignore")
 
