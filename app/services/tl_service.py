@@ -133,10 +133,17 @@ def _build_comparison_price_metrics(
     t: float,
     fr: float,
     bases: List[str],
+    sort_basis: str,
 ) -> Dict[str, Any]:
     """
     由 resolve 得到的报价与运费、吨数生成比价行中的价/税/利润字段块
     （不含仓库、冶炼厂、品类等展示维度）。
+
+    **总回收价**/**总回收价元每吨** 随 sort_basis（最优价排序口径）变化，为冶炼厂按该口径
+    支付的整单货款（元/吨×吨数，不减运费）。与 ``最优价各口径利润[sort_basis]`` 关系：
+    ``总回收价 = 最优价各口径利润[sort_basis] + 总运费``（有报价时）。
+    ``总价``/``报价金额`` 仍按 price_type 折合不含税 p_net，语义不变；sort_basis=base 且
+    p_net 亦为基准时二者可能数值相等，但展示口径不同。
     """
     if price is not None and target_tax and target_tax in merged:
         p_net = round(net_from_inclusive(float(price), merged[target_tax]), 2)
@@ -177,6 +184,16 @@ def _build_comparison_price_metrics(
             round(u * t - freight_cost_total, 2) if u is not None else None
         )
 
+    if source == "unavailable":
+        recovery_unit: Optional[float] = None
+        recovery_total: Optional[float] = None
+    else:
+        u_sort = _unit_for_optimal_price_basis(sort_basis, breakdown, qrow)
+        recovery_unit = round(u_sort, 2) if u_sort is not None else None
+        recovery_total = (
+            round(recovery_unit * t, 2) if recovery_unit is not None else None
+        )
+
     return {
         "单价": p_net if source != "unavailable" else None,
         "总价": quote_amount,
@@ -192,6 +209,8 @@ def _build_comparison_price_metrics(
         "利润": profit,
         "利润_基准": profit_base,
         "利润_含3%": profit_3,
+        "总回收价元每吨": recovery_unit,
+        "总回收价": recovery_total,
         "最优价各口径利润": optimal_profits,
     }
 
@@ -2694,6 +2713,8 @@ class TLService:
                 "利润",
                 "利润_基准",
                 "利润_含3%",
+                "总回收价元每吨",
+                "总回收价",
                 "最优价各口径利润",
             )
 
@@ -2734,6 +2755,7 @@ class TLService:
                             t,
                             fr,
                             bases,
+                            sort_basis,
                         )
                         metrics_inc = _build_comparison_price_metrics(
                             price_inc,
@@ -2744,6 +2766,7 @@ class TLService:
                             t,
                             fr,
                             bases,
+                            sort_basis,
                         )
                         top = metrics_inc
                     else:
@@ -2756,6 +2779,7 @@ class TLService:
                             t,
                             fr,
                             bases,
+                            sort_basis,
                         )
                         metrics_exc = metrics_inc
                         top = metrics_inc
