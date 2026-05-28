@@ -211,6 +211,8 @@ def add_warehouse(
             contact_phone=body.电话,
             hazardous_waste_license_qty=body.危废经营许可数量,
             monthly_avg_receipt_ton=body.月均收货,
+            current_inventory_ton=body.当前库存,
+            receipt_price_per_ton=body.收货价格,
             freight_amount=body.运费,
         )
     except ValueError as e:

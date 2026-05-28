@@ -169,6 +169,8 @@ TABLE_STATEMENTS = [
         contact_phone VARCHAR(32) DEFAULT NULL COMMENT '电话',
         hazardous_waste_license_qty DECIMAL(14, 4) DEFAULT NULL COMMENT '危废经营许可数量',
         monthly_avg_receipt_ton DECIMAL(14, 4) DEFAULT NULL COMMENT '月均收货(吨)',
+        current_inventory_ton DECIMAL(14, 4) DEFAULT NULL COMMENT '当前库存(吨)',
+        receipt_price_per_ton DECIMAL(14, 4) DEFAULT NULL COMMENT '收货价格(元/吨)',
         freight_amount DECIMAL(14, 4) DEFAULT NULL COMMENT '运费参考(元)',
         is_active TINYINT(1) DEFAULT 1 COMMENT '是否启用',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -1322,6 +1324,10 @@ def create_tables() -> None:
     except Exception:
         logger.exception("检查/添加 dict_warehouses 业务扩展列失败")
     try:
+        ensure_dict_warehouses_inventory_price_columns()
+    except Exception:
+        logger.exception("检查/添加 dict_warehouses 当前库存/收货价格列失败")
+    try:
         ensure_dict_warehouse_links_tier_price_spread_column()
     except Exception:
         logger.exception("检查/添加 dict_warehouse_links.tier_price_spread 失败")
@@ -1463,6 +1469,44 @@ def ensure_dict_warehouses_business_columns() -> None:
                     "COMMENT '运费参考(元)' AFTER monthly_avg_receipt_ton"
                 )
                 logger.info("已为 dict_warehouses 添加 freight_amount")
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def ensure_dict_warehouses_inventory_price_columns() -> None:
+    """当前库存、收货价格（旧库补列）。"""
+    config_dict = get_mysql_config()
+    connection = pymysql.connect(**config_dict)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SHOW TABLES LIKE 'dict_warehouses'")
+            if cursor.fetchone() is None:
+                return
+
+            def _has_col(col: str) -> bool:
+                cursor.execute(
+                    "SELECT COUNT(*) FROM information_schema.columns "
+                    "WHERE table_schema = DATABASE() AND table_name = 'dict_warehouses' "
+                    "AND column_name = %s",
+                    (col,),
+                )
+                return cursor.fetchone()[0] > 0
+
+            if not _has_col("current_inventory_ton"):
+                cursor.execute(
+                    "ALTER TABLE dict_warehouses ADD COLUMN current_inventory_ton "
+                    "DECIMAL(14, 4) DEFAULT NULL COMMENT '当前库存(吨)' "
+                    "AFTER monthly_avg_receipt_ton"
+                )
+                logger.info("已为 dict_warehouses 添加 current_inventory_ton")
+            if not _has_col("receipt_price_per_ton"):
+                cursor.execute(
+                    "ALTER TABLE dict_warehouses ADD COLUMN receipt_price_per_ton "
+                    "DECIMAL(14, 4) DEFAULT NULL COMMENT '收货价格(元/吨)' "
+                    "AFTER current_inventory_ton"
+                )
+                logger.info("已为 dict_warehouses 添加 receipt_price_per_ton")
         connection.commit()
     finally:
         connection.close()

@@ -419,6 +419,8 @@ class TLService:
         contact_phone: Optional[str] = None,
         hazardous_waste_license_qty: Optional[float] = None,
         monthly_avg_receipt_ton: Optional[float] = None,
+        current_inventory_ton: Optional[float] = None,
+        receipt_price_per_ton: Optional[float] = None,
         freight_amount: Optional[float] = None,
     ) -> Dict[str, Any]:
         """极简录入仅 name/地址；含省市区详址时走 tl_dict_geo_crud，经纬度默认天地图（未同时传经度+纬度时）。"""
@@ -452,6 +454,10 @@ class TLService:
                 payload["hazardous_waste_license_qty"] = hazardous_waste_license_qty
             if monthly_avg_receipt_ton is not None:
                 payload["monthly_avg_receipt_ton"] = monthly_avg_receipt_ton
+            if current_inventory_ton is not None:
+                payload["current_inventory_ton"] = current_inventory_ton
+            if receipt_price_per_ton is not None:
+                payload["receipt_price_per_ton"] = receipt_price_per_ton
             if freight_amount is not None:
                 payload["freight_amount"] = freight_amount
             try:
@@ -619,6 +625,8 @@ class TLService:
             "电话": item.get("contactPhone") or "",
             "危废经营许可数量": item.get("hazardousWasteLicenseQty"),
             "月均收货": item.get("monthlyAvgReceiptTon"),
+            "当前库存": item.get("currentInventoryTon"),
+            "收货价格": item.get("receiptPricePerTon"),
             "运费": item.get("freightAmount"),
             "仓库类型id": wt_id,
             "类型": tname,
@@ -648,6 +656,59 @@ class TLService:
         except Exception as e:
             logger.warning(f"批量加载库房类型颜色失败: {e}")
         return out
+
+    def _batch_warehouse_factory_freights(
+        self, warehouse_ids: List[int]
+    ) -> Dict[int, List[Dict[str, Any]]]:
+        """批量查询各库房到冶炼厂最新生效日运费。"""
+        ids = list(dict.fromkeys(int(x) for x in warehouse_ids if x is not None))
+        out: Dict[int, List[Dict[str, Any]]] = {wid: [] for wid in ids}
+        if not ids:
+            return out
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    ph = ",".join(["%s"] * len(ids))
+                    cur.execute(
+                        f"""
+                        SELECT fr.warehouse_id, df.id, df.name, fr.price_per_ton
+                        FROM freight_rates fr
+                        JOIN dict_factories df ON df.id = fr.factory_id
+                        WHERE fr.warehouse_id IN ({ph})
+                          AND fr.effective_date = (
+                              SELECT MAX(fr2.effective_date)
+                              FROM freight_rates fr2
+                              WHERE fr2.factory_id = fr.factory_id
+                                AND fr2.warehouse_id = fr.warehouse_id
+                          )
+                        ORDER BY fr.warehouse_id, df.id
+                        """,
+                        tuple(ids),
+                    )
+                    for wid, fid, fname, freight in cur.fetchall():
+                        wid_i = int(wid)
+                        out.setdefault(wid_i, []).append(
+                            {
+                                "目标冶炼厂id": int(fid),
+                                "目标冶炼厂": str(fname),
+                                "运费": float(freight) if freight is not None else None,
+                            }
+                        )
+        except Exception as e:
+            logger.warning(f"批量加载库房到冶炼厂运费失败: {e}")
+        return out
+
+    def _enrich_warehouse_rows_with_freight(
+        self, rows: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        if not rows:
+            return rows
+        wh_ids = [int(r["仓库id"]) for r in rows if r.get("仓库id") is not None]
+        freight_map = self._batch_warehouse_factory_freights(wh_ids)
+        for rec in rows:
+            wid = int(rec["仓库id"])
+            rec["库房到冶炼厂运费"] = freight_map.get(wid, [])
+        return rows
 
     def get_warehouses(
         self,
@@ -691,6 +752,7 @@ class TLService:
                     row["库房类型颜色配置"] = t_cc
                     row["颜色配置"] = t_cc
                     out_rows.append(row)
+                out_rows = self._enrich_warehouse_rows_with_freight(out_rows)
                 return {
                     "list": out_rows,
                     "total": int(payload.get("total") or 0),
@@ -721,6 +783,8 @@ class TLService:
                         f"dw.contact_phone AS `电话`, "
                         f"dw.hazardous_waste_license_qty AS `危废经营许可数量`, "
                         f"dw.monthly_avg_receipt_ton AS `月均收货`, "
+                        f"dw.current_inventory_ton AS `当前库存`, "
+                        f"dw.receipt_price_per_ton AS `收货价格`, "
                         f"dw.freight_amount AS `运费`, "
                         f"dw.warehouse_type_id AS `仓库类型id`, "
                         f"wt.name AS `类型`, wt.color_config AS `库房类型颜色配置`, "
@@ -738,6 +802,8 @@ class TLService:
                         rec = dict(zip(columns, row))
                         hw = rec.get("危废经营许可数量")
                         mar = rec.get("月均收货")
+                        cit = rec.get("当前库存")
+                        rpp = rec.get("收货价格")
                         fa = rec.get("运费")
                         rec["库房联系人"] = rec.get("库房联系人") or ""
                         rec["电话"] = rec.get("电话") or ""
@@ -745,6 +811,8 @@ class TLService:
                             float(hw) if hw is not None else None
                         )
                         rec["月均收货"] = float(mar) if mar is not None else None
+                        rec["当前库存"] = float(cit) if cit is not None else None
+                        rec["收货价格"] = float(rpp) if rpp is not None else None
                         rec["运费"] = float(fa) if fa is not None else None
                         type_cc = _color_config_from_db(rec.get("库房类型颜色配置"))
                         wh_cc = _color_config_from_db(rec.get("仓库颜色配置"))
@@ -752,7 +820,7 @@ class TLService:
                         rec["仓库颜色配置"] = wh_cc
                         rec["颜色配置"] = type_cc
                         out.append(rec)
-                    return out
+                    return self._enrich_warehouse_rows_with_freight(out)
         except Exception as e:
             logger.error(f"获取仓库列表失败: {e}")
             raise
@@ -761,7 +829,15 @@ class TLService:
 
     _WH_SITE_PATCH_KEYS = frozenset({"省", "市", "区", "经度", "纬度", "库房类型名"})
     _WH_BUSINESS_PATCH_KEYS = frozenset(
-        {"库房联系人", "电话", "危废经营许可数量", "月均收货", "运费"}
+        {
+            "库房联系人",
+            "电话",
+            "危废经营许可数量",
+            "月均收货",
+            "当前库存",
+            "收货价格",
+            "运费",
+        }
     )
 
     def _business_warehouse_patch_cn_to_en(self, patch: Dict[str, Any]) -> Dict[str, Any]:
@@ -777,6 +853,10 @@ class TLService:
             out["hazardous_waste_license_qty"] = patch.get("危废经营许可数量")
         if "月均收货" in patch:
             out["monthly_avg_receipt_ton"] = patch.get("月均收货")
+        if "当前库存" in patch:
+            out["current_inventory_ton"] = patch.get("当前库存")
+        if "收货价格" in patch:
+            out["receipt_price_per_ton"] = patch.get("收货价格")
         if "运费" in patch:
             out["freight_amount"] = patch.get("运费")
         return out
@@ -842,7 +922,7 @@ class TLService:
             raise ValueError(
                 "至少需要提供一个待修改字段：仓库名、is_active、地址、仓库类型id、仓库颜色配置、"
                 "省、市、区、经度、纬度、库房类型名、"
-                "库房联系人、电话、危废经营许可数量、月均收货、运费 之一"
+                "库房联系人、电话、危废经营许可数量、月均收货、当前库存、收货价格、运费 之一"
             )
 
         biz_patch = self._business_warehouse_patch_cn_to_en(patch)
@@ -1883,6 +1963,70 @@ class TLService:
 
     # ==================== 接口2c：删除冶炼厂（软删除） ====================
 
+    _SMELTER_CHILD_COUNT_SQL = """
+        SELECT
+          (SELECT COUNT(*) FROM factory_demand_items fdi
+             INNER JOIN factory_demands fd ON fd.id = fdi.demand_id
+             WHERE fd.factory_id = %s),
+          (SELECT COUNT(*) FROM factory_demands WHERE factory_id = %s),
+          (SELECT COUNT(*) FROM quote_details WHERE factory_id = %s),
+          (SELECT COUNT(*) FROM quote_table_metadata WHERE factory_id = %s),
+          (SELECT COUNT(*) FROM freight_rates WHERE factory_id = %s),
+          (SELECT COUNT(*) FROM pd_smelter_calibration_prices WHERE factory_id = %s),
+          (SELECT COUNT(*) FROM factory_tax_rates WHERE factory_id = %s)
+    """
+
+    def _smelter_child_counts(self, cur, smelter_id: int) -> Dict[str, int]:
+        cur.execute(self._SMELTER_CHILD_COUNT_SQL, (smelter_id,) * 7)
+        c_row = cur.fetchone()
+        return {
+            "factory_demand_items": int(c_row[0] or 0),
+            "factory_demands": int(c_row[1] or 0),
+            "quote_details": int(c_row[2] or 0),
+            "quote_table_metadata": int(c_row[3] or 0),
+            "freight_rates": int(c_row[4] or 0),
+            "pd_smelter_calibration_prices": int(c_row[5] or 0),
+            "factory_tax_rates": int(c_row[6] or 0),
+        }
+
+    def _purge_smelter_cascade(self, cur, smelter_id: int) -> Dict[str, int]:
+        counts = self._smelter_child_counts(cur, smelter_id)
+        cur.execute(
+            """
+            DELETE fdi FROM factory_demand_items fdi
+            INNER JOIN factory_demands fd ON fd.id = fdi.demand_id
+            WHERE fd.factory_id = %s
+            """,
+            (smelter_id,),
+        )
+        cur.execute(
+            "DELETE FROM factory_demands WHERE factory_id = %s",
+            (smelter_id,),
+        )
+        cur.execute(
+            "DELETE FROM quote_details WHERE factory_id = %s",
+            (smelter_id,),
+        )
+        cur.execute(
+            "DELETE FROM quote_table_metadata WHERE factory_id = %s",
+            (smelter_id,),
+        )
+        cur.execute(
+            "DELETE FROM freight_rates WHERE factory_id = %s",
+            (smelter_id,),
+        )
+        cur.execute(
+            "DELETE FROM pd_smelter_calibration_prices WHERE factory_id = %s",
+            (smelter_id,),
+        )
+        cur.execute(
+            "DELETE FROM dict_factories WHERE id = %s",
+            (smelter_id,),
+        )
+        if cur.rowcount == 0:
+            raise ValueError(f"冶炼厂 id={smelter_id} 删除失败")
+        return counts
+
     def delete_smelter(self, smelter_id: int) -> Dict[str, Any]:
         try:
             with get_conn() as conn:
@@ -1914,18 +2058,6 @@ class TLService:
         if smelter_id < 1:
             raise ValueError("冶炼厂 id 无效")
 
-        _child_count_sql = """
-            SELECT
-              (SELECT COUNT(*) FROM factory_demand_items fdi
-                 INNER JOIN factory_demands fd ON fd.id = fdi.demand_id
-                 WHERE fd.factory_id = %s),
-              (SELECT COUNT(*) FROM factory_demands WHERE factory_id = %s),
-              (SELECT COUNT(*) FROM quote_details WHERE factory_id = %s),
-              (SELECT COUNT(*) FROM quote_table_metadata WHERE factory_id = %s),
-              (SELECT COUNT(*) FROM freight_rates WHERE factory_id = %s),
-              (SELECT COUNT(*) FROM factory_tax_rates WHERE factory_id = %s)
-        """
-
         try:
             if cascade:
                 with get_conn() as conn:
@@ -1940,47 +2072,7 @@ class TLService:
                             if not row:
                                 raise ValueError(f"冶炼厂 id={smelter_id} 不存在")
                             factory_name = str(row[1])
-                            cur.execute(_child_count_sql, (smelter_id,) * 6)
-                            c_row = cur.fetchone()
-                            n_di, n_dm, n_qd, n_qm, n_fr, n_tr = (
-                                int(c_row[0] or 0),
-                                int(c_row[1] or 0),
-                                int(c_row[2] or 0),
-                                int(c_row[3] or 0),
-                                int(c_row[4] or 0),
-                                int(c_row[5] or 0),
-                            )
-
-                            cur.execute(
-                                """
-                                DELETE fdi FROM factory_demand_items fdi
-                                INNER JOIN factory_demands fd ON fd.id = fdi.demand_id
-                                WHERE fd.factory_id = %s
-                                """,
-                                (smelter_id,),
-                            )
-                            cur.execute(
-                                "DELETE FROM factory_demands WHERE factory_id = %s",
-                                (smelter_id,),
-                            )
-                            cur.execute(
-                                "DELETE FROM quote_details WHERE factory_id = %s",
-                                (smelter_id,),
-                            )
-                            cur.execute(
-                                "DELETE FROM quote_table_metadata WHERE factory_id = %s",
-                                (smelter_id,),
-                            )
-                            cur.execute(
-                                "DELETE FROM freight_rates WHERE factory_id = %s",
-                                (smelter_id,),
-                            )
-                            cur.execute(
-                                "DELETE FROM dict_factories WHERE id = %s",
-                                (smelter_id,),
-                            )
-                            if cur.rowcount == 0:
-                                raise ValueError(f"冶炼厂 id={smelter_id} 删除失败")
+                            deleted_counts = self._purge_smelter_cascade(cur, smelter_id)
                         conn.commit()
                     except Exception:
                         conn.rollback()
@@ -1988,15 +2080,17 @@ class TLService:
 
                 log_finance_event(
                     "冶炼厂硬删除(级联) | id=%s name=%s | 删 demand_items=%s demands=%s "
-                    "quote_details=%s quote_metadata=%s freight_rates=%s tax_rates(删厂前)=%s",
+                    "quote_details=%s quote_metadata=%s freight_rates=%s "
+                    "calibration_prices=%s tax_rates(删厂前)=%s",
                     smelter_id,
                     factory_name,
-                    n_di,
-                    n_dm,
-                    n_qd,
-                    n_qm,
-                    n_fr,
-                    n_tr,
+                    deleted_counts["factory_demand_items"],
+                    deleted_counts["factory_demands"],
+                    deleted_counts["quote_details"],
+                    deleted_counts["quote_table_metadata"],
+                    deleted_counts["freight_rates"],
+                    deleted_counts["pd_smelter_calibration_prices"],
+                    deleted_counts["factory_tax_rates"],
                 )
                 return {
                     "code": 200,
@@ -2004,14 +2098,7 @@ class TLService:
                         f"已永久删除冶炼厂 id={smelter_id}，并清除关联数据（见 deleted_counts）"
                     ),
                     "cascade": True,
-                    "deleted_counts": {
-                        "factory_demand_items": n_di,
-                        "factory_demands": n_dm,
-                        "quote_details": n_qd,
-                        "quote_table_metadata": n_qm,
-                        "freight_rates": n_fr,
-                        "factory_tax_rates": n_tr,
-                    },
+                    "deleted_counts": deleted_counts,
                 }
 
             with get_conn() as conn:
@@ -2022,23 +2109,19 @@ class TLService:
                     )
                     if not cur.fetchone():
                         raise ValueError(f"冶炼厂 id={smelter_id} 不存在")
-                    cur.execute(_child_count_sql, (smelter_id,) * 6)
-                    c_row = cur.fetchone()
-                    n_di, n_dm, n_qd, n_qm, n_fr, n_tr = (
-                        int(c_row[0] or 0),
-                        int(c_row[1] or 0),
-                        int(c_row[2] or 0),
-                        int(c_row[3] or 0),
-                        int(c_row[4] or 0),
-                        int(c_row[5] or 0),
-                    )
-                    total_children = n_di + n_dm + n_qd + n_qm + n_fr + n_tr
+                    counts = self._smelter_child_counts(cur, smelter_id)
+                    total_children = sum(counts.values())
                     if total_children > 0:
                         raise ValueError(
                             "已指定 cascade=false（仅当无子表引用时才删厂）。"
                             f"冶炼厂 id={smelter_id} 仍存在关联："
-                            f"demand_items={n_di}, demands={n_dm}, quote_details={n_qd}, "
-                            f"quote_metadata={n_qm}, freight_rates={n_fr}, tax_rates={n_tr}。"
+                            f"demand_items={counts['factory_demand_items']}, "
+                            f"demands={counts['factory_demands']}, "
+                            f"quote_details={counts['quote_details']}, "
+                            f"quote_metadata={counts['quote_table_metadata']}, "
+                            f"freight_rates={counts['freight_rates']}, "
+                            f"calibration_prices={counts['pd_smelter_calibration_prices']}, "
+                            f"tax_rates={counts['factory_tax_rates']}。"
                             "默认删除会级联清空上述数据，请勿传 cascade=false；或先手工清理子表。"
                         )
                     cur.execute(

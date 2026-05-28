@@ -146,6 +146,8 @@ def _warehouse_row_api(
     cc = _norm_cc_db(row.get("color_config"))
     hw = row.get("hazardous_waste_license_qty")
     mar = row.get("monthly_avg_receipt_ton")
+    cit = row.get("current_inventory_ton")
+    rpp = row.get("receipt_price_per_ton")
     fa = row.get("freight_amount")
     return {
         "id": int(row["id"]),
@@ -162,6 +164,8 @@ def _warehouse_row_api(
         "contactPhone": row.get("contact_phone") or "",
         "hazardousWasteLicenseQty": float(hw) if hw is not None else None,
         "monthlyAvgReceiptTon": float(mar) if mar is not None else None,
+        "currentInventoryTon": float(cit) if cit is not None else None,
+        "receiptPricePerTon": float(rpp) if rpp is not None else None,
         "freightAmount": float(fa) if fa is not None else None,
         "status": 1 if int(row.get("is_active", 1)) == 1 else 0,
         "createTime": _fmt_ts(row.get("created_at")),
@@ -253,6 +257,8 @@ def warehouse_create(payload: Dict[str, Any]) -> Dict[str, Any]:
         cp = str(payload.get("contact_phone") or "").strip() or None
         hq = _opt_float_val(payload.get("hazardous_waste_license_qty"))
         mar = _opt_float_val(payload.get("monthly_avg_receipt_ton"))
+        cit = _opt_float_val(payload.get("current_inventory_ton"))
+        rpp = _opt_float_val(payload.get("receipt_price_per_ton"))
         fa = _opt_float_val(payload.get("freight_amount"))
 
         with get_conn() as conn:
@@ -272,8 +278,9 @@ def warehouse_create(payload: Dict[str, Any]) -> Dict[str, Any]:
                     "INSERT INTO dict_warehouses (name, province, city, district, address, "
                     "warehouse_type_id, color_config, longitude, latitude, "
                     "contact_name, contact_phone, hazardous_waste_license_qty, "
-                    "monthly_avg_receipt_ton, freight_amount, is_active) "
-                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    "monthly_avg_receipt_ton, current_inventory_ton, receipt_price_per_ton, "
+                    "freight_amount, is_active) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                     (
                         name,
                         province,
@@ -288,6 +295,8 @@ def warehouse_create(payload: Dict[str, Any]) -> Dict[str, Any]:
                         cp,
                         hq,
                         mar,
+                        cit,
+                        rpp,
                         fa,
                         st,
                     ),
@@ -443,6 +452,8 @@ def warehouse_update(wh_id: int, patch: Dict[str, Any]) -> Dict[str, Any]:
                 for _k, _col in (
                     ("hazardous_waste_license_qty", "hazardous_waste_license_qty"),
                     ("monthly_avg_receipt_ton", "monthly_avg_receipt_ton"),
+                    ("current_inventory_ton", "current_inventory_ton"),
+                    ("receipt_price_per_ton", "receipt_price_per_ton"),
                     ("freight_amount", "freight_amount"),
                 ):
                     if _k not in patch:

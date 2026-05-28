@@ -270,6 +270,14 @@ class AddWarehouseRequest(BaseModel):
         None,
         description="月均收货量（吨，完整地址落库时可选）",
     )
+    当前库存: Optional[float] = Field(
+        None,
+        description="当前库存（吨，完整地址落库时可选）",
+    )
+    收货价格: Optional[float] = Field(
+        None,
+        description="收货价格（元/吨，完整地址落库时可选）",
+    )
     运费: Optional[float] = Field(
         None,
         description="运费参考（元，完整地址落库时可选）",
@@ -363,6 +371,8 @@ class UpdateWarehouseRequest(BaseModel):
     电话: Optional[str] = Field(None, description="电话；传 null 可清空")
     危废经营许可数量: Optional[float] = Field(None, description="危废经营许可数量；传 null 可清空")
     月均收货: Optional[float] = Field(None, description="月均收货（吨）；传 null 可清空")
+    当前库存: Optional[float] = Field(None, description="当前库存（吨）；传 null 可清空")
+    收货价格: Optional[float] = Field(None, description="收货价格（元/吨）；传 null 可清空")
     运费: Optional[float] = Field(None, description="运费参考（元）；传 null 可清空")
 
 
