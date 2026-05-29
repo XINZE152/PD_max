@@ -38,6 +38,10 @@ from app.price_tax_utils import (
     net_from_inclusive,
     parse_price_basis_from_remark,
 )
+from app.services.smelter_calibration_excel import (
+    SmelterCalibrationExcelError,
+    parse_smelter_calibration_workbook,
+)
 from app.services.warehouse_spread_excel import (
     SpreadImportRow,
     WarehouseSpreadExcelError,
@@ -6503,6 +6507,57 @@ class TLService:
                     )
         return {"code": 200, "data": {"total": total, "list": rows_out, "page": page, "page_size": page_size}}
 
+    def _resolve_smelter_calibration_factory_id(
+        self,
+        cur: Any,
+        *,
+        factory_id: Optional[int] = None,
+        factory_name: Optional[str] = None,
+    ) -> int:
+        if factory_id is not None and int(factory_id) >= 1:
+            fid = int(factory_id)
+            cur.execute("SELECT id FROM dict_factories WHERE id = %s", (fid,))
+            if cur.fetchone():
+                return fid
+            raise ValueError(f"冶炼厂 id={fid} 不存在")
+
+        name = (factory_name or "").strip()
+        if not name:
+            raise ValueError("冶炼厂 id 或名称至少填一项")
+
+        cur.execute(
+            "SELECT id, name FROM dict_factories WHERE TRIM(name) = %s",
+            (name,),
+        )
+        exact = cur.fetchall()
+        if len(exact) == 1:
+            return int(exact[0][0])
+        if len(exact) > 1:
+            raise ValueError(f"冶炼厂名称「{name}」存在多条精确匹配")
+
+        cur.execute("SELECT id, name FROM dict_factories")
+        factory_list = [(int(r[0]), str(r[1])) for r in cur.fetchall()]
+        matched = self._match_factory(name, factory_list)
+        if matched is not None:
+            return matched
+        raise ValueError(f"冶炼厂「{name}」在系统中不存在")
+
+    def _normalize_smelter_calibration_insert(
+        self,
+        *,
+        factory_id: int,
+        calibration_price: Any,
+        price_date: Optional[str] = None,
+        default_date: Optional[date] = None,
+    ) -> Tuple[int, Decimal, date]:
+        if factory_id < 1:
+            raise ValueError("冶炼厂 id 无效")
+        pd_day = default_date or self._pricing_calendar_date()
+        if price_date is not None and str(price_date).strip():
+            pd_day = date.fromisoformat(str(price_date).strip())
+        cp = Decimal(str(calibration_price))
+        return int(factory_id), cp, pd_day
+
     def create_smelter_calibration_price(
         self,
         *,
@@ -6510,17 +6565,16 @@ class TLService:
         calibration_price: Any,
         price_date: Optional[str] = None,
     ) -> Dict[str, Any]:
-        if factory_id < 1:
-            raise ValueError("冶炼厂 id 无效")
-        pd_day = self._pricing_calendar_date()
-        if price_date and str(price_date).strip():
-            pd_day = date.fromisoformat(str(price_date).strip())
-        cp = Decimal(str(calibration_price))
+        fid, cp, pd_day = self._normalize_smelter_calibration_insert(
+            factory_id=factory_id,
+            calibration_price=calibration_price,
+            price_date=price_date,
+        )
         with get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT id FROM dict_factories WHERE id = %s",
-                    (factory_id,),
+                    (fid,),
                 )
                 if not cur.fetchone():
                     raise ValueError("冶炼厂不存在")
@@ -6529,10 +6583,138 @@ class TLService:
                     INSERT INTO pd_smelter_calibration_prices (factory_id, calibration_price, price_date)
                     VALUES (%s, %s, %s)
                     """,
-                    (factory_id, cp, pd_day),
+                    (fid, cp, pd_day),
                 )
                 new_id = cur.lastrowid
         return {"code": 200, "msg": "已新增冶炼厂标定价格", "data": {"id": new_id}}
+
+    def batch_create_smelter_calibration_prices(
+        self,
+        items: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        if not items:
+            raise ValueError("列表不能为空")
+        if len(items) > 500:
+            raise ValueError("单次最多提交 500 条")
+
+        default_day = self._pricing_calendar_date()
+        normalized: List[Tuple[int, Decimal, date]] = []
+        for idx, it in enumerate(items, start=1):
+            try:
+                fid, cp, pd_day = self._normalize_smelter_calibration_insert(
+                    factory_id=int(it["冶炼厂id"]),
+                    calibration_price=it["标定价格"],
+                    price_date=it.get("定价日期"),
+                    default_date=default_day,
+                )
+            except ValueError as e:
+                raise ValueError(f"第 {idx} 条：{e}") from e
+            normalized.append((fid, cp, pd_day))
+
+        ids: List[int] = []
+        with get_conn() as conn:
+            conn.autocommit(False)
+            try:
+                with conn.cursor() as cur:
+                    for fid, cp, pd_day in normalized:
+                        cur.execute(
+                            "SELECT id FROM dict_factories WHERE id = %s",
+                            (fid,),
+                        )
+                        if not cur.fetchone():
+                            raise ValueError(f"冶炼厂 id={fid} 不存在")
+                        cur.execute(
+                            """
+                            INSERT INTO pd_smelter_calibration_prices
+                            (factory_id, calibration_price, price_date)
+                            VALUES (%s, %s, %s)
+                            """,
+                            (fid, cp, pd_day),
+                        )
+                        ids.append(int(cur.lastrowid))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+        return {
+            "code": 200,
+            "msg": f"已批量新增 {len(ids)} 条冶炼厂标定价格",
+            "data": {"inserted": len(ids), "ids": ids},
+        }
+
+    def import_smelter_calibration_excel(self, content: bytes) -> Dict[str, Any]:
+        try:
+            parsed_rows, meta = parse_smelter_calibration_workbook(content)
+        except SmelterCalibrationExcelError as e:
+            raise ValueError(str(e)) from e
+
+        default_day = self._pricing_calendar_date()
+        stats = {
+            "inserted": 0,
+            "skipped_empty": meta.get("skipped_empty", 0),
+            "skipped_errors": 0,
+        }
+        errors: List[str] = []
+        samples: List[Dict[str, Any]] = []
+        ids: List[int] = []
+
+        with get_conn() as conn:
+            conn.autocommit(False)
+            try:
+                with conn.cursor() as cur:
+                    for row in parsed_rows:
+                        try:
+                            fid = self._resolve_smelter_calibration_factory_id(
+                                cur,
+                                factory_id=row.factory_id,
+                                factory_name=row.factory_name,
+                            )
+                            pd_day = row.price_date or default_day
+                            cur.execute(
+                                """
+                                INSERT INTO pd_smelter_calibration_prices
+                                (factory_id, calibration_price, price_date)
+                                VALUES (%s, %s, %s)
+                                """,
+                                (fid, row.calibration_price, pd_day),
+                            )
+                            new_id = int(cur.lastrowid)
+                            ids.append(new_id)
+                            stats["inserted"] += 1
+                            if len(samples) < 20:
+                                samples.append(
+                                    {
+                                        "Excel行": row.excel_row,
+                                        "id": new_id,
+                                        "冶炼厂id": fid,
+                                        "标定价格": _cell_json(row.calibration_price),
+                                        "定价日期": pd_day.isoformat(),
+                                    }
+                                )
+                        except ValueError as e:
+                            stats["skipped_errors"] += 1
+                            errors.append(f"第 {row.excel_row} 行：{e}")
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+        msg = f"已导入 {stats['inserted']} 条冶炼厂标定价格"
+        if stats["skipped_errors"]:
+            msg += f"，{stats['skipped_errors']} 行跳过"
+
+        return {
+            "code": 200,
+            "msg": msg,
+            "data": {
+                **meta,
+                **stats,
+                "ids": ids,
+                "errors": errors[:50],
+                "samples": samples,
+            },
+        }
 
     def update_smelter_calibration_price(
         self,

@@ -50,6 +50,8 @@ TL比价模块路由
   8. 对标定价 / 标定价格 / 库房差额 / AI 分析快照：
       GET/POST/PUT/DELETE /tl/province_benchmark_prices — 省份对标城市定价历史
       GET/POST/PUT/DELETE /tl/smelter_calibration_prices — 冶炼厂标定价格历史
+      POST /tl/smelter_calibration_prices/batch — 批量新增冶炼厂标定价格
+      POST /tl/import_smelter_calibration_excel — Excel 导入冶炼厂标定价格
       GET/POST/PUT/DELETE /tl/warehouse_spread_configs — 库房对标差额与毛利配置
       POST /tl/import_warehouse_spread_excel — 导入库房差额与毛利（xlsx，读取全部工作表）
       GET /tl/ai_pricing_analysis — 实时聚合分析（公式：库房定价=对标城市定价+差额；毛利计算版=标定−运费−库房定价）
@@ -103,6 +105,7 @@ from app.models.tl import (
     ProvinceBenchmarkPriceUpdate,
     QuoteDetailsFilterRequest,
     SmelterCalibrationPriceCreate,
+    SmelterCalibrationPriceBatchCreateRequest,
     SmelterCalibrationPriceUpdate,
     WarehouseSpreadConfigCreate,
     WarehouseSpreadConfigUpdate,
@@ -1872,6 +1875,53 @@ def smelter_calibration_prices_create(
             calibration_price=body.标定价格,
             price_date=body.定价日期,
         )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/smelter_calibration_prices/batch", summary="批量新增冶炼厂标定价格")
+def smelter_calibration_prices_batch_create(
+    body: SmelterCalibrationPriceBatchCreateRequest,
+    service: TLService = Depends(get_tl_service),
+):
+    """
+    同一请求提交多条标定价格；全部校验通过后同一事务写入，任一条失败则全部回滚。
+    """
+    try:
+        items = [x.model_dump() for x in body.列表]
+        return service.batch_create_smelter_calibration_prices(items)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/import_smelter_calibration_excel", summary="Excel 导入冶炼厂标定价格")
+async def import_smelter_calibration_excel(
+    file: UploadFile = File(
+        ...,
+        description="xlsx；表头须含「冶炼厂/冶炼厂id」与「标定价格」，可选「定价日期」",
+    ),
+    service: TLService = Depends(get_tl_service),
+):
+    """
+    解析 Excel 并写入 ``pd_smelter_calibration_prices``。
+
+    - 优先读取名为「导入数据」的工作表，否则读首表。
+    - 「冶炼厂」按名称匹配 ``dict_factories``（精确优先，其次包含匹配）；「冶炼厂id」可直接填 id。
+    - 「定价日期」缺省或留空时使用当天（``QUOTE_COMPARISON_TZ`` 口径）。
+    - 单行校验失败时跳过该行并记入 ``errors``，其余行照常写入。
+    """
+    fn = (file.filename or "").lower()
+    if not fn.endswith((".xlsx", ".xlsm")):
+        raise HTTPException(status_code=400, detail="请上传 .xlsx 或 .xlsm 文件")
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="文件内容为空")
+    try:
+        return await asyncio.to_thread(service.import_smelter_calibration_excel, raw)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:

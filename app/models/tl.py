@@ -881,6 +881,17 @@ class SmelterCalibrationPriceCreate(BaseModel):
     定价日期: Optional[str] = Field(None, description="YYYY-MM-DD，默认当天")
 
 
+class SmelterCalibrationPriceBatchCreateRequest(BaseModel):
+    """批量新增冶炼厂标定价格"""
+
+    列表: List[SmelterCalibrationPriceCreate] = Field(
+        ...,
+        min_length=1,
+        max_length=500,
+        description="至少一条，最多 500 条；同一事务写入，任一条校验失败则全部回滚",
+    )
+
+
 class SmelterCalibrationPriceUpdate(BaseModel):
     """修订冶炼厂标定价格历史（保留源记录，服务端插入合并后的新历史行）"""
 
