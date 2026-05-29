@@ -39,7 +39,7 @@ from app.ai_detection.history_db import (
     list_ai_detection_history,
     purge_ai_detection_history_older_than,
 )
-from app.ai_detection.ocr_utils import run_full_image_ocr
+from app.ai_detection.ocr_utils import build_detection_bboxes_from_tokens, run_full_image_ocr
 from app.ai_detection.runtime_assets import get_easyocr_reader_kwargs
 
 if TYPE_CHECKING:
@@ -399,7 +399,10 @@ class DetectionService:
                 tmp_path = tmp.name
 
             async with semaphore:
-                _, ocr_tokens = await run_in_threadpool(run_full_image_ocr, tmp_path, ocr_reader)
+                img_cv2, ocr_tokens = await run_in_threadpool(run_full_image_ocr, tmp_path, ocr_reader)
+                detection_bboxes: List[List[int]] = []
+                if img_cv2 is not None and ocr_tokens:
+                    detection_bboxes = build_detection_bboxes_from_tokens(ocr_tokens, img_cv2.shape)
                 result_str = await run_in_threadpool(
                     partial(
                         engine.predict,
@@ -408,6 +411,7 @@ class DetectionService:
                         "xyxy",
                         ocr_tokens=ocr_tokens or None,
                         business_datetime=business_datetime,
+                        detection_bboxes=detection_bboxes or None,
                     ),
                 )
 
@@ -492,9 +496,13 @@ class DetectionDomainServiceV3:
         self._ocr_reader = ocr_reader
 
     def _predict_kwargs(self, business_datetime: Optional[str]) -> Dict[str, Any]:
+        detection_bboxes: List[List[int]] = []
+        if self._cached_candidates and self._cached_img_cv2 is not None:
+            detection_bboxes = [list(candidate.bbox) for candidate in self._cached_candidates]
         return {
             "ocr_tokens": self._cached_tokens,
             "business_datetime": business_datetime,
+            "detection_bboxes": detection_bboxes or None,
         }
 
     def _easyocr_auto_detect(self, image_path: str) -> List[BBoxDTO]:
@@ -813,22 +821,30 @@ _DETECT_RESULT_SCHEMA = (
     '  "bbox": [120, 80, 280, 60],\n'
     '  "reason": "未检出明显篡改痕迹",\n'
     '  "pixel_overlap_score": 0.18,\n'
+    '  "bbox_overlap_check": {\n'
+    '    "max_iou": 0.42,\n'
+    '    "overlapping_pairs": [],\n'
+    '    "box_count": 3,\n'
+    '    "anomalies": []\n'
+    "  },\n"
     '  "timestamp_check": {\n'
     '    "status_bar_time": "11:32",\n'
     '    "transaction_time": "2026-05-28 11:32:00",\n'
     '    "business_document_time": "2026-05-28 11:32:00",\n'
+    '    "business_mismatch": false,\n'
     '    "exif_datetime_original": null,\n'
     '    "anomalies": []\n'
     "  },\n"
-    '  "hard_tamper_flags": { "pixel_overlap": false, "timestamp": false }\n'
+    '  "hard_tamper_flags": { "pixel_overlap": false, "bbox_iou": false, "timestamp": false }\n'
     "}\n"
     "```\n"
     "- **result**：`正常` | `可疑` | `篡改` | `错误`\n"
     "- **confidence**：综合风险 0~1，越高越可疑\n"
     "- **bbox**：引擎实际使用的 ROI（x, y, 宽, 高）\n"
     "- **pixel_overlap_score**：拼接/贴图接缝像素重叠风险（0~1）\n"
-    "- **timestamp_check**：图内时间、EXIF、业务单据时间及异常码（供前端展示）\n"
-    "- **hard_tamper_flags**：像素重叠或时间戳是否触发直接判「篡改」\n"
+    "- **bbox_overlap_check**：OCR 检测框 IoU 重叠分析（max_iou、overlapping_pairs）\n"
+    "- **timestamp_check**：图内时间、EXIF、业务单据时间及异常码；**business_mismatch** 表示业务时间与图内不一致（通常为可疑）\n"
+    "- **hard_tamper_flags**：像素重叠（需佐证或极高分）、检测框 IoU 或图内时间戳是否触发直接判「篡改」\n"
     "- **reason**：中文简要说明；异步任务成功时可能另含 **original_bbox**（用户传入的四点框）\n"
 )
 
@@ -846,7 +862,8 @@ _DETECT_RESULT_SCHEMA = (
         "- **file**：图片文件（如 JPG/PNG）\n"
         "- **bbox**：字符串。支持 JSON 数组 `[x1,y1,x2,y2]` 或英文逗号分隔 `x1,y1,x2,y2`（均为像素，"
         "左上角到右下角）\n"
-        "- **document_time**（可选）：业务单据时间，如 `2026-05-28 11:32:00`，将与图内交易时间比对\n\n"
+        "- **document_time**（可选）：业务单据时间，如 `2026-05-28 11:32:00`，将与图内交易时间比对；"
+        "不一致时标为「可疑」并写入 reason，**不会单独强制判篡改**（仅与图内交易时间比对，不与状态栏比对）\n\n"
         "**输出说明**\n"
         "- 成功：`{ \"status\": \"success\", \"data\": { ...引擎结果... } }`\n"
         "- 业务失败（引擎报「错误」）：HTTP 422，`{ \"status\": \"error\", \"message\": \"...\" }`\n\n"
@@ -986,7 +1003,8 @@ async def get_detection_history_image(record_id: int):
         "2. 仅传 **task_id**：对已有任务重新触发排队（一般与上传二选一）。\n\n"
         "可选 **bbox**：与 v1 相同格式；**不传**则使用 EasyOCR 自动框选图中疑似单号/金额等数字区域，"
         "对每个框分别推理，结果在 `multi_results` 中。\n"
-        "可选 **document_time**：业务单据时间，将与图内 OCR 交易时间及 EXIF 比对。\n\n"
+        "可选 **document_time**：业务单据时间，将与图内 OCR **交易时间**比对（不与状态栏截图时刻比对）；"
+        "与图内交易时间不一致时结果为「可疑」，不单独强制判篡改。\n\n"
         "**输出示例（受理成功）**\n"
         "```json\n"
         "{\n"

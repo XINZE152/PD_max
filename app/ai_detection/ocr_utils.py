@@ -2,12 +2,12 @@
 """全图 OCR 工具：供同步/异步鉴伪共用，抽取时间戳等。"""
 from __future__ import annotations
 
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
 
-from app.ai_detection.amount_candidates import OCRToken, tokenize_ocr_results
+from app.ai_detection.amount_candidates import OCRToken, build_amount_candidates, tokenize_ocr_results
 
 
 def run_full_image_ocr(
@@ -28,3 +28,11 @@ def run_full_image_ocr(
         text_threshold=0.25,
     )
     return img_cv2, tokenize_ocr_results(ocr_results)
+
+
+def build_detection_bboxes_from_tokens(
+    tokens: Sequence[OCRToken],
+    image_shape: Tuple[int, int, int],
+) -> List[List[int]]:
+    """从 OCR token 构建金额/数字候选框列表，供 IoU 重叠鉴伪使用。"""
+    return [list(candidate.bbox) for candidate in build_amount_candidates(tokens, image_shape)]

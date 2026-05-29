@@ -1,0 +1,42 @@
+{
+  "status": "success",
+  "data": {
+    "result": "可疑",
+    "confidence": 0.58,
+    "bbox": [
+      120,
+      80,
+      280,
+      60
+    ],
+    "reason": "业务单据时间与图片可见交易时间不一致",
+    "pixel_overlap_score": 0.5403,
+    "bbox_overlap_check": {
+      "max_iou": 0.3346,
+      "risk_max_iou": 0.3346,
+      "overlapping_pairs": [],
+      "box_count": 5,
+      "anomalies": []
+    },
+    "timestamp_check": {
+      "status_bar_time": "15:55",
+      "transaction_time": "2026-01-2615.53.12",
+      "transaction_datetime": "2026-01-26 15:53:12",
+      "business_document_time": "2026-05-28 11:32:00",
+      "business_document_datetime": "2026-05-28 11:32:00",
+      "exif_datetime_original": null,
+      "exif_datetime_digitized": null,
+      "has_exif": true,
+      "exif_software": null,
+      "anomalies": [
+        "business_visible_datetime_mismatch"
+      ],
+      "business_mismatch": true
+    },
+    "hard_tamper_flags": {
+      "pixel_overlap": false,
+      "bbox_iou": false,
+      "timestamp": false
+    }
+  }
+}

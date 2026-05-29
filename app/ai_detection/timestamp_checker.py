@@ -13,15 +13,26 @@ from app.ai_detection.amount_candidates import DATE_PATTERN, TIME_PATTERN, looks
 DATETIME_COMBINED_PATTERN = re.compile(
     r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})\s*(\d{1,2}):(\d{2})(?::(\d{2}))?"
 )
+# OCR 常把日期与时间粘在一起，如 2026-01-2615.53.12
+DATETIME_GLUED_PATTERN = re.compile(
+    r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})(\d{1,2})[.:](\d{2})[.:]?(\d{2})?"
+)
+DATETIME_COMPACT_PATTERN = re.compile(r"(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})")
+TRANSACTION_TIME_LABELS = ("申请时间", "交易时间", "转账时间", "收款时间")
 BAD_SOFTWARE_KEYWORDS = ("photoshop", "picsart", "美图", "snapseed", "lightroom", "醒图", "meitu")
 
-# 触发后直接判「篡改」的时间类异常（可与 config hard_tamper_anomalies 合并）
+# 图内时间自洽类异常：触发后直接判「篡改」（可与 config hard_tamper_anomalies 合并）
+# business_* 仅作风险提示（可疑），见 timestamp_business_mismatch_risk
 DEFAULT_HARD_TAMPER_ANOMALIES = frozenset({
     "exif_editing_software",
     "future_datetime",
     "status_transaction_time_mismatch",
     "exif_visible_datetime_mismatch",
+})
+
+BUSINESS_MISMATCH_ANOMALIES = frozenset({
     "business_visible_datetime_mismatch",
+    "business_exif_datetime_mismatch",
 })
 
 
@@ -59,12 +70,14 @@ def _token_bbox(token: Any) -> Tuple[int, int, int, int]:
     return tuple(int(v) for v in bbox[:4])  # type: ignore[return-value]
 
 
-def _parse_combined_datetime(text: str) -> Optional[datetime]:
-    clean = normalize_text(text)
-    match = DATETIME_COMBINED_PATTERN.search(clean)
-    if not match:
-        return None
-    year, month, day, hour, minute, second = match.groups()
+def _build_datetime(
+    year: str,
+    month: str,
+    day: str,
+    hour: str,
+    minute: str,
+    second: Optional[str] = None,
+) -> Optional[datetime]:
     try:
         return datetime(
             int(year),
@@ -76,6 +89,98 @@ def _parse_combined_datetime(text: str) -> Optional[datetime]:
         )
     except ValueError:
         return None
+
+
+def _parse_combined_datetime(text: str) -> Optional[datetime]:
+    clean = normalize_text(text)
+    match = DATETIME_COMBINED_PATTERN.search(clean)
+    if not match:
+        return None
+    year, month, day, hour, minute, second = match.groups()
+    return _build_datetime(year, month, day, hour, minute, second)
+
+
+def _parse_mangled_datetime(text: str) -> Optional[datetime]:
+    """解析 OCR 严重污损的时间，如 2026.0..22.4.20.37。"""
+    clean = normalize_text(text)
+    if not re.search(r"20\d{2}", clean):
+        return None
+
+    numbers = re.findall(r"\d+", clean)
+    if len(numbers) < 5 or len(numbers[0]) != 4:
+        return None
+
+    year = int(numbers[0])
+    tail = numbers[1:]
+    idx = 0
+    month = int(tail[idx])
+    if month == 0:
+        month = 1
+        idx += 1
+    else:
+        idx += 1
+
+    if idx >= len(tail):
+        return None
+    day = int(tail[idx])
+    idx += 1
+    hour = int(tail[idx]) if idx < len(tail) else 0
+    idx += 1
+    minute = int(tail[idx]) if idx < len(tail) else 0
+    idx += 1
+    second = int(tail[idx]) if idx < len(tail) else 0
+    return _build_datetime(str(year), str(month), str(day), str(hour), str(minute), str(second))
+
+
+def _align_hour_with_status_bar(dt: datetime, status_bar_time: Optional[str]) -> datetime:
+    """OCR 常丢失小时十位（14→4），用状态栏时刻校正到最近候选。"""
+    status = _parse_clock_time(status_bar_time) if status_bar_time else None
+    if not status or dt.hour > 9:
+        return dt
+
+    sh, sm, _ = status
+    candidates = [dt]
+    if dt.hour <= 9:
+        candidates.append(dt.replace(hour=dt.hour + 10))
+        if dt.hour <= 3:
+            candidates.append(dt.replace(hour=dt.hour + 12))
+    return min(candidates, key=lambda item: abs(item.hour * 60 + item.minute - (sh * 60 + sm)))
+
+
+def parse_loose_datetime(text: str) -> Optional[datetime]:
+    """解析 OCR 常见的时间格式（含日期时间粘连、紧凑数字串）。"""
+    clean = normalize_text(text)
+    if not clean:
+        return None
+
+    for label in TRANSACTION_TIME_LABELS:
+        if label in clean:
+            tail = re.split(rf"{label}\s*[:：]?\s*", clean, maxsplit=1)
+            if len(tail) > 1 and tail[-1].strip():
+                parsed = parse_loose_datetime(tail[-1].strip())
+                if parsed is not None:
+                    return parsed
+
+    parsed = _parse_combined_datetime(clean)
+    if parsed is not None:
+        return parsed
+
+    glued = DATETIME_GLUED_PATTERN.search(clean)
+    if glued:
+        year, month, day, hour, minute, second = glued.groups()
+        parsed = _build_datetime(year, month, day, hour, minute, second)
+        if parsed is not None:
+            return parsed
+
+    compact = DATETIME_COMPACT_PATTERN.search(clean.replace(" ", ""))
+    if compact:
+        year, month, day, hour, minute, second = compact.groups()
+        return _build_datetime(year, month, day, hour, minute, second)
+
+    if DATE_PATTERN.search(clean) and TIME_PATTERN.search(clean):
+        return _parse_combined_datetime(clean.replace(".", "-"))
+
+    return _parse_mangled_datetime(clean)
 
 
 def _parse_clock_time(text: str) -> Optional[Tuple[int, int, int]]:
@@ -115,6 +220,40 @@ def parse_business_datetime(text: Optional[str]) -> Optional[datetime]:
     return None
 
 
+def _compare_business_and_exif(
+    business_dt: datetime,
+    exif_info: Dict[str, Any],
+    tolerance_seconds: float,
+) -> List[str]:
+    anomalies: List[str] = []
+    exif_text = exif_info.get("datetime_original") or exif_info.get("datetime_digitized")
+    if not exif_text:
+        return anomalies
+    try:
+        exif_dt = datetime.fromisoformat(str(exif_text))
+    except ValueError:
+        return anomalies
+    if abs((business_dt - exif_dt).total_seconds()) > tolerance_seconds:
+        anomalies.append("business_exif_datetime_mismatch")
+    return anomalies
+
+
+def _compare_business_and_status_bar(
+    business_dt: datetime,
+    status_bar_time: Optional[str],
+    tolerance_minutes: int = 8,
+) -> List[str]:
+    anomalies: List[str] = []
+    status_clock = _parse_clock_time(status_bar_time) if status_bar_time else None
+    if not status_clock:
+        return anomalies
+    business_minutes = business_dt.hour * 60 + business_dt.minute
+    status_minutes = _clock_minutes(status_clock)
+    if abs(business_minutes - status_minutes) > tolerance_minutes:
+        anomalies.append("business_status_bar_time_mismatch")
+    return anomalies
+
+
 def _compare_business_and_visible(
     business_dt: datetime,
     transaction_datetime: Optional[str],
@@ -131,7 +270,7 @@ def _compare_business_and_visible(
             visible_dt = None
 
     if visible_dt is None and transaction_time:
-        visible_dt = _parse_combined_datetime(transaction_time)
+        visible_dt = parse_loose_datetime(transaction_time)
 
     if visible_dt is None:
         return anomalies
@@ -200,7 +339,7 @@ def extract_timestamps_from_tokens(
     """从 OCR token 中抽取状态栏时间与正文交易时间。"""
     image_h = int(image_shape[0])
     status_bar_times: List[str] = []
-    transaction_entries: List[Tuple[str, Optional[datetime]]] = []
+    transaction_entries: List[Tuple[str, Optional[datetime], float]] = []
 
     for token in tokens:
         clean = _token_clean_text(token)
@@ -209,37 +348,41 @@ def extract_timestamps_from_tokens(
         display_text = str(getattr(token, "text", None) or (token.get("text") if isinstance(token, dict) else clean))
         _, y1, _, _ = _token_bbox(token)
 
-        combined_dt = _parse_combined_datetime(clean)
-        if combined_dt is not None:
-            transaction_entries.append((display_text, combined_dt))
-            continue
-
-        if DATE_PATTERN.search(clean) and TIME_PATTERN.search(clean):
-            parsed = _parse_combined_datetime(clean.replace(".", "-"))
-            transaction_entries.append((display_text, parsed))
-            continue
-
         if looks_like_clock_time(clean):
             if y1 <= image_h * 0.12:
                 status_bar_times.append(display_text)
             else:
-                transaction_entries.append((display_text, None))
+                transaction_entries.append((display_text, None, 0.0))
+            continue
+
+        parsed = parse_loose_datetime(clean)
+        if parsed is not None:
+            label_boost = 2.0 if any(label in clean for label in TRANSACTION_TIME_LABELS) else 0.0
+            body_boost = 0.5 if y1 > image_h * 0.12 else 0.0
+            transaction_entries.append((display_text, parsed, label_boost + body_boost + len(clean) * 0.01))
             continue
 
         if DATE_PATTERN.search(clean) and y1 > image_h * 0.12:
-            transaction_entries.append((display_text, None))
+            transaction_entries.append((display_text, None, 0.0))
 
+    status_bar_time = status_bar_times[0] if status_bar_times else None
     best_transaction: Optional[str] = None
     best_transaction_dt: Optional[datetime] = None
-    for text, dt in transaction_entries:
-        if dt is not None and (best_transaction_dt is None or len(text) > len(best_transaction or "")):
+    best_score = -1.0
+    for text, dt, score in transaction_entries:
+        if dt is None:
+            continue
+        aligned = _align_hour_with_status_bar(dt, status_bar_time)
+        if score > best_score:
             best_transaction = text
-            best_transaction_dt = dt
+            best_transaction_dt = aligned
+            best_score = score
+
     if best_transaction is None and transaction_entries:
         best_transaction = transaction_entries[0][0]
 
     return {
-        "status_bar_time": status_bar_times[0] if status_bar_times else None,
+        "status_bar_time": status_bar_time,
         "transaction_time": best_transaction,
         "transaction_datetime": _format_datetime(best_transaction_dt) if best_transaction_dt else None,
     }
@@ -259,12 +402,14 @@ def _compare_status_and_transaction(
     if not status_clock:
         return anomalies
 
-    tx_dt = _parse_combined_datetime(transaction_time or "") if transaction_time else None
-    if tx_dt is None and transaction_datetime:
+    tx_dt: Optional[datetime] = None
+    if transaction_datetime:
         try:
             tx_dt = datetime.fromisoformat(transaction_datetime)
         except ValueError:
             tx_dt = None
+    if tx_dt is None and transaction_time:
+        tx_dt = parse_loose_datetime(transaction_time)
 
     if tx_dt is not None:
         if tx_dt.date() != datetime.now().date() and status_bar_time:
@@ -367,6 +512,28 @@ def check_image_timestamps(
                 tolerance,
             )
         )
+        anomalies.extend(_compare_business_and_exif(business_dt, exif_info, tolerance))
+        if bool(thresh.get("business_compare_status_bar", False)):
+            status_tolerance = int(thresh.get("business_status_bar_tolerance_minutes", 8))
+            anomalies.extend(
+                _compare_business_and_status_bar(
+                    business_dt,
+                    ocr_info.get("status_bar_time"),
+                    status_tolerance,
+                )
+            )
+        has_visible_time = bool(
+            ocr_info.get("transaction_datetime")
+            or ocr_info.get("transaction_time")
+        )
+        if (
+            business_dt is not None
+            and ocr_tokens is not None
+            and image_shape is not None
+            and not has_visible_time
+        ):
+            anomalies.append("business_visible_time_not_found")
+            risk = max(risk, float(thresh.get("timestamp_visible_missing_risk", 0.42)))
 
     for dt_text in (
         ocr_info.get("transaction_datetime"),
@@ -387,6 +554,9 @@ def check_image_timestamps(
         "status_transaction_time_mismatch": "状态栏时间与交易时间不一致",
         "exif_visible_datetime_mismatch": "EXIF时间与可见交易时间相差超过1天",
         "business_visible_datetime_mismatch": "业务单据时间与图片可见交易时间不一致",
+        "business_exif_datetime_mismatch": "业务单据时间与EXIF时间不一致",
+        "business_status_bar_time_mismatch": "业务单据时间与状态栏时间不一致",
+        "business_visible_time_not_found": "已提供单据时间但图中未识别到可比对的时间文字",
         "future_datetime": "检测到未来时间",
         "exif_editing_software": "EXIF含修图软件标记",
     }
@@ -396,20 +566,26 @@ def check_image_timestamps(
 
     mismatch_risk = float(thresh.get("timestamp_mismatch_risk", 0.58))
     future_risk = float(thresh.get("timestamp_future_risk", 0.72))
-    business_risk = float(thresh.get("timestamp_business_mismatch_risk", 0.80))
+    business_risk = float(thresh.get("timestamp_business_mismatch_risk", 0.58))
     if "status_transaction_time_mismatch" in anomalies or "exif_visible_datetime_mismatch" in anomalies:
         risk = max(risk, mismatch_risk)
-    if "business_visible_datetime_mismatch" in anomalies:
+    if (
+        "business_visible_datetime_mismatch" in anomalies
+        or "business_exif_datetime_mismatch" in anomalies
+    ):
         risk = max(risk, business_risk)
     if "future_datetime" in anomalies:
         risk = max(risk, future_risk)
 
     timestamp_check["anomalies"] = list(dict.fromkeys(anomalies))
+    business_mismatch = bool(BUSINESS_MISMATCH_ANOMALIES.intersection(timestamp_check["anomalies"]))
     hard_tamper = bool(hard_tamper_set.intersection(timestamp_check["anomalies"]))
+    timestamp_check["business_mismatch"] = business_mismatch
     return {
         "timestamp_check": timestamp_check,
         "risk": float(min(1.0, risk)),
         "reasons": reasons,
         "anomalies": timestamp_check["anomalies"],
         "hard_tamper": hard_tamper,
+        "business_mismatch": business_mismatch,
     }
