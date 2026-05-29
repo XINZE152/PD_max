@@ -9,6 +9,7 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from app.ai_detection.bbox_overlap_checker import analyze_bbox_iou_overlaps
 from app.ai_detection.core.extractors import FeatureExtractor, FontFeatureLibrary, TamperAnalyzer
 from app.ai_detection.core.detectors import PixelLevelDetector
 from app.ai_detection.core.utils import NumpyEncoder, safe_read_image
@@ -111,6 +112,7 @@ class InferenceEngineAPI:
         bbox_format: str = "auto",
         ocr_tokens: Optional[List[Any]] = None,
         business_datetime: Optional[str] = None,
+        detection_bboxes: Optional[List[List[int]]] = None,
     ) -> str:
         # 【终极防御】用 Try-Except 包裹，防止任何内部错误导致后端服务崩溃
         try:
@@ -139,6 +141,10 @@ class InferenceEngineAPI:
             thresh_low = thresh.get('suspect_low', 0.50)
             thresh_overlap_alert = thresh.get('pixel_overlap_alert', 0.55)
             thresh_overlap_hard = thresh.get('pixel_overlap_hard_tamper', 0.72)
+            thresh_overlap_absolute = thresh.get('pixel_overlap_hard_tamper_absolute', 0.82)
+            overlap_requires_corroboration = bool(
+                thresh.get('pixel_overlap_hard_tamper_requires_corroboration', True)
+            )
 
             # ================== BBox 严密越界保护 ==================
             x1, y1, x2, y2 = self._normalize_roi_bbox(roi_bbox, img_w, img_h, bbox_format)
@@ -182,8 +188,28 @@ class InferenceEngineAPI:
             )
             timestamp_risk = float(timestamp_result.get("risk", 0.0))
             timestamp_hard_tamper = bool(timestamp_result.get("hard_tamper"))
+
+            bbox_overlap_result = analyze_bbox_iou_overlaps(
+                detection_bboxes or [],
+                roi_bbox_xyxy=[x1, y1, x2, y2],
+                thresholds=thresh,
+            )
+            bbox_iou_risk = float(bbox_overlap_result.get("risk", 0.0))
+            bbox_iou_hard_tamper = bool(bbox_overlap_result.get("hard_tamper"))
+
             overlap_risk = pixel_overlap_score * weights.get('pixel_overlap', 0.30)
-            overlap_hard_tamper = pixel_overlap_score >= float(thresh_overlap_hard)
+            overlap_hard_tamper = False
+            if pixel_overlap_score >= float(thresh_overlap_hard):
+                if pixel_overlap_score >= float(thresh_overlap_absolute):
+                    overlap_hard_tamper = True
+                elif not overlap_requires_corroboration:
+                    overlap_hard_tamper = True
+                else:
+                    overlap_hard_tamper = (
+                        global_fake_prob > thresh_global
+                        or pixel_anomaly > thresh_pixel_alert
+                        or (should_use_font_signal and font_anomaly > 0.55)
+                    )
 
             # ================== 3. 自适应权重计算 ==================
             if should_use_font_signal and len(extracted_text) > 0:
@@ -200,7 +226,7 @@ class InferenceEngineAPI:
                 if pixel_anomaly < thresh_exempt and geo_penalty == 0:
                     local_tamper_prob = 0.0
 
-            final_risk = max(global_fake_prob, local_tamper_prob, overlap_risk, timestamp_risk)
+            final_risk = max(global_fake_prob, local_tamper_prob, overlap_risk, timestamp_risk, bbox_iou_risk)
             final_risk = max(0.0, min(1.0, float(final_risk)))
 
             # ================== 4. 结果判定与防篡改理由梳理 ==================
@@ -210,6 +236,8 @@ class InferenceEngineAPI:
                 reasons.append("存在局部边缘拼接/像素涂抹痕迹")
             if pixel_overlap_score > thresh_overlap_alert:
                 reasons.append("检测到疑似像素重叠/拼接痕迹")
+            if bbox_overlap_result.get("reasons"):
+                reasons.extend(bbox_overlap_result["reasons"])
             if timestamp_result.get("reasons"):
                 reasons.extend(timestamp_result["reasons"])
             if should_use_font_signal and font_anomaly > 0.55:
@@ -217,7 +245,11 @@ class InferenceEngineAPI:
             if geo_penalty > 0:
                 reasons.extend(geo_reasons)
 
-            force_tamper = timestamp_hard_tamper or overlap_hard_tamper
+            force_tamper = (
+                timestamp_hard_tamper
+                or overlap_hard_tamper
+                or bbox_iou_hard_tamper
+            )
             if force_tamper:
                 result_status = "篡改"
                 final_risk = max(final_risk, float(thresh_high) + 0.05)
@@ -235,9 +267,11 @@ class InferenceEngineAPI:
                 "bbox": [int(i) for i in [x, y, w, h]],
                 "reason": "；".join(dict.fromkeys(reasons)),
                 "pixel_overlap_score": round(float(pixel_overlap_score), 4),
+                "bbox_overlap_check": bbox_overlap_result.get("bbox_overlap_check"),
                 "timestamp_check": timestamp_result.get("timestamp_check"),
                 "hard_tamper_flags": {
                     "pixel_overlap": overlap_hard_tamper,
+                    "bbox_iou": bbox_iou_hard_tamper,
                     "timestamp": timestamp_hard_tamper,
                 },
             }

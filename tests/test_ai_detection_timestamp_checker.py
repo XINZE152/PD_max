@@ -7,6 +7,7 @@ from app.ai_detection.timestamp_checker import (
     check_image_timestamps,
     extract_timestamps_from_tokens,
     parse_exif_timestamps,
+    parse_loose_datetime,
 )
 
 
@@ -73,6 +74,73 @@ class TimestampCheckerTests(unittest.TestCase):
         self.assertTrue(result.get("hard_tamper"))
         self.assertTrue(any("状态栏时间" in reason for reason in result["reasons"]))
 
+    def test_parse_loose_datetime_glued_ocr_text(self):
+        parsed = parse_loose_datetime("2026-01-2615.53.12")
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed.isoformat(sep=" ", timespec="seconds"), "2026-01-26 15:53:12")
+
+    def test_parse_mangled_datetime_with_ocr_noise(self):
+        parsed = parse_loose_datetime("2026.0..22.4.20.37")
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed.isoformat(sep=" ", timespec="seconds"), "2026-01-22 04:20:37")
+
+    def test_align_hour_with_status_bar(self):
+        from app.ai_detection.timestamp_checker import _align_hour_with_status_bar
+
+        parsed = parse_loose_datetime("2026.0..22.4.20.37")
+        aligned = _align_hour_with_status_bar(parsed, "14:21")
+        self.assertEqual(aligned.isoformat(sep=" ", timespec="seconds"), "2026-01-22 14:20:37")
+
+    def test_extract_glued_transaction_time(self):
+        tokens = [
+            OCRToken(
+                text="15:55",
+                clean_text="15:55",
+                bbox=(10, 10, 90, 40),
+                conf=0.99,
+                width=80,
+                height=30,
+                center_y=25.0,
+            ),
+            OCRToken(
+                text="2026-01-2615.53.12",
+                clean_text="2026-01-2615.53.12",
+                bbox=(100, 420, 620, 470),
+                conf=0.98,
+                width=520,
+                height=50,
+                center_y=445.0,
+            ),
+        ]
+
+        info = extract_timestamps_from_tokens(tokens, (1000, 800, 3))
+
+        self.assertEqual(info["transaction_datetime"], "2026-01-26 15:53:12")
+
+    def test_business_status_bar_not_compared_by_default(self):
+        tokens = [
+            OCRToken(
+                text="09:15",
+                clean_text="09:15",
+                bbox=(10, 10, 90, 40),
+                conf=0.99,
+                width=80,
+                height=30,
+                center_y=25.0,
+            ),
+        ]
+
+        with patch("app.ai_detection.timestamp_checker.parse_exif_timestamps", return_value={"has_exif": False}):
+            result = check_image_timestamps(
+                "/tmp/mock.jpg",
+                ocr_tokens=tokens,
+                image_shape=(1000, 800, 3),
+                business_datetime="2026-05-28 18:40:00",
+            )
+
+        self.assertNotIn("business_status_bar_time_mismatch", result["anomalies"])
+        self.assertFalse(result.get("business_mismatch"))
+
     def test_detects_business_document_time_mismatch(self):
         tokens = [
             OCRToken(
@@ -95,7 +163,21 @@ class TimestampCheckerTests(unittest.TestCase):
             )
 
         self.assertIn("business_visible_datetime_mismatch", result["anomalies"])
-        self.assertTrue(result.get("hard_tamper"))
+        self.assertFalse(result.get("hard_tamper"))
+        self.assertTrue(result.get("business_mismatch"))
+        self.assertGreaterEqual(result["risk"], 0.5)
+        self.assertLess(result["risk"], 0.65)
+
+    def test_detects_visible_time_not_found_when_business_time_given(self):
+        with patch("app.ai_detection.timestamp_checker.parse_exif_timestamps", return_value={"has_exif": False}):
+            result = check_image_timestamps(
+                "/tmp/mock.jpg",
+                ocr_tokens=[],
+                image_shape=(1000, 800, 3),
+                business_datetime="2026-05-28 11:32:00",
+            )
+
+        self.assertIn("business_visible_time_not_found", result["anomalies"])
 
     @patch("app.ai_detection.timestamp_checker.Image.open")
     def test_parse_exif_timestamps(self, mock_open):

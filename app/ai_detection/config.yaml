@@ -35,12 +35,22 @@ thresholds:
   timestamp_mismatch_risk: 0.58  # 时间不一致时的风险分
   timestamp_future_risk: 0.72    # 未来时间时的风险分
   timestamp_software_risk: 0.85  # EXIF 修图软件标记风险分
-  timestamp_business_mismatch_risk: 0.80  # 业务单据时间与图内时间不一致
+  timestamp_business_mismatch_risk: 0.58  # 业务单据时间与图内时间不一致（仅标「可疑」，不直接判篡改）
   business_time_tolerance_seconds: 300   # 单据时间与图内交易时间允许偏差（秒）
-  pixel_overlap_hard_tamper: 0.72        # 像素重叠分 >= 此值直接判篡改
-  hard_tamper_anomalies:                 # 出现即直接判篡改的时间异常码
+  business_compare_status_bar: false      # 业务单据时间是否与状态栏比对（截图时刻≠交易时刻，默认关闭）
+  pixel_overlap_hard_tamper: 0.72        # 像素重叠分 >= 此值且满足佐证条件时直接判篡改
+  pixel_overlap_hard_tamper_absolute: 0.82  # 像素重叠分 >= 此值无需佐证直接判篡改
+  pixel_overlap_hard_tamper_requires_corroboration: true  # 中等重叠分需结合布局/局部像素等佐证
+  bbox_iou_alert: 0.35                  # 检测框 IoU >= 此值触发重叠告警
+  bbox_iou_hard_tamper: 0.70             # 检测框 IoU >= 此值直接判篡改
+  bbox_iou_risk: 0.62                     # 检测框重叠风险分
+  bbox_iou_hard_risk: 0.82
+  timestamp_visible_missing_risk: 0.42    # 有单据时间但图内无可比对时间
+  business_status_bar_tolerance_minutes: 8
+  hard_tamper_anomalies:                 # 图内时间自洽类异常：出现即直接判篡改
     - exif_editing_software
     - future_datetime
     - status_transaction_time_mismatch
     - exif_visible_datetime_mismatch
-    - business_visible_datetime_mismatch
+  # 业务单据比对（business_*）仅写入 timestamp_check.anomalies 并抬高风险至「可疑」，
+  # 不列入 hard_tamper_anomalies，避免错误 document_time 导致真图一律判篡改。
