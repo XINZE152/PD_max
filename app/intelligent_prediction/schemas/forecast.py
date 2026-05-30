@@ -1,4 +1,4 @@
-﻿"""PRD 送货量预测（线性加权移动平均 + 周规律）API 结构。"""
+"""PRD 送货量预测（历史规律 + 价格因素）API 结构。"""
 
 from __future__ import annotations
 
@@ -30,7 +30,24 @@ class PrdForecastDetailRow(BaseModel):
     smelter: Optional[str] = Field(default=None, description="冶炼厂（历史无则 null）")
     wma_base: Decimal = Field(description="周规律调整前（线性加权30日均）")
     week_coef: Decimal = Field(description="仓库周规律系数")
+    history_baseline: Decimal = Field(description="历史规律基线 = wma_base × week_coef")
+    price_factor: Decimal = Field(default=Decimal("1"), description="价格乘数（相对行情/竞品）")
+    lead_market_price: Optional[Decimal] = Field(default=None, description="铅价/行情价")
+    own_calibration_price: Optional[Decimal] = Field(default=None, description="己方标定价格（金利）")
+    competitor_price_max: Optional[Decimal] = Field(default=None, description="竞品最高价")
+    price_sensitivity: Optional[str] = Field(default=None, description="库房价格敏感度")
+    analysis: Optional[str] = Field(default=None, description="预测解释文案")
     predicted_weight: Decimal
+
+
+class PrdForecastWarehouseProfile(BaseModel):
+    warehouse: str
+    product_variety: str
+    price_sensitivity: str
+    price_correlation: Optional[float] = None
+    capacity_max: Decimal
+    capacity_min: Decimal
+    capacity_avg: Decimal
 
 
 class PrdForecastByRmSeries(BaseModel):
@@ -42,6 +59,10 @@ class PrdForecastChartResponse(BaseModel):
     dates: list[date]
     total_by_date: list[Decimal]
     by_regional_manager: list[PrdForecastByRmSeries]
+    warehouse_profiles: list[PrdForecastWarehouseProfile] = Field(
+        default_factory=list,
+        description="各库房价格敏感度与能力基线",
+    )
 
 
 class PrdForecastDetailResponse(BaseModel):

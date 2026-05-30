@@ -22,6 +22,8 @@ class PromptBuilder:
         "\"confidence\":\"high|medium|low\",\"warnings\":[\"可选字符串\"]}]}。"
         " predicted_weight 每个目标日必须为大于 0 的数；历史有送货时禁止输出 0，"
         "可贴近历史均值/近期水平；若无把握请降低 confidence 并在 warnings 说明。"
+        " 预测需综合历史发货规律（约20%）与价格因素（约80%）：铅价/行情、己方标定价格（金利）、"
+        "竞品冶炼厂报价；用相对浮动比例判断价格优势，敏感型库房受价格影响更大。"
     )
 
     def analyze_history(self, points: list[PredictionHistoryPoint]) -> dict[str, Any]:
@@ -67,6 +69,7 @@ class PromptBuilder:
         stats: dict[str, Any],
         start_date: date,
         forecast_weather_by_date: Optional[dict[date, str]] = None,
+        price_summary: Optional[dict[str, Any]] = None,
     ) -> str:
         """组装 User Prompt。"""
         dates = [start_date + timedelta(days=i) for i in range(req.horizon_days)]
@@ -101,6 +104,9 @@ class PromptBuilder:
                 + "\n".join(lines)
                 + "\n"
             )
+        price_block = ""
+        if price_summary:
+            price_block = f"价格与库房画像（权重：价格 {price_summary.get('price_weight')} / 历史 {price_summary.get('history_weight')}）:\n{price_summary}\n"
         return (
             f"仓库: {req.warehouse}\n"
             f"冶炼厂: {req.smelter or '未指定（历史含全部冶炼厂）'}\n"
@@ -108,11 +114,14 @@ class PromptBuilder:
             f"大区经理: {req.regional_manager or '未提供'}\n"
             f"需要预测的目标日期（依次）: {date_lines}\n"
             f"{forecast_block}"
+            f"{price_block}"
             f"历史统计: {stats}\n"
             f"最近历史记录（最多30笔）:\n{hist_lines or '（无）'}\n"
             "请为每个目标日期输出一条 items，target_date 必须与上述日期一致且为 YYYY-MM-DD。"
             " 各日 predicted_weight 不得为 0（数据少时可取与历史均值相近的正数）。"
-            " 若相邻日期预测波动可能很大，请在 warnings 标注可能原因。"
+            " 结合价格优势与历史规律：己方价格相对竞品/行情偏低时降低预测，有优势时可提高；"
+            " 稳定型库房主要跟随历史规律，敏感型库房价格波动影响更大。"
+            " 若相邻日期预测波动可能很大，请在 warnings 标注可能原因（价格/节假日/规律）。"
         )
 
     def build_messages(
@@ -121,8 +130,13 @@ class PromptBuilder:
         stats: dict[str, Any],
         start_date: date,
         forecast_weather_by_date: Optional[dict[date, str]] = None,
+        price_summary: Optional[dict[str, Any]] = None,
     ) -> tuple[str, str]:
         """返回 (system, user) 双字符串。"""
         return self.SYSTEM_PROMPT, self.build_user_prompt(
-            req, stats, start_date, forecast_weather_by_date=forecast_weather_by_date
+            req,
+            stats,
+            start_date,
+            forecast_weather_by_date=forecast_weather_by_date,
+            price_summary=price_summary,
         )

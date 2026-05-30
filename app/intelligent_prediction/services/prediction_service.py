@@ -25,6 +25,7 @@ from app.intelligent_prediction.schemas.prediction import (
 from app.intelligent_prediction.services.ai_client import AIModelClient
 from app.intelligent_prediction.services.cache_manager import CacheManager
 from app.intelligent_prediction.services.prompt_builder import PromptBuilder
+from app.intelligent_prediction.services.price_context_service import build_intelligent_price_summary
 from app.intelligent_prediction.services.weather_client import (
     fetch_forecast_weather_by_dates,
     summary_from_weather_json,
@@ -356,12 +357,25 @@ class PredictionService:
             forecast_dates, wh_ctx, sm_ctx, loc_fb, default_when_missing="晴"
         )
         forecast_fp = self._cache.forecast_weather_fingerprint(forecast_map)
+        price_summary = await build_intelligent_price_summary(
+            session,
+            warehouse=req.warehouse,
+            product_variety=req.product_variety,
+            forecast_dates=forecast_dates,
+        )
+        price_fp = self._cache.stats_fingerprint({"price": price_summary})
         sm_part = req.smelter or ""
-        mem_key = f"prompt:{req.warehouse}:{sm_part}:{req.product_variety}:{fp}:{forecast_fp}"
+        mem_key = (
+            f"prompt:{req.warehouse}:{sm_part}:{req.product_variety}:{fp}:{forecast_fp}:{price_fp}"
+        )
         cached_prompt = await self._cache.memory.get(mem_key)
         if cached_prompt is None:
             system, user = self._prompt.build_messages(
-                req, stats, start, forecast_weather_by_date=forecast_map
+                req,
+                stats,
+                start,
+                forecast_weather_by_date=forecast_map,
+                price_summary=price_summary,
             )
             await self._cache.memory.set(mem_key, (system, user))
         else:
@@ -373,7 +387,7 @@ class PredictionService:
             req.horizon_days,
             fp,
             smelter=req.smelter,
-            forecast_fp=forecast_fp,
+            forecast_fp=f"{forecast_fp}:{price_fp}",
         )
         if req.use_cache:
             cached = await self._cache.redis.get_json(redis_key)
