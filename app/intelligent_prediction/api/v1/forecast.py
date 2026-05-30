@@ -26,6 +26,7 @@ from app.intelligent_prediction.services.dimension_options_service import (
     list_dimensions_from_delivery_history,
 )
 from app.intelligent_prediction.services.prd_forecast_service import PrdForecastService, get_prd_forecast_service
+from app.intelligent_prediction.settings import settings
 
 logger = get_logger(__name__)
 router = APIRouter()
@@ -54,8 +55,9 @@ def _prd_query(
     page_size: int,
 ) -> PrdForecastQuery:
     today = date.today()
+    horizon = max(1, settings.prediction_default_forecast_days)
     df = date_from or today
-    dt = date_to or (today + timedelta(days=14))
+    dt = date_to or (today + timedelta(days=horizon - 1))
     if df > dt:
         df, dt = dt, df
     return PrdForecastQuery(
@@ -74,7 +76,11 @@ def _prd_query(
     "/chart",
     response_model=PrdForecastChartResponse,
     summary="送货量预测图表数据",
-    description="按日期区间与筛选条件返回汇总曲线及按区域经理拆分的序列；支持按冶炼厂筛选。",
+    description=(
+        "按日期区间与筛选条件返回汇总曲线及按区域经理拆分的序列；"
+        "预测公式：历史基线（近30日加权×周规律）×（历史权重 + 价格权重×价格乘数）。"
+        "价格乘数由铅价/行情、金利标定价格、竞品冶炼厂报价及库房价格敏感度共同决定。"
+    ),
 )
 async def prd_forecast_chart(
     date_from: date | None = Query(None, description="预测区间起点，默认当天"),

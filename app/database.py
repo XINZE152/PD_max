@@ -462,6 +462,18 @@ TABLE_STATEMENTS = [
         INDEX idx_ip_audit_created (created_at)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='智能预测-操作审计';
     """,
+    """
+    CREATE TABLE IF NOT EXISTS pd_ip_lead_market_prices (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '主键',
+        price_date DATE NOT NULL COMMENT '铅价/行情价日期',
+        lead_price DECIMAL(18, 4) NOT NULL COMMENT '铅价（元/吨，行情基准）',
+        remark VARCHAR(255) DEFAULT NULL COMMENT '备注或数据来源',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+        UNIQUE KEY uk_ip_lead_price_date (price_date),
+        INDEX idx_ip_lead_price_date (price_date)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='智能预测-铅价/行情价历史';
+    """,
     # 省份「对标城市」定价历史（同一省份多条记录时默认取 price_date 最新，同日取 id 最大）
     """
     CREATE TABLE IF NOT EXISTS pd_province_benchmark_prices (
@@ -631,6 +643,31 @@ def ensure_pd_ip_prediction_results_smelter_column() -> None:
             except Exception:
                 pass
             logger.info("已为 pd_ip_prediction_results 添加 smelter 列")
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def ensure_pd_ip_lead_market_prices_table() -> None:
+    """已有库补建：铅价/行情价表（新建库已由 TABLE_STATEMENTS 创建）。"""
+    config_dict = get_mysql_config()
+    connection = pymysql.connect(**config_dict)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pd_ip_lead_market_prices (
+                    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '主键',
+                    price_date DATE NOT NULL COMMENT '铅价/行情价日期',
+                    lead_price DECIMAL(18, 4) NOT NULL COMMENT '铅价（元/吨，行情基准）',
+                    remark VARCHAR(255) DEFAULT NULL COMMENT '备注或数据来源',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+                    UNIQUE KEY uk_ip_lead_price_date (price_date),
+                    INDEX idx_ip_lead_price_date (price_date)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='智能预测-铅价/行情价历史';
+                """
+            )
         connection.commit()
     finally:
         connection.close()
@@ -1355,6 +1392,10 @@ def create_tables() -> None:
         ensure_pd_ip_prediction_results_smelter_column()
     except Exception:
         logger.exception("检查/添加 pd_ip_prediction_results.smelter 失败")
+    try:
+        ensure_pd_ip_lead_market_prices_table()
+    except Exception:
+        logger.exception("检查/创建 pd_ip_lead_market_prices 失败")
     try:
         ensure_dict_warehouses_extended_columns()
     except Exception:

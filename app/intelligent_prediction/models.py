@@ -122,3 +122,25 @@ class OperationAudit(Base):
         server_default=func.current_timestamp(),
         nullable=False,
     )
+
+
+class LeadMarketPrice(Base):
+    """铅价/行情价历史（预测时作为市场基准）。"""
+
+    __tablename__ = "pd_ip_lead_market_prices"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    price_date: Mapped[date] = mapped_column(Date, nullable=False, unique=True, index=True)
+    lead_price: Mapped[Decimal] = mapped_column(Numeric(18, 4), nullable=False)
+    remark: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        server_default=func.current_timestamp(),
+        nullable=False,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        server_default=func.current_timestamp(),
+        onupdate=func.current_timestamp(),
+        nullable=False,
+    )

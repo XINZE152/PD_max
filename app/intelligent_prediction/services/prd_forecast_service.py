@@ -1,4 +1,4 @@
-"""PRD V1：近30天线性加权移动平均 + 仓库周规律系数 + 大区按日汇总。"""
+"""PRD V2：近30天线性加权移动平均 + 仓库周规律系数 + 价格因素（80%）与历史规律（20%）。"""
 
 from __future__ import annotations
 
@@ -18,6 +18,15 @@ from app.intelligent_prediction.schemas.forecast import (
     PrdForecastDetailResponse,
     PrdForecastDetailRow,
     PrdForecastQuery,
+    PrdForecastWarehouseProfile,
+)
+from app.intelligent_prediction.services.price_context_service import (
+    blend_history_and_price,
+    compute_price_factor,
+    estimate_warehouse_price_profile,
+    explain_prediction,
+    load_price_context_for_horizon,
+    resolve_own_factory_id,
 )
 
 
@@ -196,26 +205,62 @@ class PrdForecastService:
         if not daily_wv:
             dates = list(_daterange_inclusive(q.date_from, q.date_to))
             z = [Decimal("0").quantize(Decimal("0.01"))] * len(dates)
-            return [], PrdForecastChartResponse(dates=dates, total_by_date=z, by_regional_manager=[])
+            return [], PrdForecastChartResponse(
+                dates=dates, total_by_date=z, by_regional_manager=[], warehouse_profiles=[]
+            )
 
         wh_set = {wh for (wh, _, _) in daily_wv.keys()} or {wh for (wh, _, _) in rm_map.keys()}
+        forecast_dates = list(_daterange_inclusive(q.date_from, q.date_to))
+        own_fid = await resolve_own_factory_id(session)
 
         coef_ref_start = ref_end - timedelta(days=119)
         coefs = _weekday_coefs(dict(daily_wh), wh_set, coef_ref_start, ref_end)
+
+        profile_cache: dict[tuple[str, str], Any] = {}
+        price_ctx_cache: dict[str, dict[date, Any]] = {}
 
         detail_rows: list[PrdForecastDetailRow] = []
         wv_keys = sorted(daily_wv.keys(), key=lambda x: (x[0], x[1], x[2]))
         for wh, v, sm_k in wv_keys:
             rm = rm_map.get((wh, v, sm_k)) or "未分配"
             series = dict(daily_wv.get((wh, v, sm_k), {}))
-            baseline = _series_positive_baseline(series)
-            for d in _daterange_inclusive(q.date_from, q.date_to):
+            baseline_floor = _series_positive_baseline(series)
+
+            pk = (wh, v)
+            if pk not in profile_cache:
+                profile_cache[pk] = await estimate_warehouse_price_profile(
+                    session, warehouse=wh, product_variety=v, own_factory_id=own_fid
+                )
+            profile = profile_cache[pk]
+
+            if v not in price_ctx_cache:
+                price_ctx_cache[v] = await load_price_context_for_horizon(
+                    session, dates=forecast_dates, product_variety=v, own_factory_id=own_fid
+                )
+            ctx_by_date = price_ctx_cache[v]
+
+            for d in forecast_dates:
                 wma = _linear_wma(series, d, 30)
                 wd = d.weekday()
                 c = coefs.get((wh, wd), Decimal("1"))
-                pred = (wma * c).quantize(Decimal("0.01"))
+                history_baseline = (wma * c).quantize(Decimal("0.01"))
+                if history_baseline <= 0:
+                    history_baseline = max(baseline_floor, Decimal("0.01")).quantize(Decimal("0.01"))
+
+                ctx = ctx_by_date[d]
+                pf = compute_price_factor(ctx, profile.sensitivity)
+                pred = blend_history_and_price(history_baseline, pf).quantize(Decimal("0.01"))
                 if pred <= 0:
-                    pred = max(baseline, Decimal("0.01")).quantize(Decimal("0.01"))
+                    pred = max(baseline_floor, Decimal("0.01")).quantize(Decimal("0.01"))
+
+                analysis = explain_prediction(
+                    target_date=d,
+                    history_baseline=history_baseline,
+                    price_factor=pf,
+                    predicted=pred,
+                    profile=profile,
+                    ctx=ctx,
+                )
                 detail_rows.append(
                     PrdForecastDetailRow(
                         target_date=d,
@@ -225,11 +270,18 @@ class PrdForecastService:
                         smelter=sm_k if sm_k else None,
                         wma_base=wma.quantize(Decimal("0.01")),
                         week_coef=c.quantize(Decimal("0.01")),
+                        history_baseline=history_baseline,
+                        price_factor=pf,
+                        lead_market_price=ctx.lead_market_price,
+                        own_calibration_price=ctx.own_calibration_price,
+                        competitor_price_max=ctx.competitor_price_max,
+                        price_sensitivity=profile.sensitivity,
+                        analysis=analysis,
                         predicted_weight=pred,
                     )
                 )
 
-        dates = list(_daterange_inclusive(q.date_from, q.date_to))
+        dates = forecast_dates
         by_d_total: dict[date, Decimal] = defaultdict(Decimal)
         by_d_rm: dict[tuple[date, str], Decimal] = defaultdict(Decimal)
         for row in detail_rows:
@@ -248,6 +300,18 @@ class PrdForecastService:
             dates=dates,
             total_by_date=[by_d_total.get(dt, Decimal("0")).quantize(Decimal("0.01")) for dt in dates],
             by_regional_manager=by_rm_series,
+            warehouse_profiles=[
+                PrdForecastWarehouseProfile(
+                    warehouse=wh,
+                    product_variety=v,
+                    price_sensitivity=prof.sensitivity,
+                    price_correlation=prof.correlation,
+                    capacity_max=prof.capacity_max,
+                    capacity_min=prof.capacity_min,
+                    capacity_avg=prof.capacity_avg,
+                )
+                for (wh, v), prof in sorted(profile_cache.items())
+            ],
         )
         return detail_rows, chart
 

@@ -133,6 +133,23 @@ class IntelligentPredictionSettings(BaseModel):
         default_factory=lambda: (os.getenv("INTELLIGENT_PREDICTION_HISTORY_PURGE_SECRET") or "").strip()
     )
 
+    prediction_price_weight: float = Field(
+        default_factory=lambda: _env_float("PREDICTION_PRICE_WEIGHT", 0.8),
+        description="送货量预测中价格因素权重（默认 0.8）",
+    )
+    prediction_history_weight: float = Field(
+        default_factory=lambda: _env_float("PREDICTION_HISTORY_WEIGHT", 0.2),
+        description="送货量预测中历史规律权重（默认 0.2）",
+    )
+    prediction_price_sensitivity_threshold: float = Field(
+        default_factory=lambda: _env_float("PREDICTION_PRICE_SENSITIVITY_THRESHOLD", 0.35),
+        description="库房价格敏感度判定：|相关系数|>=阈值视为敏感型",
+    )
+    prediction_default_forecast_days: int = Field(
+        default_factory=lambda: _env_int("PREDICTION_DEFAULT_FORECAST_DAYS", 15),
+        description="规则预测默认 horizon（天）",
+    )
+
     #: 天气 API 根地址（留空则导入时不请求天气，weather_json 为 NULL）
     weather_api_base_url: str = Field(default_factory=lambda: (os.getenv("WEATHER_API_BASE_URL") or "").strip())
     weather_api_key: str = Field(default_factory=lambda: (os.getenv("WEATHER_API_KEY") or "").strip())
