@@ -80,29 +80,63 @@ def crop_expanded_roi(
     return roi_expanded, [x, y, w, h]
 
 
+def evaluate_pixel_overlap_alert(
+    metrics: Dict[str, float],
+    thresholds: Dict[str, Any],
+) -> bool:
+    """
+    分层告警：blend 达阈即报；或 structural 高且伴随双重边缘（避免纯 UI 结构误报）。
+    """
+    structural = float(metrics.get("structural_score", 0.0))
+    blend = float(metrics.get("blend_score", 0.0))
+    double_edge = float(metrics.get("double_edge_ratio", 0.0))
+
+    blend_alert = float(thresholds.get("pixel_overlap_blend_alert", 0.55))
+    structural_alert = float(thresholds.get("pixel_overlap_structural_alert", 0.79))
+    structural_de_min = float(thresholds.get("pixel_overlap_structural_de_min", 0.018))
+
+    if blend >= blend_alert:
+        return True
+    return structural >= structural_alert and double_edge >= structural_de_min
+
+
+def _pixel_overlap_has_blend_corroboration(
+    metrics: Dict[str, float],
+    thresholds: Dict[str, Any],
+) -> bool:
+    """hard 判需羽化/双重边缘佐证，避免纯 structural 高分误 hard。"""
+    blend = float(metrics.get("blend_score", 0.0))
+    double_edge = float(metrics.get("double_edge_ratio", 0.0))
+    blend_min = float(thresholds.get("pixel_overlap_hard_blend_min", 0.55))
+    de_min = float(thresholds.get("pixel_overlap_hard_de_min", 0.045))
+    return blend >= blend_min or double_edge >= de_min
+
+
 def evaluate_pixel_overlap_hard_tamper(
-    pixel_overlap_score: float,
+    metrics: Dict[str, float],
     thresholds: Dict[str, Any],
     *,
     corroboration_signals: Optional[Dict[str, bool]] = None,
 ) -> bool:
-    """根据阈值判定像素重叠是否硬判篡改；独立接口仅使用绝对阈值，引擎可传入佐证信号。"""
+    """根据阈值判定像素重叠是否硬判篡改；独立接口需 blend/双重边缘佐证，引擎可传入额外信号。"""
+    score = float(metrics.get("pixel_overlap_score", 0.0))
     thresh_overlap_hard = float(thresholds.get("pixel_overlap_hard_tamper", 0.72))
     thresh_overlap_absolute = float(thresholds.get("pixel_overlap_hard_tamper_absolute", 0.82))
     requires_corroboration = bool(
         thresholds.get("pixel_overlap_hard_tamper_requires_corroboration", True)
     )
+    has_blend_signal = _pixel_overlap_has_blend_corroboration(metrics, thresholds)
 
-    if pixel_overlap_score >= thresh_overlap_absolute:
-        return True
-    if pixel_overlap_score < thresh_overlap_hard:
+    if score >= thresh_overlap_absolute:
+        return has_blend_signal
+    if score < thresh_overlap_hard:
+        return False
+    if not has_blend_signal:
         return False
     if not requires_corroboration:
         return True
 
     signals = corroboration_signals or {}
-    thresh_global = float(thresholds.get("global_fake", 0.65))
-    thresh_pixel_alert = float(thresholds.get("pixel_anomaly_alert", 0.60))
     return bool(
         signals.get("global_fake")
         or signals.get("pixel_anomaly")
@@ -122,7 +156,6 @@ def run_pixel_overlap_check(
 ) -> Dict[str, Any]:
     """对指定 ROI 执行像素重叠规则检测。"""
     thresh = thresholds or {}
-    alert_threshold = float(thresh.get("pixel_overlap_alert", 0.55))
 
     img = safe_read_image(image_path)
     if img is None:
@@ -132,29 +165,37 @@ def run_pixel_overlap_check(
     x1, y1, x2, y2 = normalize_roi_bbox(bbox_xyxy, img_w, img_h, bbox_format)
     roi_expanded, bbox_xywh = crop_expanded_roi(img, [x1, y1, x2, y2], margin)
 
-    metrics = pixel_detector.overlap_metrics(roi_expanded)
-    score = float(metrics["pixel_overlap_score"])
+    raw_metrics = pixel_detector.overlap_metrics(roi_expanded)
+    overlap_metrics = {
+        "structural_score": raw_metrics["structural_score"],
+        "blend_score": raw_metrics["blend_score"],
+        "double_edge_ratio": raw_metrics["double_edge_ratio"],
+        "long_gradient_ratio": raw_metrics["long_gradient_ratio"],
+        "pixel_overlap_score": raw_metrics["pixel_overlap_score"],
+    }
+    score = float(overlap_metrics["pixel_overlap_score"])
+    alert = evaluate_pixel_overlap_alert(overlap_metrics, thresh)
     hard_tamper = evaluate_pixel_overlap_hard_tamper(
-        score,
+        overlap_metrics,
         thresh,
         corroboration_signals=corroboration_signals,
     )
 
     reasons: List[str] = []
-    if score > alert_threshold:
+    if alert:
         reasons.append("检测到疑似像素重叠/拼接痕迹")
 
     return {
         "pixel_overlap_score": round(score, 4),
         "overlap_metrics": {
-            "structural_score": metrics["structural_score"],
-            "blend_score": metrics["blend_score"],
-            "double_edge_ratio": metrics["double_edge_ratio"],
-            "long_gradient_ratio": metrics["long_gradient_ratio"],
+            "structural_score": overlap_metrics["structural_score"],
+            "blend_score": overlap_metrics["blend_score"],
+            "double_edge_ratio": overlap_metrics["double_edge_ratio"],
+            "long_gradient_ratio": overlap_metrics["long_gradient_ratio"],
         },
         "bbox": [int(v) for v in bbox_xywh],
         "bbox_xyxy": [x1, y1, x2, y2],
-        "alert": score > alert_threshold,
+        "alert": alert,
         "hard_tamper": hard_tamper,
         "reasons": reasons,
     }

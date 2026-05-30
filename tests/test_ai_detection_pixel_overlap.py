@@ -71,7 +71,7 @@ class PixelOverlapIntegrationTests(unittest.TestCase):
 
         detector = PixelLevelDetector()
         for name, path, bbox, should_alert in self.cases:
-            result = run_pixel_overlap_check(path, bbox, detector, thresholds={"pixel_overlap_alert": 0.55})
+            result = run_pixel_overlap_check(path, bbox, detector)
             self.assertIn("overlap_metrics", result, msg=name)
             if should_alert:
                 self.assertTrue(

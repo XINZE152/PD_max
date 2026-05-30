@@ -26,7 +26,12 @@ weights:
 thresholds:
   global_fake: 0.65              # 全局大模型风险 > 此值，判定排版异常
   pixel_anomaly_alert: 0.60      # 局部像素风险 > 此值，触发拼接涂抹报警
-  pixel_overlap_alert: 0.55      # 像素重叠风险 > 此值，触发重叠/拼接报警
+  pixel_overlap_alert: 0.55      # 像素重叠风险 > 此值，触发重叠/拼接报警（legacy，分层规则优先）
+  pixel_overlap_blend_alert: 0.55           # blend 分 >= 此值即告警
+  pixel_overlap_structural_alert: 0.79      # structural 告警需同时满足 de_min
+  pixel_overlap_structural_de_min: 0.018    # structural 告警所需最低双重边缘占比
+  pixel_overlap_hard_blend_min: 0.55        # hard 判所需最低 blend 分
+  pixel_overlap_hard_de_min: 0.045          # hard 判所需最低双重边缘占比
   exempt_pixel_safe: 0.40        # 非核心字段的像素风险 < 此值，直接豁免清零
 
   suspect_high: 0.65             # 综合风险率 > 此值，最终定性为“篡改”
@@ -46,6 +51,9 @@ thresholds:
   bbox_iou_risk: 0.62                     # 检测框重叠风险分
   bbox_iou_hard_risk: 0.82
   timestamp_visible_missing_risk: 0.42    # 有单据时间但图内无可比对时间
+  timestamp_unparsed_risk: 0.38             # 图内有疑似时间 OCR 但未能解析
+  status_transaction_tolerance_minutes: 8   # 状态栏与交易时间一致容差（分钟）
+  status_transaction_hard_min_minutes: 240  # 分钟差 >= 此值才 hard 判 status 不一致
   business_status_bar_tolerance_minutes: 8
   hard_tamper_anomalies:                 # 图内时间自洽类异常：出现即直接判篡改
     - exif_editing_software

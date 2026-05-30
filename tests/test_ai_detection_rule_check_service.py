@@ -7,6 +7,7 @@ import numpy as np
 from app.ai_detection.core.detectors import PixelLevelDetector
 from app.ai_detection.rule_check_service import (
     crop_expanded_roi,
+    evaluate_pixel_overlap_alert,
     evaluate_pixel_overlap_hard_tamper,
     normalize_roi_bbox,
     run_pixel_overlap_check,
@@ -29,7 +30,11 @@ class RuleCheckServiceTests(unittest.TestCase):
 
     def test_evaluate_pixel_overlap_hard_tamper_absolute(self):
         hard = evaluate_pixel_overlap_hard_tamper(
-            0.90,
+            {
+                "pixel_overlap_score": 0.90,
+                "blend_score": 0.94,
+                "double_edge_ratio": 0.08,
+            },
             {
                 "pixel_overlap_hard_tamper": 0.72,
                 "pixel_overlap_hard_tamper_absolute": 0.82,
@@ -38,6 +43,46 @@ class RuleCheckServiceTests(unittest.TestCase):
         )
         self.assertTrue(hard)
 
+    def test_evaluate_pixel_overlap_hard_tamper_rejects_structural_only(self):
+        hard = evaluate_pixel_overlap_hard_tamper(
+            {
+                "pixel_overlap_score": 0.825,
+                "blend_score": 0.0,
+                "double_edge_ratio": 0.003,
+            },
+            {
+                "pixel_overlap_hard_tamper": 0.72,
+                "pixel_overlap_hard_tamper_absolute": 0.82,
+                "pixel_overlap_hard_tamper_requires_corroboration": True,
+            },
+        )
+        self.assertFalse(hard)
+
+    def test_evaluate_pixel_overlap_alert_layered_rules(self):
+        thresholds = {
+            "pixel_overlap_blend_alert": 0.55,
+            "pixel_overlap_structural_alert": 0.79,
+            "pixel_overlap_structural_de_min": 0.018,
+        }
+        self.assertTrue(
+            evaluate_pixel_overlap_alert(
+                {"blend_score": 0.60, "structural_score": 0.2, "double_edge_ratio": 0.01},
+                thresholds,
+            )
+        )
+        self.assertTrue(
+            evaluate_pixel_overlap_alert(
+                {"blend_score": 0.0, "structural_score": 0.80, "double_edge_ratio": 0.02},
+                thresholds,
+            )
+        )
+        self.assertFalse(
+            evaluate_pixel_overlap_alert(
+                {"blend_score": 0.0, "structural_score": 0.76, "double_edge_ratio": 0.008},
+                thresholds,
+            )
+        )
+
     def test_evaluate_pixel_overlap_requires_corroboration(self):
         thresholds = {
             "pixel_overlap_hard_tamper": 0.72,
@@ -45,11 +90,19 @@ class RuleCheckServiceTests(unittest.TestCase):
             "pixel_overlap_hard_tamper_requires_corroboration": True,
         }
         self.assertFalse(
-            evaluate_pixel_overlap_hard_tamper(0.75, thresholds, corroboration_signals={})
+            evaluate_pixel_overlap_hard_tamper(
+                {"pixel_overlap_score": 0.75, "blend_score": 0.60, "double_edge_ratio": 0.05},
+                thresholds,
+                corroboration_signals={},
+            )
         )
         self.assertTrue(
             evaluate_pixel_overlap_hard_tamper(
-                0.75,
+                {
+                    "pixel_overlap_score": 0.75,
+                    "blend_score": 0.60,
+                    "double_edge_ratio": 0.05,
+                },
                 thresholds,
                 corroboration_signals={"pixel_anomaly": True},
             )

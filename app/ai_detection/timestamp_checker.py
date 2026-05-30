@@ -135,7 +135,7 @@ def _parse_mangled_datetime(text: str) -> Optional[datetime]:
 def _align_hour_with_status_bar(dt: datetime, status_bar_time: Optional[str]) -> datetime:
     """OCR 常丢失小时十位（14→4），用状态栏时刻校正到最近候选。"""
     status = _parse_clock_time(status_bar_time) if status_bar_time else None
-    if not status or dt.hour > 9:
+    if not status:
         return dt
 
     sh, sm, _ = status
@@ -144,7 +144,48 @@ def _align_hour_with_status_bar(dt: datetime, status_bar_time: Optional[str]) ->
         candidates.append(dt.replace(hour=dt.hour + 10))
         if dt.hour <= 3:
             candidates.append(dt.replace(hour=dt.hour + 12))
+    if sh <= 9 and dt.hour >= 10:
+        ones_hour = dt.hour % 10
+        if ones_hour == sh:
+            candidates.append(dt.replace(hour=sh))
+            candidates.append(dt.replace(hour=sh + 10))
+            if sh <= 3:
+                candidates.append(dt.replace(hour=sh + 12))
     return min(candidates, key=lambda item: abs(item.hour * 60 + item.minute - (sh * 60 + sm)))
+
+
+def _status_bar_minute_candidates(
+    status_clock: Tuple[int, int, int],
+    tx_dt: Optional[datetime] = None,
+) -> List[int]:
+    """
+    状态栏小时 OCR 丢十位时生成候选；仅在确有对齐依据时扩展，避免 09:15 误对齐到 19:15。
+    """
+    sh, sm, _ = status_clock
+    hour_candidates = [sh]
+    if sh <= 3:
+        hour_candidates.extend([sh + 10, sh + 12])
+    elif tx_dt is not None and tx_dt.hour >= 10:
+        if tx_dt.hour % 10 == sh or sh + 10 == tx_dt.hour:
+            hour_candidates.append(sh + 10)
+            if sh <= 5:
+                hour_candidates.append(sh + 12)
+    minutes: List[int] = []
+    for hour in dict.fromkeys(hour_candidates):
+        if 0 <= hour < 24:
+            minutes.append(hour * 60 + sm)
+    return minutes or [sh * 60 + sm]
+
+
+def _is_unparsed_transaction_time(ocr_info: Dict[str, Any]) -> bool:
+    """有疑似日期时间 OCR 文本但未能解析为 datetime。"""
+    tx_time = ocr_info.get("transaction_time")
+    if not tx_time or ocr_info.get("transaction_datetime"):
+        return False
+    clean = normalize_text(str(tx_time))
+    if not clean:
+        return False
+    return bool(DATE_PATTERN.search(clean) or re.search(r"20\d{2}", clean))
 
 
 def parse_loose_datetime(text: str) -> Optional[datetime]:
@@ -396,11 +437,14 @@ def _compare_status_and_transaction(
     status_bar_time: Optional[str],
     transaction_time: Optional[str],
     transaction_datetime: Optional[str],
-) -> List[str]:
+    *,
+    tolerance_minutes: int = 8,
+) -> Tuple[List[str], Optional[int]]:
+    """比较状态栏与交易时间；返回 (异常码列表, 最小分钟差)。"""
     anomalies: List[str] = []
     status_clock = _parse_clock_time(status_bar_time) if status_bar_time else None
     if not status_clock:
-        return anomalies
+        return anomalies, None
 
     tx_dt: Optional[datetime] = None
     if transaction_datetime:
@@ -412,19 +456,22 @@ def _compare_status_and_transaction(
         tx_dt = parse_loose_datetime(transaction_time)
 
     if tx_dt is not None:
-        if tx_dt.date() != datetime.now().date() and status_bar_time:
-            # 状态栏通常显示“当前截图时刻”，与交易日期不同日本身不一定异常
-            pass
-        status_minutes = _clock_minutes(status_clock)
         tx_minutes = tx_dt.hour * 60 + tx_dt.minute
-        if abs(status_minutes - tx_minutes) > 8:
+        status_candidates = _status_bar_minute_candidates(status_clock, tx_dt)
+        min_diff = min(abs(candidate - tx_minutes) for candidate in status_candidates)
+        if min_diff > tolerance_minutes:
             anomalies.append("status_transaction_time_mismatch")
-        return anomalies
+        return anomalies, min_diff
 
     tx_clock = _parse_clock_time(transaction_time) if transaction_time else None
-    if tx_clock and abs(_clock_minutes(status_clock) - _clock_minutes(tx_clock)) > 8:
-        anomalies.append("status_transaction_time_mismatch")
-    return anomalies
+    if tx_clock:
+        status_candidates = _status_bar_minute_candidates(status_clock)
+        tx_minutes = _clock_minutes(tx_clock)
+        min_diff = min(abs(candidate - tx_minutes) for candidate in status_candidates)
+        if min_diff > tolerance_minutes:
+            anomalies.append("status_transaction_time_mismatch")
+        return anomalies, min_diff
+    return anomalies, None
 
 
 def _compare_exif_and_visible(
@@ -485,22 +532,28 @@ def check_image_timestamps(
     anomalies: List[str] = []
     reasons: List[str] = []
     risk = 0.0
+    status_minute_diff: Optional[int] = None
 
     if exif_info.get("suspicious_software"):
         anomalies.append("exif_editing_software")
         reasons.append(f"EXIF检测到修图软件: {exif_info.get('software')}")
         risk = max(risk, float(thresh.get("timestamp_software_risk", 0.85)))
 
-    anomalies.extend(
-        _compare_status_and_transaction(
-            ocr_info.get("status_bar_time"),
-            ocr_info.get("transaction_time"),
-            ocr_info.get("transaction_datetime"),
-        )
+    status_tolerance = int(thresh.get("status_transaction_tolerance_minutes", 8))
+    status_anomalies, status_minute_diff = _compare_status_and_transaction(
+        ocr_info.get("status_bar_time"),
+        ocr_info.get("transaction_time"),
+        ocr_info.get("transaction_datetime"),
+        tolerance_minutes=status_tolerance,
     )
+    anomalies.extend(status_anomalies)
     anomalies.extend(
         _compare_exif_and_visible(exif_info, ocr_info.get("transaction_datetime"))
     )
+
+    if ocr_tokens and image_shape and _is_unparsed_transaction_time(ocr_info):
+        anomalies.append("transaction_time_unparsed")
+        risk = max(risk, float(thresh.get("timestamp_unparsed_risk", 0.38)))
 
     if business_dt is not None:
         tolerance = float(thresh.get("business_time_tolerance_seconds", 300))
@@ -557,6 +610,7 @@ def check_image_timestamps(
         "business_exif_datetime_mismatch": "业务单据时间与EXIF时间不一致",
         "business_status_bar_time_mismatch": "业务单据时间与状态栏时间不一致",
         "business_visible_time_not_found": "已提供单据时间但图中未识别到可比对的时间文字",
+        "transaction_time_unparsed": "识别到疑似时间文字但未能可靠解析",
         "future_datetime": "检测到未来时间",
         "exif_editing_software": "EXIF含修图软件标记",
     }
@@ -576,10 +630,17 @@ def check_image_timestamps(
         risk = max(risk, business_risk)
     if "future_datetime" in anomalies:
         risk = max(risk, future_risk)
+    if "transaction_time_unparsed" in anomalies:
+        risk = max(risk, float(thresh.get("timestamp_unparsed_risk", 0.38)))
 
     timestamp_check["anomalies"] = list(dict.fromkeys(anomalies))
     business_mismatch = bool(BUSINESS_MISMATCH_ANOMALIES.intersection(timestamp_check["anomalies"]))
-    hard_tamper = bool(hard_tamper_set.intersection(timestamp_check["anomalies"]))
+    hard_anomalies = set(hard_tamper_set).intersection(timestamp_check["anomalies"])
+    if "status_transaction_time_mismatch" in hard_anomalies:
+        hard_min = int(thresh.get("status_transaction_hard_min_minutes", 240))
+        if status_minute_diff is None or status_minute_diff < hard_min:
+            hard_anomalies.discard("status_transaction_time_mismatch")
+    hard_tamper = bool(hard_anomalies)
     timestamp_check["business_mismatch"] = business_mismatch
     return {
         "timestamp_check": timestamp_check,
