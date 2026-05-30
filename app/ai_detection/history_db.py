@@ -8,7 +8,7 @@ import os
 import shutil
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from app.config import UPLOAD_DIR
 from app.database import get_conn
@@ -180,10 +180,12 @@ def list_ai_detection_history(
     page: int = 1,
     page_size: int = 20,
     retention_days: Optional[int] = None,
+    modes: Optional[Sequence[str]] = None,
 ) -> Tuple[int, List[Dict[str, Any]]]:
     """
     列出最近 retention_days 天内的记录（先执行清理，再查询）。
     返回 (total, rows)。每条含 image_url（可 GET 取图），无图则为 None。
+    modes 非空时仅返回指定 mode（如 rule_checks,rule_pixel_overlap）。
     """
     d = HISTORY_RETENTION_DAYS if retention_days is None else max(1, int(retention_days))
     purge_ai_detection_history_older_than(d)
@@ -192,26 +194,36 @@ def list_ai_detection_history(
     page_size = min(max(1, page_size), 200)
     offset = (page - 1) * page_size
 
+    mode_list = [str(m).strip() for m in (modes or []) if str(m).strip()]
+    mode_clause = ""
+    mode_params: List[Any] = [d]
+    if mode_list:
+        placeholders = ", ".join(["%s"] * len(mode_list))
+        mode_clause = f" AND mode IN ({placeholders})"
+        mode_params.extend(mode_list)
+
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """
+                f"""
                 SELECT COUNT(*) FROM ai_detection_history
                 WHERE created_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL %s DAY)
+                {mode_clause}
                 """,
-                (d,),
+                tuple(mode_params),
             )
             total = int(cur.fetchone()[0])
 
             cur.execute(
-                """
+                f"""
                 SELECT id, created_at, mode, task_id, original_filename, bbox, status, outcome_json, stored_image
                 FROM ai_detection_history
                 WHERE created_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL %s DAY)
+                {mode_clause}
                 ORDER BY id DESC
                 LIMIT %s OFFSET %s
                 """,
-                (d, page_size, offset),
+                tuple(mode_params + [page_size, offset]),
             )
             cols = [c[0] for c in cur.description]
             rows_out: List[Dict[str, Any]] = []
@@ -237,6 +249,9 @@ def list_ai_detection_history(
                 else:
                     item["outcome"] = _jsonish(out_v) if out_v is not None else None
                 del item["outcome_json"]
+                outcome_obj = item.get("outcome")
+                if isinstance(outcome_obj, dict) and isinstance(outcome_obj.get("summary"), dict):
+                    item["summary"] = outcome_obj["summary"]
                 rid = item.get("id")
                 stored = item.pop("stored_image", None)
                 if stored and rid is not None:

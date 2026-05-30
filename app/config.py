@@ -171,6 +171,11 @@ def _env_enabled(name: str, *, default: bool = True) -> bool:
 # 为 0 时不注册 /ai-detection/*、不启动鉴伪 GC/任务表、不预加载模型（省内存）
 AI_DETECTION_ENABLED = _env_enabled("AI_DETECTION_ENABLED", default=True)
 
+# 规则检测（像素重叠 / 时间戳）是否写入 ai_detection_history
+AI_RULE_CHECK_PERSIST = _env_enabled("AI_RULE_CHECK_PERSIST", default=True)
+# 为 0 时规则检测历史仅存 JSON，不复制归档图
+AI_RULE_CHECK_STORE_IMAGE = _env_enabled("AI_RULE_CHECK_STORE_IMAGE", default=True)
+
 # 为 0 时不注册智能预测相关路由、不连 Redis 预热线程、不启动定时预测调度
 INTELLIGENT_PREDICTION_ENABLED = _env_enabled("INTELLIGENT_PREDICTION_ENABLED", default=True)
 

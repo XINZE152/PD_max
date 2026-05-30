@@ -29,7 +29,7 @@ from app.ai_detection.amount_candidates import (
     detect_certificate_document_override,
 )
 from app.ai_detection.core.utils import load_chinese_font
-from app.config import UPLOAD_DIR
+from app.config import AI_RULE_CHECK_PERSIST, AI_RULE_CHECK_STORE_IMAGE, UPLOAD_DIR
 from app.ai_detection.easyocr_download_patch import patch_easyocr_download
 from app.ai_detection.history_db import (
     HISTORY_RETENTION_DAYS,
@@ -40,6 +40,16 @@ from app.ai_detection.history_db import (
     purge_ai_detection_history_older_than,
 )
 from app.ai_detection.ocr_utils import build_detection_bboxes_from_tokens, run_full_image_ocr
+from app.ai_detection.rule_check_history import (
+    MODE_RULE_CHECKS,
+    MODE_RULE_PIXEL_OVERLAP,
+    MODE_RULE_TIMESTAMP,
+    build_pixel_overlap_outcome,
+    build_rule_check_failed_outcome,
+    build_rule_checks_outcome,
+    build_timestamp_outcome,
+    persist_rule_check_history,
+)
 from app.ai_detection.rule_check_service import (
     run_pixel_overlap_check,
     run_rule_checks,
@@ -449,6 +459,35 @@ class RuleCheckService:
             return tmp.name
 
     @staticmethod
+    async def _persist_rule_check_history(
+        *,
+        mode: str,
+        original_filename: Optional[str],
+        bbox: Optional[List[int]],
+        status: str,
+        outcome: Dict[str, Any],
+        tmp_path: Optional[str],
+        task_id: Optional[str] = None,
+    ) -> None:
+        if not AI_RULE_CHECK_PERSIST:
+            return
+        source_image_path = None
+        if status == "COMPLETED" and AI_RULE_CHECK_STORE_IMAGE and tmp_path and os.path.isfile(tmp_path):
+            source_image_path = tmp_path
+        await run_in_threadpool(
+            partial(
+                persist_rule_check_history,
+                mode=mode,
+                original_filename=original_filename,
+                bbox=bbox,
+                status=status,
+                outcome=outcome,
+                source_image_path=source_image_path,
+                task_id=task_id,
+            ),
+        )
+
+    @staticmethod
     async def process_rule_checks(
         file: UploadFile,
         engine: InferenceEngineAPI,
@@ -457,6 +496,7 @@ class RuleCheckService:
         *,
         bbox_list: Optional[List[int]] = None,
         business_datetime: Optional[str] = None,
+        task_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         tmp_path: Optional[str] = None
         try:
@@ -470,7 +510,7 @@ class RuleCheckService:
                         int(img_cv2.shape[1]),
                         int(img_cv2.shape[2]) if len(img_cv2.shape) > 2 else 3,
                     )
-                return await run_in_threadpool(
+                data = await run_in_threadpool(
                     partial(
                         run_rule_checks,
                         tmp_path,
@@ -483,6 +523,36 @@ class RuleCheckService:
                         business_rules=engine.config.get("business_rules", {}),
                     ),
                 )
+            await RuleCheckService._persist_rule_check_history(
+                mode=MODE_RULE_CHECKS,
+                original_filename=file.filename,
+                bbox=bbox_list,
+                status="COMPLETED",
+                outcome=build_rule_checks_outcome(
+                    data,
+                    bbox=bbox_list,
+                    document_time=business_datetime,
+                ),
+                tmp_path=tmp_path,
+                task_id=task_id,
+            )
+            return data
+        except ValueError as exc:
+            await RuleCheckService._persist_rule_check_history(
+                mode=MODE_RULE_CHECKS,
+                original_filename=file.filename,
+                bbox=bbox_list,
+                status="FAILED",
+                outcome=build_rule_check_failed_outcome(
+                    MODE_RULE_CHECKS,
+                    str(exc),
+                    bbox=bbox_list,
+                    document_time=business_datetime,
+                ),
+                tmp_path=None,
+                task_id=task_id,
+            )
+            raise
         finally:
             if tmp_path and os.path.exists(tmp_path):
                 os.remove(tmp_path)
@@ -493,12 +563,14 @@ class RuleCheckService:
         bbox_list: List[int],
         engine: InferenceEngineAPI,
         semaphore: asyncio.Semaphore,
+        *,
+        task_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         tmp_path: Optional[str] = None
         try:
             tmp_path = await RuleCheckService._save_upload_to_temp(file)
             async with semaphore:
-                return await run_in_threadpool(
+                data = await run_in_threadpool(
                     partial(
                         run_pixel_overlap_check,
                         tmp_path,
@@ -508,6 +580,31 @@ class RuleCheckService:
                         margin=int(engine.config.get("business_rules", {}).get("roi_expand_margin", 15)),
                     ),
                 )
+            await RuleCheckService._persist_rule_check_history(
+                mode=MODE_RULE_PIXEL_OVERLAP,
+                original_filename=file.filename,
+                bbox=bbox_list,
+                status="COMPLETED",
+                outcome=build_pixel_overlap_outcome(data, bbox=bbox_list),
+                tmp_path=tmp_path,
+                task_id=task_id,
+            )
+            return data
+        except ValueError as exc:
+            await RuleCheckService._persist_rule_check_history(
+                mode=MODE_RULE_PIXEL_OVERLAP,
+                original_filename=file.filename,
+                bbox=bbox_list,
+                status="FAILED",
+                outcome=build_rule_check_failed_outcome(
+                    MODE_RULE_PIXEL_OVERLAP,
+                    str(exc),
+                    bbox=bbox_list,
+                ),
+                tmp_path=None,
+                task_id=task_id,
+            )
+            raise
         finally:
             if tmp_path and os.path.exists(tmp_path):
                 os.remove(tmp_path)
@@ -520,6 +617,7 @@ class RuleCheckService:
         ocr_reader: Any,
         *,
         business_datetime: Optional[str] = None,
+        task_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         tmp_path: Optional[str] = None
         try:
@@ -533,7 +631,7 @@ class RuleCheckService:
                         int(img_cv2.shape[1]),
                         int(img_cv2.shape[2]) if len(img_cv2.shape) > 2 else 3,
                     )
-                return await run_in_threadpool(
+                data = await run_in_threadpool(
                     partial(
                         run_timestamp_check,
                         tmp_path,
@@ -543,6 +641,31 @@ class RuleCheckService:
                         thresholds=engine.config.get("thresholds", {}),
                     ),
                 )
+            await RuleCheckService._persist_rule_check_history(
+                mode=MODE_RULE_TIMESTAMP,
+                original_filename=file.filename,
+                bbox=None,
+                status="COMPLETED",
+                outcome=build_timestamp_outcome(data, document_time=business_datetime),
+                tmp_path=tmp_path,
+                task_id=task_id,
+            )
+            return data
+        except ValueError as exc:
+            await RuleCheckService._persist_rule_check_history(
+                mode=MODE_RULE_TIMESTAMP,
+                original_filename=file.filename,
+                bbox=None,
+                status="FAILED",
+                outcome=build_rule_check_failed_outcome(
+                    MODE_RULE_TIMESTAMP,
+                    str(exc),
+                    document_time=business_datetime,
+                ),
+                tmp_path=None,
+                task_id=task_id,
+            )
+            raise
         finally:
             if tmp_path and os.path.exists(tmp_path):
                 os.remove(tmp_path)
@@ -996,8 +1119,10 @@ _RULE_CHECK_SCHEMA = (
         "**输入参数**\n"
         "- **file**：图片文件（必填）\n"
         "- **bbox**（可选）：检测框 `[x1,y1,x2,y2]`；传入则额外做 ROI 像素重叠检测\n"
-        "- **document_time**（可选）：业务单据时间，与图内交易时间比对\n\n"
-        "**说明**：可与 `POST .../api/v3/detect` 并行调用；主鉴伪接口不再包含像素重叠与时间戳。\n\n"
+        "- **document_time**（可选）：业务单据时间，与图内交易时间比对\n"
+        "- **task_id**（可选）：与 `async_v3` 主鉴伪任务关联，便于历史聚合\n\n"
+        "**说明**：可与 `POST .../api/v3/detect` 并行调用；主鉴伪接口不再包含像素重叠与时间戳。"
+        "成功/失败均写入 `ai_detection_history`（`mode=rule_checks`，可用 `AI_RULE_CHECK_PERSIST=0` 关闭）。\n\n"
         + _RULE_CHECK_SCHEMA
     ),
 )
@@ -1012,6 +1137,10 @@ async def rule_checks_endpoint(
         None,
         description="可选。业务单据时间",
         examples=["2026-05-28 11:32:00"],
+    ),
+    task_id: Optional[str] = Form(
+        None,
+        description="可选。与主鉴伪 async_v3 任务关联的 UUID",
     ),
     engine: InferenceEngineAPI = Depends(get_engine),
     ocr_reader: Any = Depends(get_ocr_reader),
@@ -1031,6 +1160,7 @@ async def rule_checks_endpoint(
             ocr_reader,
             bbox_list=bbox_list,
             business_datetime=document_time,
+            task_id=task_id,
         )
         return {"status": "success", "data": data}
     except ValueError as exc:
@@ -1045,6 +1175,8 @@ async def rule_checks_endpoint(
         "**请求方式**：`multipart/form-data`\n\n"
         "- **file**：图片文件（必填）\n"
         "- **bbox**：检测框 `[x1,y1,x2,y2]`（必填）\n"
+        "- **task_id**（可选）：与主鉴伪 async_v3 任务关联\n"
+        "\n成功/失败写入 `ai_detection_history`（`mode=rule_pixel_overlap`）。\n"
     ),
 )
 async def pixel_overlap_check_endpoint(
@@ -1054,6 +1186,7 @@ async def pixel_overlap_check_endpoint(
         description="像素重叠检测 ROI：[x1,y1,x2,y2]",
         examples=["[120,80,400,140]"],
     ),
+    task_id: Optional[str] = Form(None, description="可选。与主鉴伪 async_v3 任务关联的 UUID"),
     engine: InferenceEngineAPI = Depends(get_engine),
     semaphore: asyncio.Semaphore = Depends(get_ai_semaphore),
 ):
@@ -1062,7 +1195,9 @@ async def pixel_overlap_check_endpoint(
     except Exception:
         raise HTTPException(status_code=400, detail="bbox 格式无效，请使用 [x1,y1,x2,y2] 或 x1,y1,x2,y2")
     try:
-        data = await RuleCheckService.process_pixel_overlap(file, bbox_list, engine, semaphore)
+        data = await RuleCheckService.process_pixel_overlap(
+            file, bbox_list, engine, semaphore, task_id=task_id,
+        )
         return {"status": "success", "data": data}
     except ValueError as exc:
         return JSONResponse(status_code=422, content={"status": "error", "message": str(exc)})
@@ -1076,6 +1211,8 @@ async def pixel_overlap_check_endpoint(
         "**请求方式**：`multipart/form-data`\n\n"
         "- **file**：图片文件（必填）\n"
         "- **document_time**（可选）：业务单据时间\n"
+        "- **task_id**（可选）：与主鉴伪 async_v3 任务关联\n"
+        "\n成功/失败写入 `ai_detection_history`（`mode=rule_timestamp`）。\n"
     ),
 )
 async def timestamp_check_endpoint(
@@ -1085,6 +1222,7 @@ async def timestamp_check_endpoint(
         description="可选。业务单据时间",
         examples=["2026-05-28 11:32:00"],
     ),
+    task_id: Optional[str] = Form(None, description="可选。与主鉴伪 async_v3 任务关联的 UUID"),
     engine: InferenceEngineAPI = Depends(get_engine),
     ocr_reader: Any = Depends(get_ocr_reader),
     semaphore: asyncio.Semaphore = Depends(get_ai_semaphore),
@@ -1096,6 +1234,7 @@ async def timestamp_check_endpoint(
             semaphore,
             ocr_reader,
             business_datetime=document_time,
+            task_id=task_id,
         )
         return {"status": "success", "data": data}
     except ValueError as exc:
@@ -1195,18 +1334,26 @@ async def detect_tampering_endpoint(
     description=(
         "分页返回最近 **7 天**（可用环境变量 `AI_DETECTION_HISTORY_DAYS` 调整）内的检测记录；"
         "每次查询前会清理超过保留期的数据。\n\n"
-        "**查询参数**：`page`（默认 1）、`page_size`（默认 20，最大 200）。\n\n"
-        "**单条字段**：`id`、`created_at`、`mode`（sync_v1 | async_v3）、`task_id`、`original_filename`、"
-        "`bbox`、`status`（COMPLETED | FAILED）、`outcome`（含 `result` / `multi_results` / `error_msg`）、"
+        "**查询参数**：`page`（默认 1）、`page_size`（默认 20，最大 200）、"
+        "`mode`（可选，逗号分隔，如 `rule_checks,rule_pixel_overlap` 或 `sync_v1,async_v3`）。\n\n"
+        "**单条字段**：`id`、`created_at`、`mode`（sync_v1 | async_v3 | rule_checks | rule_pixel_overlap | rule_timestamp）、"
+        "`task_id`、`original_filename`、"
+        "`bbox`、`status`（COMPLETED | FAILED）、`outcome`（含 `result` / `multi_results` / `error_msg` / 规则检测完整结果）、"
+        "`summary`（规则检测摘要，若有）、"
         "`image_url`（有归档图时为 `GET /ai-detection/api/v1/history/{id}/image` 的路径前缀，否则为 null）。\n"
     ),
 )
 async def list_detection_history(
     page: int = Query(1, ge=1, description="页码，从 1 开始"),
     page_size: int = Query(20, ge=1, le=200, description="每页条数"),
+    mode: Optional[str] = Query(
+        None,
+        description="可选。按 mode 过滤，逗号分隔，如 rule_checks,sync_v1",
+    ),
 ):
+    modes = [m.strip() for m in mode.split(",")] if mode else None
     total, rows = await run_in_threadpool(
-        partial(list_ai_detection_history, page=page, page_size=page_size),
+        partial(list_ai_detection_history, page=page, page_size=page_size, modes=modes),
     )
     return {
         "status": "success",
