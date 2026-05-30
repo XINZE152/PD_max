@@ -210,6 +210,95 @@ class TimestampCheckerTests(unittest.TestCase):
         self.assertIn("future_datetime", result["anomalies"])
         self.assertGreaterEqual(result["risk"], 0.72)
 
+    def test_status_bar_single_digit_hour_aligns_with_transaction(self):
+        tokens = [
+            OCRToken(
+                text="2:49",
+                clean_text="2:49",
+                bbox=(10, 10, 90, 40),
+                conf=0.99,
+                width=80,
+                height=30,
+                center_y=25.0,
+            ),
+            OCRToken(
+                text="申请时间:  2026-01-2814:49:06",
+                clean_text="申请时间:  2026-01-2814:49:06",
+                bbox=(100, 420, 620, 470),
+                conf=0.98,
+                width=520,
+                height=50,
+                center_y=445.0,
+            ),
+        ]
+
+        with patch("app.ai_detection.timestamp_checker.parse_exif_timestamps", return_value={"has_exif": False}):
+            result = check_image_timestamps(
+                "/tmp/mock.jpg",
+                ocr_tokens=tokens,
+                image_shape=(1000, 800, 3),
+            )
+
+        self.assertNotIn("status_transaction_time_mismatch", result["anomalies"])
+        self.assertFalse(result.get("hard_tamper"))
+
+    def test_moderate_status_mismatch_is_not_hard_tamper(self):
+        tokens = [
+            OCRToken(
+                text="18:34",
+                clean_text="18:34",
+                bbox=(10, 10, 90, 40),
+                conf=0.99,
+                width=80,
+                height=30,
+                center_y=25.0,
+            ),
+            OCRToken(
+                text="2026012720004001110013002985888",
+                clean_text="2026012720004001110013002985888",
+                bbox=(100, 420, 620, 470),
+                conf=0.98,
+                width=520,
+                height=50,
+                center_y=445.0,
+            ),
+        ]
+
+        with patch("app.ai_detection.timestamp_checker.parse_exif_timestamps", return_value={"has_exif": False}):
+            result = check_image_timestamps(
+                "/tmp/mock.jpg",
+                ocr_tokens=tokens,
+                image_shape=(1000, 800, 3),
+            )
+
+        self.assertIn("status_transaction_time_mismatch", result["anomalies"])
+        self.assertFalse(result.get("hard_tamper"))
+
+    def test_unparsed_transaction_time_is_flagged(self):
+        tokens = [
+            OCRToken(
+                text="2026-01-28170 37",
+                clean_text="2026-01-28170 37",
+                bbox=(100, 420, 620, 470),
+                conf=0.98,
+                width=520,
+                height=50,
+                center_y=445.0,
+            ),
+        ]
+
+        with patch("app.ai_detection.timestamp_checker.parse_exif_timestamps", return_value={"has_exif": False}):
+            result = check_image_timestamps(
+                "/tmp/mock.jpg",
+                ocr_tokens=tokens,
+                image_shape=(1000, 800, 3),
+                business_datetime="2026-05-28 11:32:00",
+            )
+
+        self.assertIn("transaction_time_unparsed", result["anomalies"])
+        self.assertGreaterEqual(result["risk"], 0.38)
+        self.assertFalse(result.get("hard_tamper"))
+
 
 if __name__ == "__main__":
     unittest.main()
