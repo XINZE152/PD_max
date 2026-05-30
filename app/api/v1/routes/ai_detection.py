@@ -40,6 +40,11 @@ from app.ai_detection.history_db import (
     purge_ai_detection_history_older_than,
 )
 from app.ai_detection.ocr_utils import build_detection_bboxes_from_tokens, run_full_image_ocr
+from app.ai_detection.rule_check_service import (
+    run_pixel_overlap_check,
+    run_rule_checks,
+    run_timestamp_check,
+)
 from app.ai_detection.runtime_assets import get_easyocr_reader_kwargs
 
 if TYPE_CHECKING:
@@ -388,7 +393,6 @@ class DetectionService:
         ocr_reader: Any,
         *,
         retain_temp_for_history: bool = False,
-        business_datetime: Optional[str] = None,
     ) -> Tuple[Dict[str, Any], Optional[str]]:
         """成功时若 retain_temp_for_history=True，返回 (结果, 临时图路径)，由调用方在归档后删除临时文件。"""
         tmp_path: Optional[str] = None
@@ -409,8 +413,6 @@ class DetectionService:
                         tmp_path,
                         bbox_list,
                         "xyxy",
-                        ocr_tokens=ocr_tokens or None,
-                        business_datetime=business_datetime,
                         detection_bboxes=detection_bboxes or None,
                     ),
                 )
@@ -423,6 +425,126 @@ class DetectionService:
             return result_dict, (tmp_path if retain_temp_for_history else None)
         finally:
             if tmp_path and os.path.exists(tmp_path) and not keep_tmp:
+                os.remove(tmp_path)
+
+
+def _parse_bbox_form(bbox: str) -> List[int]:
+    clean_bbox = bbox.strip().strip("'").strip('"').strip()
+    if clean_bbox.startswith("["):
+        parsed = json.loads(clean_bbox)
+    else:
+        parsed = [int(x.strip()) for x in clean_bbox.split(",")]
+    if len(parsed) != 4:
+        raise ValueError("bbox 格式无效，请使用 [x1,y1,x2,y2] 或 x1,y1,x2,y2")
+    return [int(x) for x in parsed]
+
+
+class RuleCheckService:
+    """规则类检测（像素重叠、时间戳），与完整 AI 鉴伪解耦。"""
+
+    @staticmethod
+    async def _save_upload_to_temp(file: UploadFile) -> str:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
+            tmp.write(await file.read())
+            return tmp.name
+
+    @staticmethod
+    async def process_rule_checks(
+        file: UploadFile,
+        engine: InferenceEngineAPI,
+        semaphore: asyncio.Semaphore,
+        ocr_reader: Any,
+        *,
+        bbox_list: Optional[List[int]] = None,
+        business_datetime: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        tmp_path: Optional[str] = None
+        try:
+            tmp_path = await RuleCheckService._save_upload_to_temp(file)
+            async with semaphore:
+                img_cv2, ocr_tokens = await run_in_threadpool(run_full_image_ocr, tmp_path, ocr_reader)
+                image_shape = None
+                if img_cv2 is not None:
+                    image_shape = (
+                        int(img_cv2.shape[0]),
+                        int(img_cv2.shape[1]),
+                        int(img_cv2.shape[2]) if len(img_cv2.shape) > 2 else 3,
+                    )
+                return await run_in_threadpool(
+                    partial(
+                        run_rule_checks,
+                        tmp_path,
+                        engine.pixel_detector,
+                        bbox_xyxy=bbox_list,
+                        business_datetime=business_datetime,
+                        ocr_tokens=ocr_tokens or None,
+                        image_shape=image_shape,
+                        thresholds=engine.config.get("thresholds", {}),
+                        business_rules=engine.config.get("business_rules", {}),
+                    ),
+                )
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+    @staticmethod
+    async def process_pixel_overlap(
+        file: UploadFile,
+        bbox_list: List[int],
+        engine: InferenceEngineAPI,
+        semaphore: asyncio.Semaphore,
+    ) -> Dict[str, Any]:
+        tmp_path: Optional[str] = None
+        try:
+            tmp_path = await RuleCheckService._save_upload_to_temp(file)
+            async with semaphore:
+                return await run_in_threadpool(
+                    partial(
+                        run_pixel_overlap_check,
+                        tmp_path,
+                        bbox_list,
+                        engine.pixel_detector,
+                        thresholds=engine.config.get("thresholds", {}),
+                        margin=int(engine.config.get("business_rules", {}).get("roi_expand_margin", 15)),
+                    ),
+                )
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+    @staticmethod
+    async def process_timestamp(
+        file: UploadFile,
+        engine: InferenceEngineAPI,
+        semaphore: asyncio.Semaphore,
+        ocr_reader: Any,
+        *,
+        business_datetime: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        tmp_path: Optional[str] = None
+        try:
+            tmp_path = await RuleCheckService._save_upload_to_temp(file)
+            async with semaphore:
+                img_cv2, ocr_tokens = await run_in_threadpool(run_full_image_ocr, tmp_path, ocr_reader)
+                image_shape = None
+                if img_cv2 is not None:
+                    image_shape = (
+                        int(img_cv2.shape[0]),
+                        int(img_cv2.shape[1]),
+                        int(img_cv2.shape[2]) if len(img_cv2.shape) > 2 else 3,
+                    )
+                return await run_in_threadpool(
+                    partial(
+                        run_timestamp_check,
+                        tmp_path,
+                        ocr_tokens=ocr_tokens or None,
+                        image_shape=image_shape,
+                        business_datetime=business_datetime,
+                        thresholds=engine.config.get("thresholds", {}),
+                    ),
+                )
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
                 os.remove(tmp_path)
 
 
@@ -495,13 +617,11 @@ class DetectionDomainServiceV3:
         self._cached_candidates = build_amount_candidates(self._cached_tokens, img_cv2.shape)
         self._ocr_reader = ocr_reader
 
-    def _predict_kwargs(self, business_datetime: Optional[str]) -> Dict[str, Any]:
+    def _predict_kwargs(self) -> Dict[str, Any]:
         detection_bboxes: List[List[int]] = []
         if self._cached_candidates and self._cached_img_cv2 is not None:
             detection_bboxes = [list(candidate.bbox) for candidate in self._cached_candidates]
         return {
-            "ocr_tokens": self._cached_tokens,
-            "business_datetime": business_datetime,
             "detection_bboxes": detection_bboxes or None,
         }
 
@@ -552,7 +672,6 @@ class DetectionDomainServiceV3:
         task_id: str,
         image_path: str,
         bbox: Optional[BBoxDTO] = None,
-        business_datetime: Optional[str] = None,
     ) -> None:
         task = await self.registry.get_task(task_id)
         if not task or task.status == TaskStatusEnum.CANCELED:
@@ -572,7 +691,7 @@ class DetectionDomainServiceV3:
 
             async with self.semaphore:
                 await run_in_threadpool(self._run_ocr_once, image_path, ocr_reader)
-            predict_extra = self._predict_kwargs(business_datetime)
+            predict_extra = self._predict_kwargs()
 
             if bbox:
                 bbox_list = [bbox.x1, bbox.y1, bbox.x2, bbox.y2]
@@ -813,40 +932,174 @@ router = APIRouter(
 
 
 _DETECT_RESULT_SCHEMA = (
-    "引擎返回的 `data` / `result` 中单条结构示例：\n"
+    "引擎返回的 `data` / `result` 中单条结构示例（**不含**像素重叠与时间戳，请用规则检测接口）：\n"
     "```json\n"
     "{\n"
     '  "result": "正常",\n'
     '  "confidence": 0.32,\n'
     '  "bbox": [120, 80, 280, 60],\n'
     '  "reason": "未检出明显篡改痕迹",\n'
-    '  "pixel_overlap_score": 0.18,\n'
     '  "bbox_overlap_check": {\n'
     '    "max_iou": 0.42,\n'
     '    "overlapping_pairs": [],\n'
     '    "box_count": 3,\n'
     '    "anomalies": []\n'
     "  },\n"
-    '  "timestamp_check": {\n'
-    '    "status_bar_time": "11:32",\n'
-    '    "transaction_time": "2026-05-28 11:32:00",\n'
-    '    "business_document_time": "2026-05-28 11:32:00",\n'
-    '    "business_mismatch": false,\n'
-    '    "exif_datetime_original": null,\n'
-    '    "anomalies": []\n'
-    "  },\n"
-    '  "hard_tamper_flags": { "pixel_overlap": false, "bbox_iou": false, "timestamp": false }\n'
+    '  "hard_tamper_flags": { "bbox_iou": false }\n'
     "}\n"
     "```\n"
     "- **result**：`正常` | `可疑` | `篡改` | `错误`\n"
     "- **confidence**：综合风险 0~1，越高越可疑\n"
     "- **bbox**：引擎实际使用的 ROI（x, y, 宽, 高）\n"
-    "- **pixel_overlap_score**：拼接/贴图接缝像素重叠风险（0~1）\n"
     "- **bbox_overlap_check**：OCR 检测框 IoU 重叠分析（max_iou、overlapping_pairs）\n"
-    "- **timestamp_check**：图内时间、EXIF、业务单据时间及异常码；**business_mismatch** 表示业务时间与图内不一致（通常为可疑）\n"
-    "- **hard_tamper_flags**：像素重叠（需佐证或极高分）、检测框 IoU 或图内时间戳是否触发直接判「篡改」\n"
+    "- **hard_tamper_flags.bbox_iou**：检测框高度重叠是否触发直接判「篡改」\n"
     "- **reason**：中文简要说明；异步任务成功时可能另含 **original_bbox**（用户传入的四点框）\n"
+    "- 像素重叠、时间戳请调用 `POST .../api/v1/rule-checks`（或子接口）\n"
 )
+
+_RULE_CHECK_SCHEMA = (
+    "规则检测返回的 `data` 结构示例（`POST .../api/v1/rule-checks` 及子接口）：\n"
+    "```json\n"
+    "{\n"
+    '  "pixel_overlap": {\n'
+    '    "pixel_overlap_score": 0.18,\n'
+    '    "bbox": [120, 80, 280, 60],\n'
+    '    "alert": false,\n'
+    '    "hard_tamper": false,\n'
+    '    "reasons": []\n'
+    "  },\n"
+    '  "timestamp": {\n'
+    '    "timestamp_check": {\n'
+    '      "status_bar_time": "11:32",\n'
+    '      "transaction_time": "2026-05-28 11:32:00",\n'
+    '      "business_document_time": null,\n'
+    '      "anomalies": []\n'
+    "    },\n"
+    '    "risk": 0.0,\n'
+    '    "hard_tamper": false\n'
+    "  },\n"
+    '  "hard_tamper_flags": { "pixel_overlap": false, "timestamp": false },\n'
+    '  "reason": "未检出明显规则类异常"\n'
+    "}\n"
+    "```\n"
+    "- 未传 **bbox** 时 `pixel_overlap` 为 `null`，仅执行时间戳检测。\n"
+    "- 子接口 `/pixel-overlap/check` 仅返回像素重叠块；`/timestamp/check` 仅返回时间戳块。\n"
+)
+
+
+@router.post(
+    "/api/v1/rule-checks",
+    summary="规则检测（像素重叠 + 时间戳）",
+    description=(
+        "上传图片，执行**规则类**鉴伪：像素重叠与图内时间戳校验，**不加载 XGBoost/字体模型**。\n\n"
+        "**请求方式**：`multipart/form-data`\n\n"
+        "**输入参数**\n"
+        "- **file**：图片文件（必填）\n"
+        "- **bbox**（可选）：检测框 `[x1,y1,x2,y2]`；传入则额外做 ROI 像素重叠检测\n"
+        "- **document_time**（可选）：业务单据时间，与图内交易时间比对\n\n"
+        "**说明**：可与 `POST .../api/v3/detect` 并行调用；主鉴伪接口不再包含像素重叠与时间戳。\n\n"
+        + _RULE_CHECK_SCHEMA
+    ),
+)
+async def rule_checks_endpoint(
+    file: UploadFile = File(..., description="待检测图片文件"),
+    bbox: Optional[str] = Form(
+        None,
+        description="可选。像素重叠检测 ROI：[x1,y1,x2,y2]",
+        examples=["[120,80,400,140]"],
+    ),
+    document_time: Optional[str] = Form(
+        None,
+        description="可选。业务单据时间",
+        examples=["2026-05-28 11:32:00"],
+    ),
+    engine: InferenceEngineAPI = Depends(get_engine),
+    ocr_reader: Any = Depends(get_ocr_reader),
+    semaphore: asyncio.Semaphore = Depends(get_ai_semaphore),
+):
+    bbox_list: Optional[List[int]] = None
+    if bbox:
+        try:
+            bbox_list = _parse_bbox_form(bbox)
+        except Exception:
+            raise HTTPException(status_code=400, detail="bbox 格式无效，请使用 [x1,y1,x2,y2] 或 x1,y1,x2,y2")
+    try:
+        data = await RuleCheckService.process_rule_checks(
+            file,
+            engine,
+            semaphore,
+            ocr_reader,
+            bbox_list=bbox_list,
+            business_datetime=document_time,
+        )
+        return {"status": "success", "data": data}
+    except ValueError as exc:
+        return JSONResponse(status_code=422, content={"status": "error", "message": str(exc)})
+
+
+@router.post(
+    "/api/v1/pixel-overlap/check",
+    summary="像素重叠规则检测",
+    description=(
+        "对指定 ROI 执行像素重叠/拼接规则检测（OpenCV + 统计阈值），不执行完整 AI 鉴伪。\n\n"
+        "**请求方式**：`multipart/form-data`\n\n"
+        "- **file**：图片文件（必填）\n"
+        "- **bbox**：检测框 `[x1,y1,x2,y2]`（必填）\n"
+    ),
+)
+async def pixel_overlap_check_endpoint(
+    file: UploadFile = File(..., description="待检测图片文件"),
+    bbox: str = Form(
+        ...,
+        description="像素重叠检测 ROI：[x1,y1,x2,y2]",
+        examples=["[120,80,400,140]"],
+    ),
+    engine: InferenceEngineAPI = Depends(get_engine),
+    semaphore: asyncio.Semaphore = Depends(get_ai_semaphore),
+):
+    try:
+        bbox_list = _parse_bbox_form(bbox)
+    except Exception:
+        raise HTTPException(status_code=400, detail="bbox 格式无效，请使用 [x1,y1,x2,y2] 或 x1,y1,x2,y2")
+    try:
+        data = await RuleCheckService.process_pixel_overlap(file, bbox_list, engine, semaphore)
+        return {"status": "success", "data": data}
+    except ValueError as exc:
+        return JSONResponse(status_code=422, content={"status": "error", "message": str(exc)})
+
+
+@router.post(
+    "/api/v1/timestamp/check",
+    summary="图片时间戳规则检测",
+    description=(
+        "对图片执行 OCR + EXIF + 业务时间规则校验，不执行完整 AI 鉴伪。\n\n"
+        "**请求方式**：`multipart/form-data`\n\n"
+        "- **file**：图片文件（必填）\n"
+        "- **document_time**（可选）：业务单据时间\n"
+    ),
+)
+async def timestamp_check_endpoint(
+    file: UploadFile = File(..., description="待检测图片文件"),
+    document_time: Optional[str] = Form(
+        None,
+        description="可选。业务单据时间",
+        examples=["2026-05-28 11:32:00"],
+    ),
+    engine: InferenceEngineAPI = Depends(get_engine),
+    ocr_reader: Any = Depends(get_ocr_reader),
+    semaphore: asyncio.Semaphore = Depends(get_ai_semaphore),
+):
+    try:
+        data = await RuleCheckService.process_timestamp(
+            file,
+            engine,
+            semaphore,
+            ocr_reader,
+            business_datetime=document_time,
+        )
+        return {"status": "success", "data": data}
+    except ValueError as exc:
+        return JSONResponse(status_code=422, content={"status": "error", "message": str(exc)})
 
 
 @router.post(
@@ -861,9 +1114,8 @@ _DETECT_RESULT_SCHEMA = (
         "**输入参数**\n"
         "- **file**：图片文件（如 JPG/PNG）\n"
         "- **bbox**：字符串。支持 JSON 数组 `[x1,y1,x2,y2]` 或英文逗号分隔 `x1,y1,x2,y2`（均为像素，"
-        "左上角到右下角）\n"
-        "- **document_time**（可选）：业务单据时间，如 `2026-05-28 11:32:00`，将与图内交易时间比对；"
-        "不一致时标为「可疑」并写入 reason，**不会单独强制判篡改**（仅与图内交易时间比对，不与状态栏比对）\n\n"
+        "左上角到右下角）\n\n"
+        "**说明**：像素重叠、时间戳规则检测请使用 `POST .../api/v1/rule-checks` 或子接口。\n\n"
         "**输出说明**\n"
         "- 成功：`{ \"status\": \"success\", \"data\": { ...引擎结果... } }`\n"
         "- 业务失败（引擎报「错误」）：HTTP 422，`{ \"status\": \"error\", \"message\": \"...\" }`\n\n"
@@ -892,20 +1144,12 @@ async def detect_tampering_endpoint(
         description="检测框：JSON 数组 [x1,y1,x2,y2] 或逗号分隔的四个整数",
         examples=["[120,80,400,140]", "120,80,400,140"],
     ),
-    document_time: Optional[str] = Form(
-        None,
-        description="可选。业务单据时间，将与 OCR 识别的图内交易时间比对",
-        examples=["2026-05-28 11:32:00"],
-    ),
     engine: InferenceEngineAPI = Depends(get_engine),
     ocr_reader: Any = Depends(get_ocr_reader),
     semaphore: asyncio.Semaphore = Depends(get_ai_semaphore),
 ):
     try:
-        clean_bbox = bbox.strip().strip("'").strip('"').strip()
-        bbox_parsed = json.loads(clean_bbox) if clean_bbox.startswith("[") else [int(x.strip()) for x in clean_bbox.split(",")]
-        if len(bbox_parsed) != 4:
-            raise ValueError
+        bbox_parsed = _parse_bbox_form(bbox)
     except Exception:
         raise HTTPException(status_code=400, detail="bbox 格式无效，请使用 [x1,y1,x2,y2] 或 x1,y1,x2,y2")
 
@@ -913,12 +1157,11 @@ async def detect_tampering_endpoint(
     try:
         res, tmp_history_path = await DetectionService.process_detection(
             file,
-            [int(x) for x in bbox_parsed],
+            bbox_parsed,
             engine,
             semaphore,
             ocr_reader,
             retain_temp_for_history=True,
-            business_datetime=document_time,
         )
         try:
             await run_in_threadpool(
@@ -927,7 +1170,7 @@ async def detect_tampering_endpoint(
                     mode="sync_v1",
                     task_id=None,
                     original_filename=file.filename,
-                    bbox=list(int(x) for x in bbox_parsed),
+                    bbox=bbox_parsed,
                     status="COMPLETED",
                     outcome={"result": res},
                     source_image_path=tmp_history_path,
@@ -1003,8 +1246,7 @@ async def get_detection_history_image(record_id: int):
         "2. 仅传 **task_id**：对已有任务重新触发排队（一般与上传二选一）。\n\n"
         "可选 **bbox**：与 v1 相同格式；**不传**则使用 EasyOCR 自动框选图中疑似单号/金额等数字区域，"
         "对每个框分别推理，结果在 `multi_results` 中。\n"
-        "可选 **document_time**：业务单据时间，将与图内 OCR **交易时间**比对（不与状态栏截图时刻比对）；"
-        "与图内交易时间不一致时结果为「可疑」，不单独强制判篡改。\n\n"
+        "像素重叠、时间戳请并行调用 `POST .../api/v1/rule-checks` 或子接口。\n\n"
         "**输出示例（受理成功）**\n"
         "```json\n"
         "{\n"
@@ -1024,11 +1266,6 @@ async def submit_detection(
         None,
         description="可选。指定框 [x1,y1,x2,y2]；不传则自动 OCR 多框检测",
         examples=["[120,80,400,140]"],
-    ),
-    document_time: Optional[str] = Form(
-        None,
-        description="可选。业务单据时间，将与图内 OCR 交易时间及 EXIF 比对",
-        examples=["2026-05-28 11:32:00"],
     ),
     registry: AbstractTaskRegistry = Depends(get_registry),
     semaphore: asyncio.Semaphore = Depends(get_ai_semaphore),
@@ -1058,7 +1295,7 @@ async def submit_detection(
 
     await registry.update_task(task_id, status=TaskStatusEnum.PENDING)
     service = DetectionDomainServiceV3(registry, semaphore)
-    background_tasks.add_task(service.execute_async, task_id, task.image_path, bbox_dto, document_time)
+    background_tasks.add_task(service.execute_async, task_id, task.image_path, bbox_dto)
     return {"status": "pending", "task_id": task_id}
 
 
