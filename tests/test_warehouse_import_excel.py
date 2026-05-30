@@ -13,14 +13,26 @@ class WarehouseInventoryExcelTests(unittest.TestCase):
         wb = Workbook()
         ws = wb.active
         ws.title = "导入数据"
-        ws.append(["库房名称", "当前库存", "库存日期"])
-        ws.append(["测试库房", 88.5, "2026-05-29"])
+        ws.append(["库房名称", "回收品种", "当前库存", "库存日期"])
+        ws.append(["测试库房", "电动电瓶", 88.5, "2026-05-29"])
         buf = io.BytesIO()
         wb.save(buf)
         rows, meta = parse_warehouse_inventory_workbook(buf.getvalue())
         self.assertEqual(meta["parsed_rows"], 1)
         self.assertEqual(rows[0].warehouse_name, "测试库房")
+        self.assertEqual(rows[0].category_name, "电动电瓶")
         self.assertEqual(rows[0].inventory_ton, Decimal("88.5"))
+
+    def test_parse_inventory_requires_category_column(self) -> None:
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "导入数据"
+        ws.append(["库房名称", "当前库存", "库存日期"])
+        ws.append(["测试库房", 88.5, "2026-05-29"])
+        buf = io.BytesIO()
+        wb.save(buf)
+        with self.assertRaises(Exception):
+            parse_warehouse_inventory_workbook(buf.getvalue())
 
 
 class WarehouseReceiptPriceExcelTests(unittest.TestCase):

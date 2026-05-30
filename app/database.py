@@ -309,11 +309,12 @@ TABLE_STATEMENTS = [
         UNIQUE KEY uk_inventory_warehouse_category (warehouse_id, category_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='仓库库存表（预留）';
     """,
-    # 库房当前库存快照（按日期；页面展示最新一条）
+    # 库房当前库存快照（库房+品类+日期；页面展示每品类最新一条）
     """
     CREATE TABLE IF NOT EXISTS warehouse_inventory_snapshots (
         id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '主键',
         warehouse_id INT NOT NULL COMMENT '库房ID',
+        category_id INT NOT NULL COMMENT '品类分组ID（dict_categories.category_id）',
         inventory_ton DECIMAL(14, 4) NOT NULL COMMENT '当前库存(吨)',
         inventory_date DATE NOT NULL COMMENT '库存日期',
         source VARCHAR(32) NOT NULL DEFAULT 'import' COMMENT '来源：import/manual',
@@ -321,9 +322,9 @@ TABLE_STATEMENTS = [
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         CONSTRAINT fk_wis_warehouse FOREIGN KEY (warehouse_id) REFERENCES dict_warehouses (id)
             ON UPDATE CASCADE ON DELETE CASCADE,
-        UNIQUE KEY uk_wis_wh_date (warehouse_id, inventory_date),
-        INDEX idx_wis_wh_date (warehouse_id, inventory_date)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='库房库存快照（按日期）';
+        UNIQUE KEY uk_wis_wh_cat_date (warehouse_id, category_id, inventory_date),
+        INDEX idx_wis_wh_cat_date (warehouse_id, category_id, inventory_date)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='库房库存快照（按库房、品类、日期）';
     """,
     # 库房按品种收货价格（回收单价维护）
     """
@@ -1427,6 +1428,7 @@ def ensure_warehouse_inventory_and_receipt_price_tables() -> None:
                 CREATE TABLE IF NOT EXISTS warehouse_inventory_snapshots (
                     id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '主键',
                     warehouse_id INT NOT NULL COMMENT '库房ID',
+                    category_id INT NOT NULL COMMENT '品类分组ID（dict_categories.category_id）',
                     inventory_ton DECIMAL(14, 4) NOT NULL COMMENT '当前库存(吨)',
                     inventory_date DATE NOT NULL COMMENT '库存日期',
                     source VARCHAR(32) NOT NULL DEFAULT 'import' COMMENT '来源：import/manual',
@@ -1434,11 +1436,77 @@ def ensure_warehouse_inventory_and_receipt_price_tables() -> None:
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                     CONSTRAINT fk_wis_warehouse FOREIGN KEY (warehouse_id) REFERENCES dict_warehouses (id)
                         ON UPDATE CASCADE ON DELETE CASCADE,
-                    UNIQUE KEY uk_wis_wh_date (warehouse_id, inventory_date),
-                    INDEX idx_wis_wh_date (warehouse_id, inventory_date)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='库房库存快照（按日期）';
+                    UNIQUE KEY uk_wis_wh_cat_date (warehouse_id, category_id, inventory_date),
+                    INDEX idx_wis_wh_cat_date (warehouse_id, category_id, inventory_date)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='库房库存快照（按库房、品类、日期）';
                 """
             )
+            cursor.execute("SHOW TABLES LIKE 'warehouse_inventory_snapshots'")
+            if cursor.fetchone():
+
+                def _wis_has_col(col: str) -> bool:
+                    cursor.execute(
+                        "SELECT COUNT(*) FROM information_schema.columns "
+                        "WHERE table_schema = DATABASE() "
+                        "AND table_name = 'warehouse_inventory_snapshots' "
+                        "AND column_name = %s",
+                        (col,),
+                    )
+                    return cursor.fetchone()[0] > 0
+
+                def _wis_has_index(name: str) -> bool:
+                    cursor.execute(
+                        "SELECT COUNT(*) FROM information_schema.statistics "
+                        "WHERE table_schema = DATABASE() "
+                        "AND table_name = 'warehouse_inventory_snapshots' "
+                        "AND index_name = %s",
+                        (name,),
+                    )
+                    return cursor.fetchone()[0] > 0
+
+                needs_category_col = not _wis_has_col("category_id")
+                needs_new_indexes = (
+                    not _wis_has_index("uk_wis_wh_cat_date")
+                    or not _wis_has_index("idx_wis_wh_cat_date")
+                )
+                has_old_indexes = _wis_has_index("uk_wis_wh_date") or _wis_has_index(
+                    "idx_wis_wh_date"
+                )
+                if needs_category_col or needs_new_indexes or has_old_indexes:
+                    if needs_category_col:
+                        cursor.execute("DELETE FROM warehouse_inventory_snapshots")
+                        cursor.execute(
+                            "ALTER TABLE warehouse_inventory_snapshots "
+                            "ADD COLUMN category_id INT NOT NULL COMMENT "
+                            "'品类分组ID（dict_categories.category_id）' "
+                            "AFTER warehouse_id"
+                        )
+                    # 先建含 warehouse_id 前缀的新索引，再删旧索引（外键 fk_wis_warehouse 依赖该列索引）
+                    if not _wis_has_index("idx_wis_wh_cat_date"):
+                        cursor.execute(
+                            "ALTER TABLE warehouse_inventory_snapshots "
+                            "ADD INDEX idx_wis_wh_cat_date "
+                            "(warehouse_id, category_id, inventory_date)"
+                        )
+                    if not _wis_has_index("uk_wis_wh_cat_date"):
+                        cursor.execute(
+                            "ALTER TABLE warehouse_inventory_snapshots "
+                            "ADD UNIQUE KEY uk_wis_wh_cat_date "
+                            "(warehouse_id, category_id, inventory_date)"
+                        )
+                    if _wis_has_index("uk_wis_wh_date"):
+                        cursor.execute(
+                            "ALTER TABLE warehouse_inventory_snapshots "
+                            "DROP INDEX uk_wis_wh_date"
+                        )
+                    if _wis_has_index("idx_wis_wh_date"):
+                        cursor.execute(
+                            "ALTER TABLE warehouse_inventory_snapshots "
+                            "DROP INDEX idx_wis_wh_date"
+                        )
+                    logger.info(
+                        "已为 warehouse_inventory_snapshots 完成 category_id/索引迁移"
+                    )
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS warehouse_category_receipt_prices (

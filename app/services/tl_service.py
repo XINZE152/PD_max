@@ -771,7 +771,7 @@ class TLService:
     def _enrich_warehouse_rows_inventory_and_prices(
         self, rows: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
-        """为库房列表补充最新库存日期与按品种收货价格。"""
+        """为库房列表补充按品种库存、最新库存日期与按品种收货价格。"""
         if not rows:
             return rows
         wh_ids = list(
@@ -780,6 +780,7 @@ class TLService:
         if not wh_ids:
             return rows
         inv_date_by_wh: Dict[int, date] = {}
+        inventory_by_wh: Dict[int, List[Dict[str, Any]]] = {wid: [] for wid in wh_ids}
         prices_by_wh: Dict[int, List[Dict[str, Any]]] = {wid: [] for wid in wh_ids}
         try:
             with get_conn() as conn:
@@ -787,21 +788,43 @@ class TLService:
                     ph = ",".join(["%s"] * len(wh_ids))
                     cur.execute(
                         f"""
-                        SELECT wis.warehouse_id, wis.inventory_date
+                        SELECT wis.warehouse_id, wis.category_id, wis.inventory_ton,
+                               wis.inventory_date,
+                               COALESCE(
+                                   MAX(CASE WHEN dc.is_main = 1 THEN dc.name END),
+                                   MAX(dc.name)
+                               ) AS cat_name
                         FROM warehouse_inventory_snapshots wis
                         INNER JOIN (
-                            SELECT warehouse_id, MAX(inventory_date) AS max_date
+                            SELECT warehouse_id, category_id, MAX(inventory_date) AS max_date
                             FROM warehouse_inventory_snapshots
                             WHERE warehouse_id IN ({ph})
-                            GROUP BY warehouse_id
+                            GROUP BY warehouse_id, category_id
                         ) latest ON wis.warehouse_id = latest.warehouse_id
+                            AND wis.category_id = latest.category_id
                             AND wis.inventory_date = latest.max_date
+                        JOIN dict_categories dc ON dc.category_id = wis.category_id
+                            AND dc.is_active = 1
                         WHERE wis.warehouse_id IN ({ph})
+                        GROUP BY wis.warehouse_id, wis.category_id, wis.inventory_ton,
+                                 wis.inventory_date
+                        ORDER BY wis.warehouse_id, wis.category_id
                         """,
                         tuple(wh_ids) + tuple(wh_ids),
                     )
-                    for wh_id, inv_date in cur.fetchall():
-                        inv_date_by_wh[int(wh_id)] = inv_date
+                    for wh_id, cat_id, inv_ton, inv_date, cat_name in cur.fetchall():
+                        wid = int(wh_id)
+                        inv_date_by_wh[wid] = max(
+                            inv_date_by_wh.get(wid, inv_date), inv_date
+                        )
+                        inventory_by_wh[wid].append(
+                            {
+                                "品类id": int(cat_id),
+                                "品类名": str(cat_name or ""),
+                                "当前库存": float(inv_ton),
+                                "库存日期": inv_date.isoformat() if inv_date else None,
+                            }
+                        )
 
                     cur.execute(
                         f"""
@@ -835,6 +858,7 @@ class TLService:
             wid = int(rec["仓库id"])
             inv_d = inv_date_by_wh.get(wid)
             rec["库存日期"] = inv_d.isoformat() if inv_d else None
+            rec["库存按品种"] = inventory_by_wh.get(wid, [])
             rec["收货价格按品种"] = prices_by_wh.get(wid, [])
         return rows
 
@@ -978,7 +1002,6 @@ class TLService:
             "电话",
             "危废经营许可数量",
             "月均收货",
-            "当前库存",
             "收货价格",
             "运费",
         }
@@ -997,8 +1020,6 @@ class TLService:
             out["hazardous_waste_license_qty"] = patch.get("危废经营许可数量")
         if "月均收货" in patch:
             out["monthly_avg_receipt_ton"] = patch.get("月均收货")
-        if "当前库存" in patch:
-            out["current_inventory_ton"] = patch.get("当前库存")
         if "收货价格" in patch:
             out["receipt_price_per_ton"] = patch.get("收货价格")
         if "运费" in patch:
@@ -1066,7 +1087,7 @@ class TLService:
             raise ValueError(
                 "至少需要提供一个待修改字段：仓库名、is_active、地址、仓库类型id、仓库颜色配置、"
                 "省、市、区、经度、纬度、库房类型名、"
-                "库房联系人、电话、危废经营许可数量、月均收货、当前库存、收货价格、运费 之一"
+                "库房联系人、电话、危废经营许可数量、月均收货、收货价格、运费 之一"
             )
 
         biz_patch = self._business_warehouse_patch_cn_to_en(patch)
@@ -7993,21 +8014,33 @@ class TLService:
     def _sync_warehouse_current_inventory_from_snapshot(
         self, cur, warehouse_id: int
     ) -> None:
+        """各品类最新快照吨数求和，写回 dict_warehouses.current_inventory_ton。"""
         cur.execute(
             """
-            SELECT inventory_ton FROM warehouse_inventory_snapshots
-            WHERE warehouse_id = %s
-            ORDER BY inventory_date DESC, id DESC
-            LIMIT 1
+            SELECT COALESCE(SUM(wis.inventory_ton), 0)
+            FROM warehouse_inventory_snapshots wis
+            INNER JOIN (
+                SELECT warehouse_id, category_id, MAX(inventory_date) AS max_date
+                FROM warehouse_inventory_snapshots
+                WHERE warehouse_id = %s
+                GROUP BY warehouse_id, category_id
+            ) latest ON wis.warehouse_id = latest.warehouse_id
+                AND wis.category_id = latest.category_id
+                AND wis.inventory_date = latest.max_date
+            WHERE wis.warehouse_id = %s
             """,
-            (int(warehouse_id),),
+            (int(warehouse_id), int(warehouse_id)),
         )
         row = cur.fetchone()
-        if row is None:
-            return
+        total = row[0] if row else None
+        cur.execute(
+            "SELECT COUNT(*) FROM warehouse_inventory_snapshots WHERE warehouse_id = %s",
+            (int(warehouse_id),),
+        )
+        has_any = int(cur.fetchone()[0]) > 0
         cur.execute(
             "UPDATE dict_warehouses SET current_inventory_ton = %s WHERE id = %s",
-            (row[0], int(warehouse_id)),
+            (float(total) if has_any and total is not None else None, int(warehouse_id)),
         )
 
     def list_warehouse_inventories(
@@ -8015,6 +8048,8 @@ class TLService:
         *,
         page: int = 1,
         page_size: int = 20,
+        warehouse_id: Optional[int] = None,
+        category_id: Optional[int] = None,
         keyword: Optional[str] = None,
     ) -> Dict[str, Any]:
         if page < 1:
@@ -8023,27 +8058,39 @@ class TLService:
         offset = (page - 1) * page_size
         conditions = ["1=1"]
         params: List[Any] = []
+        if warehouse_id is not None:
+            conditions.append("wis.warehouse_id = %s")
+            params.append(int(warehouse_id))
+        if category_id is not None:
+            conditions.append("wis.category_id = %s")
+            params.append(int(category_id))
         kw = (keyword or "").strip()
         if kw:
-            conditions.append("dw.name LIKE %s")
-            params.append(f"%{kw}%")
+            conditions.append("(dw.name LIKE %s OR dc.name LIKE %s)")
+            params.extend([f"%{kw}%", f"%{kw}%"])
         where_sql = " AND ".join(conditions)
+        latest_join = """
+            INNER JOIN (
+                SELECT warehouse_id, category_id, MAX(inventory_date) AS max_date
+                FROM warehouse_inventory_snapshots
+                GROUP BY warehouse_id, category_id
+            ) latest ON wis.warehouse_id = latest.warehouse_id
+                AND wis.category_id = latest.category_id
+                AND wis.inventory_date = latest.max_date
+        """
         with get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     f"""
                     SELECT COUNT(*) FROM (
-                        SELECT wis.warehouse_id
+                        SELECT wis.warehouse_id, wis.category_id
                         FROM warehouse_inventory_snapshots wis
                         JOIN dict_warehouses dw ON dw.id = wis.warehouse_id
-                        INNER JOIN (
-                            SELECT warehouse_id, MAX(inventory_date) AS max_date
-                            FROM warehouse_inventory_snapshots
-                            GROUP BY warehouse_id
-                        ) latest ON wis.warehouse_id = latest.warehouse_id
-                            AND wis.inventory_date = latest.max_date
+                        JOIN dict_categories dc ON dc.category_id = wis.category_id
+                            AND dc.is_active = 1
+                        {latest_join}
                         WHERE {where_sql}
-                        GROUP BY wis.warehouse_id
+                        GROUP BY wis.warehouse_id, wis.category_id
                     ) t
                     """,
                     tuple(params),
@@ -8051,17 +8098,22 @@ class TLService:
                 total = int(cur.fetchone()[0])
                 cur.execute(
                     f"""
-                    SELECT wis.id, wis.warehouse_id, dw.name, wis.inventory_ton,
-                           wis.inventory_date, wis.source, wis.updated_at
+                    SELECT wis.id, wis.warehouse_id, dw.name, wis.category_id,
+                           COALESCE(
+                               MAX(CASE WHEN dc.is_main = 1 THEN dc.name END),
+                               MAX(dc.name)
+                           ) AS cat_name,
+                           wis.inventory_ton, wis.inventory_date, wis.source,
+                           wis.updated_at
                     FROM warehouse_inventory_snapshots wis
                     JOIN dict_warehouses dw ON dw.id = wis.warehouse_id
-                    INNER JOIN (
-                        SELECT warehouse_id, MAX(inventory_date) AS max_date
-                        FROM warehouse_inventory_snapshots
-                        GROUP BY warehouse_id
-                    ) latest ON wis.warehouse_id = latest.warehouse_id
-                        AND wis.inventory_date = latest.max_date
+                    JOIN dict_categories dc ON dc.category_id = wis.category_id
+                        AND dc.is_active = 1
+                    {latest_join}
                     WHERE {where_sql}
+                    GROUP BY wis.id, wis.warehouse_id, dw.name, wis.category_id,
+                             wis.inventory_ton, wis.inventory_date, wis.source,
+                             wis.updated_at
                     ORDER BY wis.inventory_date DESC, wis.id DESC
                     LIMIT %s OFFSET %s
                     """,
@@ -8074,10 +8126,12 @@ class TLService:
                             "id": int(r[0]),
                             "库房id": int(r[1]),
                             "库房名称": r[2],
-                            "当前库存": float(r[3]),
-                            "库存日期": r[4].isoformat() if r[4] else None,
-                            "来源": r[5],
-                            "更新时间": r[6].isoformat() if r[6] else None,
+                            "品类id": int(r[3]),
+                            "品类名": r[4],
+                            "当前库存": float(r[5]),
+                            "库存日期": r[6].isoformat() if r[6] else None,
+                            "来源": r[7],
+                            "更新时间": r[8].isoformat() if r[8] else None,
                         }
                     )
         return {
@@ -8085,16 +8139,36 @@ class TLService:
             "data": {"total": total, "list": items, "page": page, "page_size": page_size},
         }
 
+    def _validate_warehouse_category_for_inventory(
+        self, cur, warehouse_id: int, category_id: int
+    ) -> None:
+        cur.execute(
+            "SELECT id FROM dict_warehouses WHERE id = %s AND is_active = 1",
+            (int(warehouse_id),),
+        )
+        if not cur.fetchone():
+            raise ValueError("库房不存在或已停用")
+        cur.execute(
+            """
+            SELECT category_id FROM dict_categories
+            WHERE category_id = %s AND is_active = 1 LIMIT 1
+            """,
+            (int(category_id),),
+        )
+        if not cur.fetchone():
+            raise ValueError("品类不存在或已停用")
+
     def create_warehouse_inventory(
         self,
         *,
         warehouse_id: int,
+        category_id: int,
         inventory_ton: float,
         inventory_date: Optional[str] = None,
         source: str = "manual",
     ) -> Dict[str, Any]:
-        if warehouse_id < 1:
-            raise ValueError("库房 id 无效")
+        if warehouse_id < 1 or category_id < 1:
+            raise ValueError("库房或品类 id 无效")
         inv_day = (
             date.fromisoformat(str(inventory_date).strip())
             if inventory_date and str(inventory_date).strip()
@@ -8104,32 +8178,36 @@ class TLService:
             conn.autocommit(False)
             try:
                 with conn.cursor() as cur:
-                    cur.execute(
-                        "SELECT id FROM dict_warehouses WHERE id = %s AND is_active = 1",
-                        (int(warehouse_id),),
+                    self._validate_warehouse_category_for_inventory(
+                        cur, int(warehouse_id), int(category_id)
                     )
-                    if not cur.fetchone():
-                        raise ValueError("库房不存在或已停用")
                     cur.execute(
                         """
                         INSERT INTO warehouse_inventory_snapshots
-                        (warehouse_id, inventory_ton, inventory_date, source)
-                        VALUES (%s, %s, %s, %s)
+                        (warehouse_id, category_id, inventory_ton, inventory_date, source)
+                        VALUES (%s, %s, %s, %s, %s)
                         ON DUPLICATE KEY UPDATE
                             inventory_ton = VALUES(inventory_ton),
                             source = VALUES(source),
                             updated_at = CURRENT_TIMESTAMP
                         """,
-                        (int(warehouse_id), inventory_ton, inv_day, source),
+                        (
+                            int(warehouse_id),
+                            int(category_id),
+                            inventory_ton,
+                            inv_day,
+                            source,
+                        ),
                     )
                     snap_id = int(cur.lastrowid)
                     if snap_id == 0:
                         cur.execute(
                             """
                             SELECT id FROM warehouse_inventory_snapshots
-                            WHERE warehouse_id = %s AND inventory_date = %s
+                            WHERE warehouse_id = %s AND category_id = %s
+                                AND inventory_date = %s
                             """,
-                            (int(warehouse_id), inv_day),
+                            (int(warehouse_id), int(category_id), inv_day),
                         )
                         row = cur.fetchone()
                         snap_id = int(row[0]) if row else 0
@@ -8146,6 +8224,7 @@ class TLService:
             "data": {
                 "id": snap_id,
                 "库房id": int(warehouse_id),
+                "品类id": int(category_id),
                 "当前库存": float(inventory_ton),
                 "库存日期": inv_day.isoformat(),
             },
@@ -8167,6 +8246,7 @@ class TLService:
         }
         errors: List[str] = []
         samples: List[Dict[str, Any]] = []
+        touched_wh: set[int] = set()
 
         with get_conn() as conn:
             conn.autocommit(False)
@@ -8186,14 +8266,18 @@ class TLService:
                                 raise ValueError(
                                     f"库房名称「{row.warehouse_name}」不存在"
                                 )
+                            cat_id = self._resolve_category_id_by_name(
+                                cur, row.category_name
+                            )
                             inv_day = row.inventory_date or default_day
                             if not overwrite:
                                 cur.execute(
                                     """
                                     SELECT id FROM warehouse_inventory_snapshots
-                                    WHERE warehouse_id = %s AND inventory_date = %s
+                                    WHERE warehouse_id = %s AND category_id = %s
+                                        AND inventory_date = %s
                                     """,
-                                    (wh_id, inv_day),
+                                    (wh_id, cat_id, inv_day),
                                 )
                                 if cur.fetchone():
                                     stats["skipped_no_overwrite"] += 1
@@ -8201,18 +8285,17 @@ class TLService:
                             cur.execute(
                                 """
                                 INSERT INTO warehouse_inventory_snapshots
-                                (warehouse_id, inventory_ton, inventory_date, source)
-                                VALUES (%s, %s, %s, 'import')
+                                (warehouse_id, category_id, inventory_ton,
+                                 inventory_date, source)
+                                VALUES (%s, %s, %s, %s, 'import')
                                 ON DUPLICATE KEY UPDATE
                                     inventory_ton = VALUES(inventory_ton),
                                     source = 'import',
                                     updated_at = CURRENT_TIMESTAMP
                                 """,
-                                (wh_id, row.inventory_ton, inv_day),
+                                (wh_id, cat_id, row.inventory_ton, inv_day),
                             )
-                            self._sync_warehouse_current_inventory_from_snapshot(
-                                cur, wh_id
-                            )
+                            touched_wh.add(int(wh_id))
                             stats["success"] += 1
                             if len(samples) < 20:
                                 samples.append(
@@ -8220,6 +8303,7 @@ class TLService:
                                         "Excel行": row.excel_row,
                                         "库房id": wh_id,
                                         "库房名称": row.warehouse_name,
+                                        "品类": row.category_name,
                                         "当前库存": _cell_json(row.inventory_ton),
                                         "库存日期": inv_day.isoformat(),
                                         "匹配": match_kind,
@@ -8228,6 +8312,8 @@ class TLService:
                         except ValueError as e:
                             stats["skipped_errors"] += 1
                             errors.append(f"第 {row.excel_row} 行：{e}")
+                    for wh_id in touched_wh:
+                        self._sync_warehouse_current_inventory_from_snapshot(cur, wh_id)
                 conn.commit()
             except Exception:
                 conn.rollback()
@@ -8248,8 +8334,8 @@ class TLService:
         wb = Workbook()
         ws = wb.active
         ws.title = "导入数据"
-        ws.append(["库房名称", "当前库存", "库存日期"])
-        ws.append(["示例库房A", 120.5, "2026-05-29"])
+        ws.append(["库房名称", "回收品种", "当前库存", "库存日期"])
+        ws.append(["示例库房A", "电动电瓶", 120.5, "2026-05-29"])
         buf = io.BytesIO()
         wb.save(buf)
         return buf.getvalue()

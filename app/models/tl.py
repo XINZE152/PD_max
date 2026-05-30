@@ -371,7 +371,6 @@ class UpdateWarehouseRequest(BaseModel):
     电话: Optional[str] = Field(None, description="电话；传 null 可清空")
     危废经营许可数量: Optional[float] = Field(None, description="危废经营许可数量；传 null 可清空")
     月均收货: Optional[float] = Field(None, description="月均收货（吨）；传 null 可清空")
-    当前库存: Optional[float] = Field(None, description="当前库存（吨）；传 null 可清空")
     收货价格: Optional[float] = Field(None, description="收货价格（元/吨）；传 null 可清空")
     运费: Optional[float] = Field(None, description="运费参考（元）；传 null 可清空")
 
@@ -964,6 +963,7 @@ class WarehouseInventoryCreate(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     库房id: int = Field(..., ge=1)
+    品类id: int = Field(..., ge=1, description="dict_categories.category_id")
     当前库存: float = Field(..., description="库存吨数")
     库存日期: Optional[str] = Field(None, description="YYYY-MM-DD；缺省为当天")
 

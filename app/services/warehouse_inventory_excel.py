@@ -12,6 +12,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Tuple
 
 _WAREHOUSE_NAME_CANDIDATES = ("库房名称", "仓库名称", "名称", "库房名")
+_CATEGORY_CANDIDATES = ("回收品种", "品种", "品类", "品类名称", "category")
 _INVENTORY_CANDIDATES = ("当前库存", "库存", "库存(吨)", "库存吨数")
 _DATE_CANDIDATES = ("库存日期", "日期", "inventory_date")
 
@@ -24,6 +25,7 @@ class WarehouseInventoryExcelError(ValueError):
 class WarehouseInventoryImportRow:
     excel_row: int
     warehouse_name: str
+    category_name: str
     inventory_ton: Decimal
     inventory_date: Optional[date] = None
 
@@ -100,11 +102,12 @@ def _find_header_row(all_rows: List[tuple], *, max_scan_rows: int = 30) -> Tuple
             continue
         headers = [_cell_str(c) for c in row]
         has_wh = _resolve_col_index(headers, _WAREHOUSE_NAME_CANDIDATES) is not None
+        has_cat = _resolve_col_index(headers, _CATEGORY_CANDIDATES) is not None
         has_inv = _resolve_col_index(headers, _INVENTORY_CANDIDATES) is not None
-        if has_wh and has_inv:
+        if has_wh and has_cat and has_inv:
             return ri, headers
     raise WarehouseInventoryExcelError(
-        "未识别到表头：需包含「库房名称」与「当前库存」列"
+        "未识别到表头：需包含「库房名称」「回收品种」与「当前库存」列"
     )
 
 
@@ -125,10 +128,11 @@ def parse_warehouse_inventory_workbook(content: bytes) -> Tuple[List[WarehouseIn
 
     header_row_idx, headers = _find_header_row(all_rows)
     wh_col = _resolve_col_index(headers, _WAREHOUSE_NAME_CANDIDATES)
+    cat_col = _resolve_col_index(headers, _CATEGORY_CANDIDATES)
     inv_col = _resolve_col_index(headers, _INVENTORY_CANDIDATES)
     date_col = _resolve_col_index(headers, _DATE_CANDIDATES)
-    if wh_col is None or inv_col is None:
-        raise WarehouseInventoryExcelError("表头缺少库房名称或当前库存列")
+    if wh_col is None or cat_col is None or inv_col is None:
+        raise WarehouseInventoryExcelError("表头缺少库房名称、回收品种或当前库存列")
 
     parsed: List[WarehouseInventoryImportRow] = []
     skipped_empty = 0
@@ -137,11 +141,12 @@ def parse_warehouse_inventory_workbook(content: bytes) -> Tuple[List[WarehouseIn
             skipped_empty += 1
             continue
         wh_name = _cell_str(row[wh_col] if wh_col < len(row) else None)
+        cat_name = _cell_str(row[cat_col] if cat_col < len(row) else None)
         inv_val = _cell_decimal(row[inv_col] if inv_col < len(row) else None)
-        if not wh_name and inv_val is None:
+        if not wh_name and not cat_name and inv_val is None:
             skipped_empty += 1
             continue
-        if not wh_name:
+        if not wh_name or not cat_name:
             continue
         if inv_val is None:
             continue
@@ -152,6 +157,7 @@ def parse_warehouse_inventory_workbook(content: bytes) -> Tuple[List[WarehouseIn
             WarehouseInventoryImportRow(
                 excel_row=ri,
                 warehouse_name=wh_name,
+                category_name=cat_name,
                 inventory_ton=inv_val,
                 inventory_date=inv_date,
             )

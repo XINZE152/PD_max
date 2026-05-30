@@ -2212,16 +2212,22 @@ async def import_warehouse_spread_excel(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/warehouse_inventories", summary="库房当前库存列表（每库房最新一条）")
+@router.get("/warehouse_inventories", summary="库房当前库存列表（每库房每品类最新一条）")
 def warehouse_inventories(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=500),
-    keyword: Optional[str] = Query(None, description="库房名称模糊"),
+    warehouse_id: Optional[int] = Query(None, ge=1),
+    category_id: Optional[int] = Query(None, ge=1),
+    keyword: Optional[str] = Query(None, description="库房名称或品类名模糊"),
     service: TLService = Depends(get_tl_service),
 ):
     try:
         return service.list_warehouse_inventories(
-            page=page, page_size=page_size, keyword=keyword
+            page=page,
+            page_size=page_size,
+            warehouse_id=warehouse_id,
+            category_id=category_id,
+            keyword=keyword,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -2229,7 +2235,7 @@ def warehouse_inventories(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/warehouse_inventories", summary="手工录入/覆盖库房某日库存")
+@router.post("/warehouse_inventories", summary="手工录入/覆盖库房某日按品类库存")
 def warehouse_inventories_create(
     body: WarehouseInventoryCreate,
     service: TLService = Depends(get_tl_service),
@@ -2237,6 +2243,7 @@ def warehouse_inventories_create(
     try:
         return service.create_warehouse_inventory(
             warehouse_id=body.库房id,
+            category_id=body.品类id,
             inventory_ton=body.当前库存,
             inventory_date=body.库存日期,
         )
@@ -2269,8 +2276,10 @@ def download_warehouse_inventory_template_excel(
 
 @router.post("/import_warehouse_inventory_excel", summary="Excel 导入库房当前库存")
 async def import_warehouse_inventory_excel(
-    file: UploadFile = File(..., description="xlsx；表头须含库房名称、当前库存，可选库存日期"),
-    overwrite: bool = Form(True, description="同库房同日期是否覆盖"),
+    file: UploadFile = File(
+        ..., description="xlsx；表头须含库房名称、回收品种、当前库存，可选库存日期"
+    ),
+    overwrite: bool = Form(True, description="同库房同品类同日期是否覆盖"),
     service: TLService = Depends(get_tl_service),
 ):
     fn = (file.filename or "").lower()
