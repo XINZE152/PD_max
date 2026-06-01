@@ -70,9 +70,11 @@ thresholds:
   hard_semantic_anomalies:               # 语义规则硬判篡改
     - invalid_amount_format
     - detail_field_typography_anomaly
+    - account_mask_pattern_inconsistent
     - synthetic_image_signals
   semantic_amount_format_risk: 0.78       # 金额千分位格式异常风险分
   semantic_typography_risk: 0.72          # 明细行排版不一致风险分
+  semantic_account_mask_risk: 0.76        # 账号脱敏格式不一致风险分
   semantic_synthetic_risk: 0.75           # 无 EXIF 合成/AI 重绘风险分
   synthetic_bg_var_max: 0.08              # 背景方差低于此视为过于平滑
   synthetic_noise_std_max: 55.0           # 噪声标准差低于此视为异常
