@@ -95,6 +95,66 @@ def get_rule_checks_history_by_task_id(task_id: str) -> Optional[Dict[str, Any]]
     }
 
 
+def get_async_v3_history_by_task_id(task_id: str) -> Optional[Dict[str, Any]]:
+    """按 task_id 返回最近一条 async_v3 历史（任意 status），供重启后恢复任务结果。"""
+    tid = str(task_id or "").strip()
+    if not tid:
+        return None
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, task_id, status, outcome_json, stored_image, original_filename,
+                       created_at, bbox
+                FROM ai_detection_history
+                WHERE task_id=%s AND mode='async_v3'
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (tid,),
+            )
+            row = cur.fetchone()
+    if not row:
+        return None
+
+    (
+        rid,
+        _task_id,
+        status,
+        outcome_json,
+        stored_image,
+        original_filename,
+        created_at,
+        bbox_raw,
+    ) = row
+    try:
+        outcome = json.loads(outcome_json) if isinstance(outcome_json, str) else _jsonish(outcome_json)
+    except json.JSONDecodeError:
+        outcome = {}
+    bbox_val = bbox_raw
+    if isinstance(bbox_val, str):
+        try:
+            bbox_val = json.loads(bbox_val)
+        except json.JSONDecodeError:
+            bbox_val = None
+
+    created_text = (
+        created_at.isoformat(sep=" ", timespec="seconds")
+        if hasattr(created_at, "isoformat")
+        else str(created_at or "")
+    )
+    return {
+        "id": int(rid),
+        "task_id": _task_id,
+        "status": status,
+        "outcome": outcome or {},
+        "stored_image": stored_image,
+        "original_filename": original_filename,
+        "created_at": created_text,
+        "bbox": bbox_val,
+    }
+
+
 def get_latest_ai_detection_history_by_task_id(task_id: str) -> Optional[Dict[str, Any]]:
     """按异步 task_id 返回最近一条成功历史及归档图路径，用于任务内存丢失后的兜底读取。"""
     tid = str(task_id or "").strip()
@@ -106,7 +166,7 @@ def get_latest_ai_detection_history_by_task_id(task_id: str) -> Optional[Dict[st
                 """
                 SELECT id, task_id, status, outcome_json, stored_image
                 FROM ai_detection_history
-                WHERE task_id=%s AND status='COMPLETED'
+                WHERE task_id=%s AND mode='async_v3' AND status='COMPLETED'
                 ORDER BY id DESC
                 LIMIT 1
                 """,

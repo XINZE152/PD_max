@@ -34,6 +34,7 @@ from app.ai_detection.easyocr_download_patch import patch_easyocr_download
 from app.ai_detection.history_db import (
     HISTORY_RETENTION_DAYS,
     get_ai_detection_history_image_path,
+    get_async_v3_history_by_task_id,
     get_latest_ai_detection_history_by_task_id,
     get_rule_checks_history_by_task_id,
     insert_ai_detection_history,
@@ -71,6 +72,10 @@ STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 MAX_CONCURRENT_AI_TASKS = int(os.getenv("AI_MAX_CONCURRENT_TASKS", "1"))
 GC_MAX_AGE_HOURS = int(os.getenv("AI_GC_MAX_AGE_HOURS", "24"))
 GC_INTERVAL_SECONDS = int(os.getenv("AI_GC_INTERVAL_SECONDS", "3600"))
+
+TASK_RESTART_INTERRUPTED_MSG = (
+    "服务已重启，异步检测任务已中断，请重新点击「提交检测」或重新上传图片。"
+)
 
 
 class TaskStatusEnum(str, Enum):
@@ -401,6 +406,122 @@ async def get_engine() -> InferenceEngineAPI:
     if not EngineContainer.instance:
         raise HTTPException(status_code=503, detail="Engine unavailable")
     return EngineContainer.instance
+
+
+def _storage_image_path(task_id: str) -> Path:
+    return STORAGE_DIR / f"{task_id}.jpg"
+
+
+def _bbox_dto_from_history(bbox_val: Any) -> Optional[BBoxDTO]:
+    if not isinstance(bbox_val, dict):
+        return None
+    try:
+        if "x1" in bbox_val:
+            return BBoxDTO(
+                x1=int(bbox_val["x1"]),
+                y1=int(bbox_val["y1"]),
+                x2=int(bbox_val["x2"]),
+                y2=int(bbox_val["y2"]),
+            )
+    except (TypeError, ValueError):
+        return None
+    return None
+
+
+def build_task_record_from_persistence(task_id: str) -> Optional[TaskRecordDTO]:
+    """
+    内存任务丢失时（如进程重启）从 DB 历史或磁盘原图恢复 TaskRecordDTO。
+    若仅有原图、无历史，返回 FAILED 并提示重新提交。
+    """
+    tid = str(task_id or "").strip()
+    if not tid:
+        return None
+
+    storage_path = _storage_image_path(tid)
+    history = get_async_v3_history_by_task_id(tid)
+    image_path = str(storage_path) if storage_path.is_file() else None
+    created_at = datetime.now().isoformat()
+    original_filename: Optional[str] = None
+    bbox_dto: Optional[BBoxDTO] = None
+
+    if history:
+        created_at = str(history.get("created_at") or created_at)
+        original_filename = history.get("original_filename")
+        bbox_dto = _bbox_dto_from_history(history.get("bbox"))
+        outcome = history.get("outcome") or {}
+        if history.get("status") == "COMPLETED":
+            linked = outcome.get("linked_rule_checks")
+            if linked is None:
+                rule_row = get_rule_checks_history_by_task_id(tid)
+                if rule_row:
+                    linked = build_rule_check_public_summary(rule_row.get("outcome") or {})
+            return TaskRecordDTO(
+                task_id=tid,
+                status=TaskStatusEnum.COMPLETED,
+                created_at=created_at,
+                image_path=image_path,
+                original_filename=original_filename,
+                bbox=bbox_dto,
+                result=outcome.get("result"),
+                multi_results=outcome.get("multi_results"),
+                linked_rule_checks=linked,
+            )
+        if history.get("status") == "FAILED":
+            return TaskRecordDTO(
+                task_id=tid,
+                status=TaskStatusEnum.FAILED,
+                created_at=created_at,
+                image_path=image_path,
+                original_filename=original_filename,
+                bbox=bbox_dto,
+                error_msg=outcome.get("error_msg") or TASK_RESTART_INTERRUPTED_MSG,
+            )
+
+    if image_path:
+        return TaskRecordDTO(
+            task_id=tid,
+            status=TaskStatusEnum.FAILED,
+            created_at=created_at,
+            image_path=image_path,
+            original_filename=original_filename,
+            error_msg=TASK_RESTART_INTERRUPTED_MSG,
+        )
+    return None
+
+
+async def resolve_task_record(
+    task_id: str,
+    registry: AbstractTaskRegistry,
+) -> Optional[TaskRecordDTO]:
+    """先查内存注册表，再查历史/磁盘兜底。"""
+    task = await registry.get_task(task_id)
+    if task:
+        return task
+    return await run_in_threadpool(build_task_record_from_persistence, task_id)
+
+
+async def ensure_task_in_registry_for_retry(
+    task_id: str,
+    registry: AbstractTaskRegistry,
+) -> TaskRecordDTO:
+    """提交检测时：内存无任务则从历史/磁盘恢复并写回注册表，便于仅 task_id 重新排队。"""
+    task = await resolve_task_record(task_id, registry)
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    if not task.image_path or not Path(task.image_path).is_file():
+        raise HTTPException(status_code=404, detail="任务原图已不存在，请重新上传图片")
+
+    existing = await registry.get_task(task_id)
+    if not existing:
+        await registry.create_task(
+            task_id,
+            task.image_path,
+            original_filename=task.original_filename,
+        )
+        restored = await registry.get_task(task_id)
+        if restored:
+            return restored
+    return task
 
 
 def get_registry() -> AbstractTaskRegistry:
@@ -1572,8 +1693,11 @@ async def submit_detection(
     elif not task_id:
         raise HTTPException(status_code=400, detail="必须提供上传文件 file，或已有任务的 task_id")
 
-    task = await registry.get_task(task_id)
-    if not task:
+    if file:
+        task = await registry.get_task(task_id)
+    else:
+        task = await ensure_task_in_registry_for_retry(task_id, registry)
+    if not task or not task.image_path:
         raise HTTPException(status_code=404, detail="任务不存在")
 
     bbox_dto = None
@@ -1627,7 +1751,7 @@ async def submit_detection(
     response_description="任务记录 JSON，结构见下方 Schema 与示例",
 )
 async def get_result(task_id: str, registry: AbstractTaskRegistry = Depends(get_registry)):
-    task = await registry.get_task(task_id)
+    task = await resolve_task_record(task_id, registry)
     if not task:
         raise HTTPException(status_code=404, detail="任务不存在")
 
