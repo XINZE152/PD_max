@@ -23,16 +23,26 @@ AMOUNT_DECIMAL_PATTERN = re.compile(
 DETAIL_FIELD_LABELS = (
     "收款账号",
     "付款账号",
+    "收款方账户",
+    "付款方账户",
     "收款银行",
     "付款银行",
     "交易时间",
     "交易渠道",
     "汇款附言",
+    "转账金额",
+)
+ACCOUNT_FIELD_LABELS = (
+    "收款账号",
+    "付款账号",
+    "收款方账户",
+    "付款方账户",
 )
 
 DEFAULT_HARD_SEMANTIC_ANOMALIES = frozenset({
     "invalid_amount_format",
     "detail_field_typography_anomaly",
+    "account_mask_pattern_inconsistent",
     "synthetic_image_signals",
 })
 
@@ -107,6 +117,82 @@ def _merge_token_bbox(tokens: Sequence[OCRToken]) -> Optional[List[int]]:
     ]
 
 
+def _account_mask_pattern(text: str) -> Optional[tuple[int, ...]]:
+    """提取账号脱敏星号分组长度，如 6213 **** **** 3191 -> (4, 4)。"""
+    clean = normalize_text(text)
+    if not re.search(r"\*", clean):
+        return None
+    groups = re.findall(r"\*+", clean)
+    if not groups:
+        return None
+    return tuple(len(group) for group in groups)
+
+
+def check_account_mask_consistency(tokens: Sequence[OCRToken]) -> Dict[str, Any]:
+    """同一回单内多个账号的星号分组格式应一致（GPT 重绘常出现 *** 与 **** 混用）。"""
+    patterns: Dict[str, tuple[int, ...]] = {}
+    for token in tokens:
+        pattern = _account_mask_pattern(token.clean_text)
+        if pattern is None:
+            continue
+        label_hint = token.clean_text[:16]
+        patterns[label_hint] = pattern
+
+    for line in group_tokens_by_line(tokens):
+        line_patterns: List[tuple[int, ...]] = []
+        line_labels: List[str] = []
+        for label in ACCOUNT_FIELD_LABELS:
+            value_tokens = _find_label_value_tokens(line, label)
+            for token in value_tokens:
+                pattern = _account_mask_pattern(token.clean_text)
+                if pattern is not None:
+                    line_patterns.append(pattern)
+                    line_labels.append(label)
+
+        unique_patterns = set(line_patterns)
+        if len(unique_patterns) > 1:
+            return {
+                "anomaly": True,
+                "patterns": {label: list(pattern) for label, pattern in zip(line_labels, line_patterns)},
+                "message": "同一回单内账号脱敏格式不一致",
+            }
+
+    all_patterns = list(patterns.values())
+    if len(set(all_patterns)) > 1 and len(all_patterns) >= 2:
+        return {
+            "anomaly": True,
+            "patterns": {key: list(value) for key, value in patterns.items()},
+            "message": "多个账号脱敏星号分组不一致",
+        }
+
+    return {"anomaly": False, "patterns": patterns}
+
+
+def is_large_amount_missing_separator(text: str, *, min_integer_digits: int = 5) -> bool:
+    """大额数字未使用千分位（如 73929.50），常见于 AI 重绘回单。"""
+    clean = normalize_text(text)
+    match = AMOUNT_DECIMAL_PATTERN.search(clean)
+    if not match:
+        return False
+    amount_text = match.group()
+    if "," in amount_text:
+        return False
+    integer_part = re.sub(r"^[+\-]?\s*(?:[¥￥])?", "", amount_text.split(".")[0])
+    digits = re.sub(r"\D", "", integer_part)
+    return len(digits) >= min_integer_digits
+
+
+def find_account_field_bbox(
+    tokens: Sequence[OCRToken],
+) -> Optional[List[int]]:
+    """优先定位收款侧账号字段 bbox（xyxy）。"""
+    for label in ("收款账号", "收款方账户", "付款账号", "付款方账户"):
+        bbox = find_labeled_field_bbox(tokens, label)
+        if bbox is not None:
+            return bbox
+    return None
+
+
 def find_labeled_field_bbox(
     tokens: Sequence[OCRToken],
     label: str = "收款账号",
@@ -127,8 +213,16 @@ def check_detail_field_typography(tokens: Sequence[OCRToken]) -> Dict[str, Any]:
     单行替换文字时常出现高度或基线偏移。
     """
     labeled_rows: List[Dict[str, Any]] = []
+    typography_labels = (
+        "收款账号",
+        "付款账号",
+        "收款方账户",
+        "付款方账户",
+        "交易时间",
+        "转账金额",
+    )
     for line in group_tokens_by_line(tokens):
-        for label in ("收款账号", "付款账号", "交易时间"):
+        for label in typography_labels:
             value_tokens = _find_label_value_tokens(line, label)
             if not value_tokens:
                 continue
@@ -222,7 +316,13 @@ def check_synthetic_image_signals(
         signals.append("semantic_anomaly")
 
     min_signals = int(thresh.get("synthetic_min_signals", 3))
+    receipt_hint = any(
+        any(keyword in token.clean_text for keyword in ("回单", "电子回单", "交易成功", "转账金额"))
+        for token in (ocr_tokens or [])
+    )
     suspicious = len(set(signals)) >= min_signals or (no_exif and has_semantic and "smooth_background" in signals)
+    if no_exif and receipt_hint and low_noise and "smooth_background" in signals:
+        suspicious = True
 
     return {
         "suspicious": suspicious,
@@ -266,6 +366,13 @@ def check_receipt_semantics(
         reasons.append(f"金额千分位格式异常（如 {sample}）")
         risk = max(risk, float(thresh.get("semantic_amount_format_risk", 0.78)))
 
+    mask_check = check_account_mask_consistency(tokens)
+    details["account_masks"] = mask_check
+    if mask_check.get("anomaly"):
+        anomalies.append("account_mask_pattern_inconsistent")
+        reasons.append("账号脱敏星号格式不一致（疑似非原生回单）")
+        risk = max(risk, float(thresh.get("semantic_account_mask_risk", 0.76)))
+
     typography = check_detail_field_typography(tokens)
     details["typography"] = typography
     if typography.get("anomaly"):
@@ -287,7 +394,7 @@ def check_receipt_semantics(
         reasons.append(f"疑似 AI 重绘/合成图（{signal_text}）")
         risk = max(risk, float(thresh.get("semantic_synthetic_risk", 0.75)))
 
-    account_bbox = find_labeled_field_bbox(tokens, "收款账号")
+    account_bbox = find_account_field_bbox(tokens)
     if account_bbox is not None:
         details["account_field_bbox"] = account_bbox
 

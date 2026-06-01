@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from app.config import UPLOAD_DIR
 from app.database import get_conn
+from app.ai_detection.rule_check_display import build_rule_check_public_summary
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +55,44 @@ def get_ai_detection_history_image_path(record_id: int) -> Optional[Path]:
         return None
     p = HISTORY_IMAGES_DIR / name
     return p if p.is_file() else None
+
+
+def get_rule_checks_history_by_task_id(task_id: str) -> Optional[Dict[str, Any]]:
+    """按 task_id 返回最近一条 rule_checks 历史（AI+规则 聚合用）。"""
+    tid = str(task_id or "").strip()
+    if not tid:
+        return None
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, task_id, status, outcome_json, original_filename, created_at
+                FROM ai_detection_history
+                WHERE task_id=%s AND mode='rule_checks' AND status='COMPLETED'
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (tid,),
+            )
+            row = cur.fetchone()
+    if not row:
+        return None
+
+    rid, _task_id, status, outcome_json, original_filename, created_at = row
+    try:
+        outcome = json.loads(outcome_json) if isinstance(outcome_json, str) else _jsonish(outcome_json)
+    except json.JSONDecodeError:
+        outcome = {}
+
+    created_text = created_at.isoformat(sep=" ", timespec="seconds") if hasattr(created_at, "isoformat") else created_at
+    return {
+        "id": int(rid),
+        "task_id": _task_id,
+        "status": status,
+        "outcome": outcome or {},
+        "original_filename": original_filename,
+        "created_at": created_text,
+    }
 
 
 def get_latest_ai_detection_history_by_task_id(task_id: str) -> Optional[Dict[str, Any]]:
@@ -267,6 +306,13 @@ def list_ai_detection_history(
                 outcome_obj = item.get("outcome")
                 if isinstance(outcome_obj, dict) and isinstance(outcome_obj.get("summary"), dict):
                     item["summary"] = outcome_obj["summary"]
+                linked_task_id = item.get("task_id")
+                if item.get("mode") == "async_v3" and linked_task_id:
+                    rule_row = get_rule_checks_history_by_task_id(str(linked_task_id))
+                    if rule_row:
+                        item["linked_rule_checks"] = build_rule_check_public_summary(rule_row.get("outcome") or {})
+                    else:
+                        item["linked_rule_checks"] = None
                 rid = item.get("id")
                 stored = item.pop("stored_image", None)
                 if stored and rid is not None:

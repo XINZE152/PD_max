@@ -10,7 +10,11 @@ import yaml
 
 from app.ai_detection.core.detectors import PixelLevelDetector
 from app.ai_detection.core.utils import safe_read_image
-from app.ai_detection.semantic_checker import check_receipt_semantics, find_labeled_field_bbox
+from app.ai_detection.semantic_checker import (
+    check_receipt_semantics,
+    find_account_field_bbox,
+    find_labeled_field_bbox,
+)
 from app.ai_detection.timestamp_checker import check_image_timestamps
 
 
@@ -300,7 +304,7 @@ def _resolve_pixel_overlap_bbox(
     if bbox_xyxy is not None:
         return [int(v) for v in bbox_xyxy[:4]]
     if auto_detect_account_field and ocr_tokens:
-        detected = find_labeled_field_bbox(ocr_tokens, "收款账号")
+        detected = find_account_field_bbox(ocr_tokens)
         if detected is not None:
             return detected
     return None
