@@ -130,7 +130,7 @@ class CategoryPurgeServiceTests(unittest.TestCase):
         self.assertIn("不存在", str(ctx.exception))
 
     def test_purge_category_cascade_true_deletes_children(self) -> None:
-        counts = iter([(0,), (0,), (2,), (3,), (1,), (1,)])
+        counts = iter([(0,), (0,), (2,), (3,), (1,), (1,), (2,)])
 
         def count_handler(s, p):
             return next(counts)
@@ -147,6 +147,7 @@ class CategoryPurgeServiceTests(unittest.TestCase):
                 "DELETE FROM quote_details": lambda s, p: {"rowcount": 3},
                 "DELETE FROM warehouse_inventory_snapshots": lambda s, p: {"rowcount": 1},
                 "DELETE FROM warehouse_category_receipt_prices": lambda s, p: {"rowcount": 1},
+                "DELETE FROM warehouse_category_receipt_price_history": lambda s, p: {"rowcount": 2},
                 "DELETE FROM dict_categories": lambda s, p: {"rowcount": 2},
             }
         )
@@ -162,9 +163,12 @@ class CategoryPurgeServiceTests(unittest.TestCase):
         delete_sqls = [e[0] for e in cur.executed]
         self.assertTrue(any("DELETE FROM quote_details" in s for s in delete_sqls))
         self.assertTrue(any("DELETE FROM dict_categories" in s for s in delete_sqls))
+        self.assertTrue(
+            any("warehouse_category_receipt_price_history" in s for s in delete_sqls)
+        )
 
     def test_purge_category_cascade_false_with_children_raises(self) -> None:
-        counts = iter([(1,), (0,), (2,), (0,), (0,), (0,)])
+        counts = iter([(1,), (0,), (2,), (0,), (0,), (0,), (0,)])
 
         cur = _FakeCursor(
             {
@@ -223,7 +227,7 @@ class CategoryPurgeServiceTests(unittest.TestCase):
         )
 
     def test_purge_category_row_last_row_cleans_snapshots(self) -> None:
-        counts = iter([(0,), (0,), (1,), (0,), (1,), (2,), (1,)])
+        counts = iter([(0,), (0,), (1,), (0,), (1,), (2,), (1,), (2,)])
 
         cur = _FakeCursor(
             {
@@ -234,6 +238,7 @@ class CategoryPurgeServiceTests(unittest.TestCase):
                 "DELETE FROM quote_details": lambda s, p: {"rowcount": 0},
                 "DELETE FROM warehouse_inventory_snapshots": lambda s, p: {"rowcount": 2},
                 "DELETE FROM warehouse_category_receipt_prices": lambda s, p: {"rowcount": 1},
+                "DELETE FROM warehouse_category_receipt_price_history": lambda s, p: {"rowcount": 2},
                 "DELETE FROM dict_categories": lambda s, p: {"rowcount": 1},
             }
         )

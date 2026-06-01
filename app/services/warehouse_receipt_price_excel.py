@@ -7,12 +7,14 @@ from __future__ import annotations
 import io
 import re
 from dataclasses import dataclass
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Tuple
 
 _WAREHOUSE_NAME_CANDIDATES = ("库房名称", "仓库名称", "名称", "库房名")
 _CATEGORY_CANDIDATES = ("回收品种", "品种", "品类", "品类名称", "category")
 _PRICE_CANDIDATES = ("价格", "收货价格", "回收单价", "元每吨", "单价", "元/吨")
+_PRICE_DATE_CANDIDATES = ("价格日期", "定价日期", "日期", "price_date")
 
 
 class WarehouseReceiptPriceExcelError(ValueError):
@@ -25,6 +27,7 @@ class WarehouseReceiptPriceImportRow:
     warehouse_name: str
     category_name: str
     price_per_ton: Decimal
+    price_date: Optional[date] = None
 
 
 def _norm_header(s: object) -> str:
@@ -60,6 +63,34 @@ def _cell_decimal(v: object) -> Optional[Decimal]:
     try:
         return Decimal(s)
     except InvalidOperation:
+        return None
+
+
+def _parse_date_cell(v: object) -> Optional[date]:
+    if v is None:
+        return None
+    if isinstance(v, datetime):
+        return v.date()
+    if isinstance(v, date):
+        return v
+    if isinstance(v, (int, float)):
+        try:
+            from openpyxl.utils.datetime import from_excel
+
+            dt = from_excel(v)
+            if isinstance(dt, datetime):
+                return dt.date()
+            if isinstance(dt, date):
+                return dt
+        except Exception:
+            pass
+    s = _cell_str(v)
+    if not s:
+        return None
+    s = s[:10]
+    try:
+        return date.fromisoformat(s)
+    except ValueError:
         return None
 
 
@@ -101,6 +132,7 @@ def parse_warehouse_receipt_price_workbook(
     wh_col = _resolve_col_index(headers, _WAREHOUSE_NAME_CANDIDATES)
     cat_col = _resolve_col_index(headers, _CATEGORY_CANDIDATES)
     price_col = _resolve_col_index(headers, _PRICE_CANDIDATES)
+    date_col = _resolve_col_index(headers, _PRICE_DATE_CANDIDATES)
     if wh_col is None or cat_col is None or price_col is None:
         raise WarehouseReceiptPriceExcelError("表头缺少库房名称、回收品种或价格列")
 
@@ -120,12 +152,16 @@ def parse_warehouse_receipt_price_workbook(
             continue
         if price_val is None:
             continue
+        price_date: Optional[date] = None
+        if date_col is not None and date_col < len(row):
+            price_date = _parse_date_cell(row[date_col])
         parsed.append(
             WarehouseReceiptPriceImportRow(
                 excel_row=ri,
                 warehouse_name=wh_name,
                 category_name=cat_name,
                 price_per_ton=price_val,
+                price_date=price_date,
             )
         )
 

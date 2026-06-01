@@ -115,6 +115,7 @@ from app.models.tl import (
     WarehouseSpreadConfigCreate,
     WarehouseSpreadConfigUpdate,
     WarehouseInventoryCreate,
+    WarehouseInventoryDelete,
     WarehouseReceiptPriceCreate,
     WarehouseReceiptPriceUpdate,
 )
@@ -2312,6 +2313,23 @@ def warehouse_inventories_create(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.delete("/warehouse_inventories", summary="删除库房某日库存快照")
+def warehouse_inventories_delete(
+    body: WarehouseInventoryDelete,
+    service: TLService = Depends(get_tl_service),
+):
+    try:
+        return service.delete_warehouse_inventory(
+            warehouse_id=body.库房id,
+            inventory_date=body.库存日期,
+            category_id=body.品类id,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get(
     "/download_warehouse_inventory_template_excel",
     summary="下载库房库存导入模板（xlsx）",
@@ -2390,6 +2408,7 @@ def warehouse_receipt_prices_create(
             warehouse_id=body.库房id,
             category_id=body.品类id,
             price_per_ton=body.价格,
+            price_date=body.价格日期,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -2473,6 +2492,49 @@ async def import_warehouse_receipt_prices_excel(
         return await asyncio.to_thread(
             service.import_warehouse_receipt_prices_excel, raw
         )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/warehouse_receipt_price_history", summary="库房按品种收货价格历史列表")
+def warehouse_receipt_price_history(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=500),
+    warehouse_id: Optional[int] = Query(None, ge=1),
+    category_id: Optional[int] = Query(None, ge=1),
+    keyword: Optional[str] = Query(None, description="库房名/品种名模糊"),
+    date_from: Optional[str] = Query(None, description="价格日期起 YYYY-MM-DD"),
+    date_to: Optional[str] = Query(None, description="价格日期止 YYYY-MM-DD"),
+    service: TLService = Depends(get_tl_service),
+):
+    try:
+        return service.list_warehouse_receipt_price_history(
+            page=page,
+            page_size=page_size,
+            warehouse_id=warehouse_id,
+            category_id=category_id,
+            keyword=keyword,
+            date_from=date_from,
+            date_to=date_to,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete(
+    "/warehouse_receipt_price_history/{history_id}",
+    summary="删除库房按品种收货价格历史记录",
+)
+def warehouse_receipt_price_history_delete(
+    history_id: int,
+    service: TLService = Depends(get_tl_service),
+):
+    try:
+        return service.delete_warehouse_receipt_price_history(history_id)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:

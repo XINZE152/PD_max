@@ -968,6 +968,18 @@ class WarehouseInventoryCreate(BaseModel):
     库存日期: Optional[str] = Field(None, description="YYYY-MM-DD；缺省为当天")
 
 
+class WarehouseInventoryDelete(BaseModel):
+    """删除库房某日库存快照"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    库房id: int = Field(..., ge=1)
+    库存日期: str = Field(..., description="YYYY-MM-DD")
+    品类id: Optional[int] = Field(
+        None, ge=1, description="可选；缺省则删除该库房该日全部品类"
+    )
+
+
 class WarehouseReceiptPriceCreate(BaseModel):
     """新增/覆盖库房按品种收货价格"""
 
@@ -976,6 +988,7 @@ class WarehouseReceiptPriceCreate(BaseModel):
     库房id: int = Field(..., ge=1)
     品类id: int = Field(..., ge=1, description="dict_categories.category_id")
     价格: float = Field(..., description="库房回收单价，元/吨")
+    价格日期: Optional[str] = Field(None, description="YYYY-MM-DD；缺省为当天")
 
 
 class WarehouseReceiptPriceUpdate(BaseModel):
