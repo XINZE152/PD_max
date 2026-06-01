@@ -8793,7 +8793,7 @@ class TLService:
             with conn.cursor() as cur:
                 cur.execute(
                     f"""
-                    SELECT COUNT(*)
+                    SELECT COUNT(DISTINCT wcrp.id)
                     FROM warehouse_category_receipt_prices wcrp
                     JOIN dict_warehouses dw ON dw.id = wcrp.warehouse_id
                     JOIN dict_categories dc ON dc.category_id = wcrp.category_id
