@@ -3,7 +3,7 @@ import cv2
 import numpy as np
 import joblib
 from PIL import Image, ExifTags
-from typing import Dict
+from typing import Dict, List
 
 
 class PixelLevelDetector:
@@ -79,6 +79,75 @@ class PixelLevelDetector:
         long_gradient_ratio = float(np.sum(np.abs(grad) > 5) / (w * h))
         return double_edge_ratio, long_gradient_ratio
 
+    @staticmethod
+    def _ela_inconsistency_score(gray: np.ndarray, quality: int = 85) -> float:
+        """ELA 局部不一致：同层文字替换/粘贴常出现中心区域压缩残差偏高。"""
+        from io import BytesIO
+
+        h, w = gray.shape
+        if h < 8 or w < 8:
+            return 0.0
+
+        pil = Image.fromarray(gray)
+        buffer = BytesIO()
+        pil.save(buffer, "JPEG", quality=quality)
+        buffer.seek(0)
+        recompressed = np.array(Image.open(buffer).convert("L"), dtype=np.int16)
+        if recompressed.shape != gray.shape:
+            recompressed = cv2.resize(recompressed.astype(np.uint8), (w, h)).astype(np.int16)
+
+        ela = np.abs(gray.astype(np.int16) - recompressed)
+        band = max(2, min(h, w) // 8)
+        if h <= band * 3 or w <= band * 3:
+            core = ela
+            edge_mean = float(np.mean(ela))
+        else:
+            core = ela[band:-band, band:-band]
+            edges = np.concatenate(
+                [
+                    ela[:band, :].reshape(-1),
+                    ela[-band:, :].reshape(-1),
+                    ela[:, :band].reshape(-1),
+                    ela[:, -band:].reshape(-1),
+                ]
+            )
+            edge_mean = float(np.mean(edges)) if edges.size else 0.0
+
+        core_mean = float(np.mean(core)) if core.size else 0.0
+        ratio = core_mean / (edge_mean + 1e-6)
+        std_boost = float(np.std(core) / (np.std(ela) + 1e-6))
+        score = max(0.0, (ratio - 1.15) * 0.55) + max(0.0, (std_boost - 0.35) * 0.35)
+        return float(min(1.0, score))
+
+    @staticmethod
+    def _noise_inconsistency_score(gray: np.ndarray) -> float:
+        """水平条带噪声方差差异：无痕文字替换常仅影响局部条带。"""
+        h, w = gray.shape
+        if h < 12 or w < 12:
+            return 0.0
+
+        kernel = np.array([[-1, -1, -1], [-1, 8, -1], [-1, -1, -1]], dtype=np.float32)
+        noise = cv2.filter2D(gray.astype(np.float32), -1, kernel)
+        band_count = 5
+        band_h = max(2, h // band_count)
+        band_vars: List[float] = []
+        for index in range(band_count):
+            start = index * band_h
+            end = h if index == band_count - 1 else (index + 1) * band_h
+            strip = noise[start:end, :]
+            if strip.size:
+                band_vars.append(float(np.var(strip)))
+
+        if len(band_vars) < 2:
+            return 0.0
+
+        var_range = max(band_vars) - min(band_vars)
+        var_mean = float(np.mean(band_vars)) + 1e-6
+        ratio = var_range / var_mean
+        if ratio < 0.65:
+            return 0.0
+        return float(min(1.0, (ratio - 0.55) * 0.55))
+
     @classmethod
     def _alpha_blend_overlap_score(cls, double_edge_ratio: float, long_gradient_ratio: float) -> float:
         """
@@ -106,6 +175,9 @@ class PixelLevelDetector:
                 "blend_score": 0.0,
                 "double_edge_ratio": 0.0,
                 "long_gradient_ratio": 0.0,
+                "ela_score": 0.0,
+                "noise_inconsistency_score": 0.0,
+                "text_splice_score": 0.0,
                 "pixel_overlap_score": 0.0,
             }
 
@@ -114,12 +186,18 @@ class PixelLevelDetector:
         structural = cls._structural_overlap_score(gray)
         de, lg = cls._alpha_blend_metrics(gray)
         blend = cls._alpha_blend_overlap_score(de, lg)
-        final = float(min(1.0, max(structural, blend)))
+        ela = cls._ela_inconsistency_score(gray)
+        noise_inc = cls._noise_inconsistency_score(gray)
+        text_splice = float(min(1.0, max(ela, noise_inc * 0.9)))
+        final = float(min(1.0, max(structural, blend, text_splice)))
         return {
             "structural_score": round(structural, 4),
             "blend_score": round(blend, 4),
             "double_edge_ratio": round(de, 4),
             "long_gradient_ratio": round(lg, 4),
+            "ela_score": round(ela, 4),
+            "noise_inconsistency_score": round(noise_inc, 4),
+            "text_splice_score": round(text_splice, 4),
             "pixel_overlap_score": round(final, 4),
         }
 

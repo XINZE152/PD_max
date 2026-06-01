@@ -37,6 +37,8 @@ class PixelOverlapDetectorTests(unittest.TestCase):
         self.assertIn("structural_score", metrics)
         self.assertIn("blend_score", metrics)
         self.assertIn("double_edge_ratio", metrics)
+        self.assertIn("text_splice_score", metrics)
+        self.assertIn("ela_score", metrics)
         self.assertIn("pixel_overlap_score", metrics)
 
 
