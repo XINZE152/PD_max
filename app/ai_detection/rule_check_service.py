@@ -12,7 +12,7 @@ from app.ai_detection.core.detectors import PixelLevelDetector
 from app.ai_detection.core.utils import safe_read_image
 from app.ai_detection.rule_check_roi import (
     find_high_risk_pixel_rois,
-    rule_checks_need_auto_pixel_rescan,
+    should_auto_scan_high_risk_pixel_rois,
 )
 from app.ai_detection.semantic_checker import (
     check_receipt_semantics,
@@ -431,46 +431,25 @@ def run_rule_checks(
     if semantic.get("anomalies"):
         merged_signals["semantic_anomaly"] = True
 
-    effective_bbox = _resolve_pixel_overlap_bbox(
-        bbox_xyxy,
-        ocr_tokens,
-        auto_detect_account_field=auto_detect,
-    )
-    pixel_overlap_source = "manual_bbox" if bbox_xyxy is not None else (
-        "ocr_account_field" if effective_bbox is not None else None
-    )
-
     pixel_overlap: Optional[Dict[str, Any]] = None
-    if effective_bbox is not None:
+    pixel_overlap_source: Optional[str] = None
+
+    if bbox_xyxy is not None:
         pixel_overlap = run_pixel_overlap_check(
             image_path,
-            effective_bbox,
+            bbox_xyxy,
             pixel_detector,
             thresholds=thresh,
             margin=margin,
             bbox_format=bbox_format,
             corroboration_signals=merged_signals,
         )
-        if pixel_overlap_source == "ocr_account_field":
-            pixel_overlap["auto_detected"] = True
-            pixel_overlap["auto_detect_source"] = "收款账号"
-
-    timestamp = run_timestamp_check(
-        image_path,
-        ocr_tokens=ocr_tokens,
-        image_shape=image_shape,
-        business_datetime=business_datetime,
-        thresholds=thresh,
-    )
-
-    if (
+        pixel_overlap_source = "manual_bbox"
+    elif (
         ocr_tokens
         and image_shape
-        and rule_checks_need_auto_pixel_rescan(
+        and should_auto_scan_high_risk_pixel_rois(
             manual_bbox=bbox_xyxy,
-            semantic=semantic,
-            timestamp=timestamp,
-            pixel_overlap=pixel_overlap,
             business_rules=rules,
         )
     ):
@@ -490,9 +469,36 @@ def run_rule_checks(
                 corroboration_signals=merged_signals,
             )
             if auto_scans:
-                pixel_overlap = merge_pixel_overlap_results(pixel_overlap, auto_scans)
+                pixel_overlap = merge_pixel_overlap_results(None, auto_scans)
                 pixel_overlap["auto_detected"] = True
                 pixel_overlap_source = "auto_high_risk_rois"
+    else:
+        effective_bbox = _resolve_pixel_overlap_bbox(
+            bbox_xyxy,
+            ocr_tokens,
+            auto_detect_account_field=auto_detect,
+        )
+        if effective_bbox is not None:
+            pixel_overlap = run_pixel_overlap_check(
+                image_path,
+                effective_bbox,
+                pixel_detector,
+                thresholds=thresh,
+                margin=margin,
+                bbox_format=bbox_format,
+                corroboration_signals=merged_signals,
+            )
+            pixel_overlap_source = "ocr_account_field"
+            pixel_overlap["auto_detected"] = True
+            pixel_overlap["auto_detect_source"] = "收款账号"
+
+    timestamp = run_timestamp_check(
+        image_path,
+        ocr_tokens=ocr_tokens,
+        image_shape=image_shape,
+        business_datetime=business_datetime,
+        thresholds=thresh,
+    )
 
     reasons: List[str] = []
     if pixel_overlap and pixel_overlap.get("reasons"):
