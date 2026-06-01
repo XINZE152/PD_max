@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.ai_detection.bbox_overlap_checker import analyze_bbox_iou_overlaps
-
+from app.ai_detection.core.exceptions import RecoverableError
 from app.ai_detection.core.extractors import FeatureExtractor, FontFeatureLibrary, TamperAnalyzer
 from app.ai_detection.core.detectors import PixelLevelDetector, OriginalityChecker
 from app.ai_detection.core.utils import NumpyEncoder, safe_read_image
@@ -30,7 +30,11 @@ class InferenceEngineAPI:
             self.config = yaml.safe_load(f)
         self.base_dir = config_file.parent
 
-        self.extractor = FeatureExtractor(reader=shared_ocr_reader)
+        preprocess_cfg = self.config.get("preprocessing", {})
+        self.extractor = FeatureExtractor(
+            reader=shared_ocr_reader,
+            preserve_aspect_ratio=preprocess_cfg.get("preserve_aspect_ratio", True),
+        )
         self.font_lib = FontFeatureLibrary()
         font_lib_path = self._resolve_path(self.config['paths']['font_lib_path'])
         self.font_lib.load(font_lib_path)
@@ -436,6 +440,16 @@ class InferenceEngineAPI:
 
             return json.dumps(output, ensure_ascii=False, indent=4, cls=NumpyEncoder)
 
+        except RecoverableError as e:
+            self._metrics["error_count"] += 1
+            logger.warning("可恢复的业务异常: %s", e)
+            error_output = {
+                "result": "错误",
+                "confidence": 0.0,
+                "bbox": roi_bbox,
+                "reason": str(e),
+            }
+            return json.dumps(error_output, ensure_ascii=False, indent=4, cls=NumpyEncoder)
         except Exception as e:
             self._metrics["error_count"] += 1
             logger.error("引擎推理引发未捕获系统异常: %s", e, exc_info=True)

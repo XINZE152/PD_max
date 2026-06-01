@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 import cv2
 import numpy as np
 from functools import partial
+import yaml
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.concurrency import run_in_threadpool
@@ -280,6 +281,46 @@ class EngineContainer:
     ai_semaphore: Optional[asyncio.Semaphore] = None
     cleanup_task: Optional[asyncio.Task] = None
     _runtime_lock: Optional[asyncio.Lock] = None
+
+
+def _read_model_config() -> Dict[str, Any]:
+    cfg_path = Path(__file__).resolve().parents[3] / "ai_detection" / "config.yaml"
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+    except Exception:
+        logger.exception("Read AI detection config failed")
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _resolve_model_path(path_value: Any) -> str:
+    raw = str(path_value or "").strip()
+    if not raw:
+        return ""
+    p = Path(raw)
+    if p.is_absolute():
+        return str(p)
+    return str((Path(__file__).resolve().parents[3] / "ai_detection" / p).resolve())
+
+
+def _list_model_versions_from_registry() -> Dict[str, Any]:
+    cfg = _read_model_config()
+    paths = cfg.get("paths") if isinstance(cfg.get("paths"), dict) else {}
+    training = cfg.get("training") if isinstance(cfg.get("training"), dict) else {}
+    current_model = _resolve_model_path(paths.get("xgb_model_path", "models/global_layout_model.pkl"))
+    registry_path = _resolve_model_path(training.get("registry_path", "models/registry.json"))
+    if not registry_path or not os.path.exists(registry_path):
+        return {"versions": [], "current_model": current_model}
+    try:
+        with open(registry_path, "r", encoding="utf-8") as f:
+            registry = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {"versions": [], "current_model": current_model}
+    if not isinstance(registry, dict):
+        registry = {"versions": []}
+    registry["current_model"] = current_model
+    return registry
 
 
 async def startup_ai_detection() -> None:
@@ -1726,19 +1767,30 @@ async def submit_judgment(
 ):
     from app.ai_detection.feedback_manager import FeedbackManager
 
-    task = await registry.get_task(req.task_id)
-    if not task:
-        raise HTTPException(404, "任务不存在")
-
     fb = FeedbackManager()
-    result = task.result or {}
+
+    task = await registry.get_task(req.task_id)
+    image_path: Optional[str] = None
+    result: Dict[str, Any] = {}
+    if task:
+        image_path = task.image_path
+        result = task.result or {}
+    else:
+        # 内存注册表中不存在时，从持久化历史记录回退（服务重启/GC 后仍可标注）
+        history = await run_in_threadpool(get_latest_ai_detection_history_by_task_id, req.task_id)
+        if not history:
+            raise HTTPException(404, "任务不存在")
+        image_path = str(history["image_path"])
+        outcome = history.get("outcome") or {}
+        result = outcome.get("result") or {}
+
     bbox = req.bbox
     if bbox is None:
         bbox = result.get("original_bbox") or result.get("bbox")
     entry = fb.save_judgment(
         task_id=req.task_id,
         judgment=req.judgment,
-        image_path=task.image_path,
+        image_path=image_path,
         bbox=bbox,
         result=result,
         note=req.note,
@@ -1840,3 +1892,66 @@ async def get_train_visualization(filename: str):
     if not viz_file.exists():
         raise HTTPException(404, "可视化图片不存在")
     return FileResponse(str(viz_file), media_type="image/png")
+
+
+# ---- 运维端点：健康检查 / 模型版本 / 模型重载 ----
+
+
+@router.get(
+    "/api/v3/health",
+    summary="AI 鉴伪服务健康检查",
+    description=(
+        "返回推理引擎状态指标，包括模型、字体库、OCR 就绪情况。\n\n"
+        "前端可在鉴伪页面加载时调用，用于展示服务可用性。"
+    ),
+)
+async def health_check():
+    engine = EngineContainer.instance
+    ocr_reader = EngineContainer.ocr_reader
+    metrics = engine.get_metrics() if engine is not None else {}
+    return {
+        "status": "ok",
+        "font_lib_ready": bool(metrics.get("font_lib_ready", False)),
+        "font_lib_size": int(metrics.get("font_lib_size", 0)),
+        "global_model_loaded": bool(engine is not None and engine.global_model is not None),
+        "ocr_available": ocr_reader is not None,
+        "metrics": {
+            "total_predictions": metrics.get("total_predictions", 0),
+            "tampered_count": metrics.get("tampered_count", 0),
+            "suspicious_count": metrics.get("suspicious_count", 0),
+            "normal_count": metrics.get("normal_count", 0),
+            "error_count": metrics.get("error_count", 0),
+            "avg_inference_ms": metrics.get("avg_inference_ms", 0),
+            "inference_p50_ms": metrics.get("inference_p50_ms", 0),
+            "inference_p99_ms": metrics.get("inference_p99_ms", 0),
+        },
+    }
+
+
+@router.get(
+    "/api/v3/models",
+    summary="模型版本列表",
+    description="返回模型注册表中所有版本及当前活跃模型。",
+)
+async def list_models():
+    engine = EngineContainer.instance
+    if engine is not None:
+        return engine.list_model_versions()
+    return _list_model_versions_from_registry()
+
+
+@router.post(
+    "/api/v3/reload",
+    summary="热重载模型",
+    description=(
+        "无需重启服务即可重载 FAISS 字体库和 XGBoost 全局模型。\n\n"
+        "- `version`（可选）：指定注册表中的版本时间戳；不传则重新加载当前版本。\n"
+        "Python 属性赋值为原子操作，读取端无锁安全。"
+    ),
+)
+async def reload_model(
+    version: Optional[str] = Form(None),
+    engine: "InferenceEngineAPI" = Depends(get_engine),
+):
+    result = await run_in_threadpool(lambda: engine.reload_models(version))
+    return {"status": "ok", "detail": result}
