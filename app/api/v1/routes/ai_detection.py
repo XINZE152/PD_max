@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import mimetypes
 import os
 import time
 import shutil
@@ -17,6 +18,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 import cv2
 import numpy as np
 from functools import partial
+import yaml
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.concurrency import run_in_threadpool
@@ -33,6 +35,7 @@ from app.config import AI_RULE_CHECK_PERSIST, AI_RULE_CHECK_STORE_IMAGE, UPLOAD_
 from app.ai_detection.easyocr_download_patch import patch_easyocr_download
 from app.ai_detection.history_db import (
     HISTORY_RETENTION_DAYS,
+    delete_ai_detection_history,
     get_ai_detection_history_image_path,
     get_async_v3_history_by_task_id,
     get_latest_ai_detection_history_by_task_id,
@@ -286,6 +289,46 @@ class EngineContainer:
     ai_semaphore: Optional[asyncio.Semaphore] = None
     cleanup_task: Optional[asyncio.Task] = None
     _runtime_lock: Optional[asyncio.Lock] = None
+
+
+def _read_model_config() -> Dict[str, Any]:
+    cfg_path = Path(__file__).resolve().parents[3] / "ai_detection" / "config.yaml"
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+    except Exception:
+        logger.exception("Read AI detection config failed")
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _resolve_model_path(path_value: Any) -> str:
+    raw = str(path_value or "").strip()
+    if not raw:
+        return ""
+    p = Path(raw)
+    if p.is_absolute():
+        return str(p)
+    return str((Path(__file__).resolve().parents[3] / "ai_detection" / p).resolve())
+
+
+def _list_model_versions_from_registry() -> Dict[str, Any]:
+    cfg = _read_model_config()
+    paths = cfg.get("paths") if isinstance(cfg.get("paths"), dict) else {}
+    training = cfg.get("training") if isinstance(cfg.get("training"), dict) else {}
+    current_model = _resolve_model_path(paths.get("xgb_model_path", "models/global_layout_model.pkl"))
+    registry_path = _resolve_model_path(training.get("registry_path", "models/registry.json"))
+    if not registry_path or not os.path.exists(registry_path):
+        return {"versions": [], "current_model": current_model}
+    try:
+        with open(registry_path, "r", encoding="utf-8") as f:
+            registry = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {"versions": [], "current_model": current_model}
+    if not isinstance(registry, dict):
+        registry = {"versions": []}
+    registry["current_model"] = current_model
+    return registry
 
 
 async def startup_ai_detection() -> None:
@@ -888,6 +931,7 @@ class DetectionDomainServiceV3:
         self._cached_tokens: Optional[List[Any]] = None
         self._cached_candidates: Optional[List[Any]] = None
         self._ocr_reader: Optional[Any] = None
+        self._cached_global_feat: Optional[np.ndarray] = None
 
     @staticmethod
     def _bbox_iou(a: BBoxDTO, b: BBoxDTO) -> float:
@@ -934,7 +978,7 @@ class DetectionDomainServiceV3:
         return bool(not task or task.status == TaskStatusEnum.CANCELED)
 
     def _run_ocr_once(self, image_path: str, ocr_reader: Any) -> None:
-        """读取图片并执行一次 OCR tokenize + amount 候选构建，结果缓存供后续复用。"""
+        """读取图片并执行一次 OCR tokenize + amount 候选构建 + 全局特征提取，结果缓存供后续复用。"""
         if self._cached_tokens is not None:
             return
         img_cv2, tokens = run_full_image_ocr(image_path, ocr_reader)
@@ -1150,6 +1194,7 @@ class DetectionDomainServiceV3:
                 )
                 return
 
+            global_feat = self._cached_global_feat
             all_results = []
             for b in bboxes:
                 if await self._is_canceled(task_id):
@@ -1646,6 +1691,18 @@ async def get_detection_history_image(record_id: int):
     )
 
 
+@router.delete(
+    "/api/v1/history/{record_id}",
+    summary="删除鉴伪历史记录",
+    description="删除单条历史记录，并清理其归档图片（若存在）。",
+)
+async def delete_detection_history(record_id: int):
+    removed = await run_in_threadpool(delete_ai_detection_history, record_id)
+    if not removed:
+        raise HTTPException(status_code=404, detail="历史记录不存在")
+    return {"status": "success"}
+
+
 @router.post(
     "/api/v3/detect",
     summary="提交鉴伪任务（异步）",
@@ -1821,3 +1878,394 @@ async def cancel_task(task_id: str, registry: AbstractTaskRegistry = Depends(get
         await registry.delete_task(task_id)
 
     return {"status": "success"}
+
+
+# ---- 人工标注反馈系统 ----
+
+class JudgmentRequest(BaseModel):
+    task_id: str
+    judgment: str = Field(..., pattern="^(correct|wrong|suspicious)$")
+    bbox: Optional[List[int]] = None
+    note: str = ""
+
+
+class FeedbackUpdateRequest(BaseModel):
+    judgment: str = Field(..., pattern="^(correct|wrong|suspicious)$")
+    note: Optional[str] = None
+
+
+class DatasetUpdateRequest(BaseModel):
+    label: int = Field(..., ge=0, le=1, description="训练标签：0=正常，1=篡改")
+
+
+@router.post(
+    "/api/v3/feedback/judge",
+    summary="提交人工判断标注",
+    description=(
+        "对鉴伪结果进行人工标注，支持 **correct**（正确）、**wrong**（错误）、**suspicious**（疑似）三种判定。\n\n"
+        "- **wrong**：保存原图 + 框选区域裁剪图 + 完整元数据到 feedback/wrong/ 目录\n"
+        "- **suspicious**：保存到 feedback/suspicious/ 待确认目录\n"
+        "- **correct**：保存到 feedback/correct/ 目录\n\n"
+        "**请求体**：JSON\n"
+        "- `task_id`：任务 ID\n"
+        "- `judgment`：判定结果（correct | wrong | suspicious）\n"
+        "- `bbox`（可选）：标注框 [x1, y1, x2, y2]，不传则使用检测结果中的框\n"
+        "- `note`（可选）：备注说明\n"
+    ),
+)
+async def submit_judgment(
+    req: JudgmentRequest,
+    registry: AbstractTaskRegistry = Depends(get_registry),
+):
+    from app.ai_detection.feedback_manager import FeedbackManager
+
+    fb = FeedbackManager()
+
+    task = await registry.get_task(req.task_id)
+    image_path: Optional[str] = None
+    result: Dict[str, Any] = {}
+    if task:
+        image_path = task.image_path
+        result = task.result or {}
+    else:
+        # 内存注册表中不存在时，从持久化历史记录回退（服务重启/GC 后仍可标注）
+        history = await run_in_threadpool(get_latest_ai_detection_history_by_task_id, req.task_id)
+        if not history:
+            raise HTTPException(404, "任务不存在")
+        image_path = str(history["image_path"])
+        outcome = history.get("outcome") or {}
+        result = outcome.get("result") or {}
+
+    bbox = req.bbox
+    if bbox is None:
+        bbox = result.get("original_bbox") or result.get("bbox")
+    entry = fb.save_judgment(
+        task_id=req.task_id,
+        judgment=req.judgment,
+        image_path=image_path,
+        bbox=bbox,
+        result=result,
+        note=req.note,
+    )
+    logger.info("反馈已保存: task=%s judgment=%s entry=%s", req.task_id, req.judgment, entry.get("entry_id"))
+    return {"status": "success", "entry": entry}
+
+
+@router.get(
+    "/api/v3/feedback/list",
+    summary="列出反馈记录",
+    description=(
+        "列出所有反馈记录，可按判定类型过滤。\n\n"
+        "**查询参数**：`judgment`（可选）— 过滤 correct / wrong / suspicious\n"
+    ),
+)
+async def list_feedback(judgment: Optional[str] = Query(None, pattern="^(correct|wrong|suspicious)$")):
+    from app.ai_detection.feedback_manager import FeedbackManager
+
+    fb = FeedbackManager()
+    entries = fb.list_entries(judgment_filter=judgment)
+    return {"total": len(entries), "items": entries}
+
+
+@router.get(
+    "/api/v3/feedback/{folder_name}",
+    summary="获取反馈详情",
+    description="按反馈条目文件夹名返回元数据、AI 原始结果、图片访问地址等。",
+)
+async def get_feedback_detail(folder_name: str):
+    from app.ai_detection.feedback_manager import FeedbackManager
+
+    fb = FeedbackManager()
+    entry = fb.get_entry(folder_name)
+    if not entry:
+        raise HTTPException(404, "反馈条目不存在")
+    return {"status": "success", "entry": entry}
+
+
+@router.get(
+    "/api/v3/feedback/{folder_name}/image",
+    summary="获取反馈原图",
+    response_class=FileResponse,
+)
+async def get_feedback_image(folder_name: str):
+    from app.ai_detection.feedback_manager import FeedbackManager
+
+    fb = FeedbackManager()
+    path = fb.get_entry_file(folder_name, "image")
+    if path is None:
+        raise HTTPException(404, "反馈原图不存在")
+    media_type, _enc = mimetypes.guess_type(path.name)
+    return FileResponse(str(path), media_type=media_type or "application/octet-stream", filename=path.name)
+
+
+@router.get(
+    "/api/v3/feedback/{folder_name}/roi",
+    summary="获取反馈裁剪区域图",
+    response_class=FileResponse,
+)
+async def get_feedback_roi(folder_name: str):
+    from app.ai_detection.feedback_manager import FeedbackManager
+
+    fb = FeedbackManager()
+    path = fb.get_entry_file(folder_name, "roi")
+    if path is None:
+        raise HTTPException(404, "反馈裁剪图不存在")
+    return FileResponse(str(path), media_type="image/jpeg", filename=path.name)
+
+
+@router.patch(
+    "/api/v3/feedback/{folder_name}",
+    summary="修改反馈判断",
+    description="在 correct / wrong / suspicious 之间移动反馈条目，可用于纠错或撤回疑似状态。",
+)
+async def update_feedback(folder_name: str, req: FeedbackUpdateRequest):
+    from app.ai_detection.feedback_manager import FeedbackManager
+
+    fb = FeedbackManager()
+    entry = fb.update_entry(folder_name, req.judgment, note=req.note)
+    if not entry:
+        raise HTTPException(404, "反馈条目不存在")
+    return {"status": "success", "entry": entry}
+
+
+@router.delete(
+    "/api/v3/feedback/{folder_name}",
+    summary="删除/撤销反馈标注",
+)
+async def delete_feedback(folder_name: str):
+    from app.ai_detection.feedback_manager import FeedbackManager
+
+    fb = FeedbackManager()
+    if not fb.delete_entry(folder_name):
+        raise HTTPException(404, "反馈条目不存在")
+    return {"status": "success"}
+
+
+@router.post(
+    "/api/v3/feedback/confirm",
+    summary="确认疑似标注转向",
+    description=(
+        "将 suspicious（疑似）条目确认后移入 correct 或 wrong 目录。\n\n"
+        "**请求体**：`multipart/form-data`\n"
+        "- `folder_name`：疑似条目文件夹名\n"
+        "- `judgment`：最终判定（correct | wrong）\n"
+    ),
+)
+async def confirm_suspicious(folder_name: str = Form(...), judgment: str = Form(..., pattern="^(correct|wrong)$")):
+    from app.ai_detection.feedback_manager import FeedbackManager
+
+    fb = FeedbackManager()
+    entry = fb.confirm_suspicious(folder_name, judgment)
+    if not entry:
+        raise HTTPException(404, "疑似条目不存在或已处理")
+    return {"status": "success", "entry": entry}
+
+
+# ---- 原始训练集管理 ----
+
+@router.get(
+    "/api/v3/training-dataset/list",
+    summary="列出图片检测训练集样本",
+    description="列出训练管线读取的 images/ 样本，可按 label 过滤。label=0 为正常，label=1 为篡改。",
+)
+async def list_training_dataset(
+    label: Optional[int] = Query(None, ge=0, le=1, description="可选。0=正常，1=篡改"),
+    include_enhanced: bool = Query(True, description="是否包含 *_enhanced 增强样本"),
+):
+    from app.ai_detection.dataset_manager import DatasetManager
+
+    manager = DatasetManager()
+    entries = await run_in_threadpool(manager.list_entries, label, include_enhanced)
+    return {
+        "status": "success",
+        "summary": manager.summary(),
+        "total": len(entries),
+        "items": entries,
+    }
+
+
+@router.get(
+    "/api/v3/training-dataset/{filename}/image",
+    summary="获取训练集样本原图",
+    response_class=FileResponse,
+)
+async def get_training_dataset_image(filename: str):
+    from app.ai_detection.dataset_manager import DatasetManager
+
+    manager = DatasetManager()
+    path = await run_in_threadpool(manager.get_image_file, filename)
+    if path is None:
+        raise HTTPException(404, "训练样本不存在")
+    return FileResponse(str(path), media_type=manager.image_media_type(path.name), filename=path.name)
+
+
+@router.get(
+    "/api/v3/training-dataset/{filename}/annotation",
+    summary="获取训练集样本区域标注 JSON",
+)
+async def get_training_dataset_annotation(filename: str):
+    from app.ai_detection.dataset_manager import DatasetManager
+
+    manager = DatasetManager()
+    annotation = await run_in_threadpool(manager.get_annotation, filename)
+    if annotation is None:
+        raise HTTPException(404, "训练样本标注不存在")
+    return {"status": "success", "annotation": annotation}
+
+
+@router.patch(
+    "/api/v3/training-dataset/{filename}",
+    summary="修改训练集样本标签",
+    description="通过重命名样本及其 *_enhanced 配套图、locate_json 标注来修改训练标签。",
+)
+async def update_training_dataset_entry(filename: str, req: DatasetUpdateRequest):
+    from app.ai_detection.dataset_manager import DatasetManager
+
+    manager = DatasetManager()
+    try:
+        entry = await run_in_threadpool(manager.update_label, filename, req.label)
+    except FileExistsError as exc:
+        raise HTTPException(409, str(exc))
+    if entry is None:
+        raise HTTPException(404, "训练样本不存在")
+    return {"status": "success", "entry": entry, "summary": manager.summary()}
+
+
+@router.delete(
+    "/api/v3/training-dataset/{filename}",
+    summary="删除训练集样本",
+    description="删除该样本，默认同时删除同名 *_enhanced 配套图和 locate_json 标注。",
+)
+async def delete_training_dataset_entry(
+    filename: str,
+    delete_family: bool = Query(True, description="是否同时删除同一基础样本的增强图和 JSON 标注"),
+):
+    from app.ai_detection.dataset_manager import DatasetManager
+
+    manager = DatasetManager()
+    removed = await run_in_threadpool(manager.delete_entry, filename, delete_family)
+    if not removed:
+        raise HTTPException(404, "训练样本不存在")
+    return {"status": "success", "summary": manager.summary()}
+
+
+# ---- 训练端点 (含风险提示) ----
+
+class TrainResponse(BaseModel):
+    status: str
+    warning: str = "训练将使用反馈数据+原始数据集重新训练模型。这将覆盖当前模型（旧模型自动备份）。训练期间 GPU 资源占用高，可能影响正在进行的检测任务。"
+    summary: Optional[Dict[str, Any]] = None
+
+
+@router.post(
+    "/api/v3/train",
+    summary="触发模型训练（含风险警告）",
+    description=(
+        "使用反馈数据 + 原始数据集重新训练全局模型与字体库。\n\n"
+        "**风险提示**：训练将覆盖当前模型文件（旧模型自动备份）。训练期间 GPU 资源占用高，可能影响正在进行的检测任务。\n\n"
+        "**请求体**：`multipart/form-data`\n"
+        "- `confirm`：必须设为 `true` 以确认风险并开始训练\n"
+    ),
+)
+async def trigger_training(
+    confirm: bool = Form(False, description="必须设为 true 以确认风险"),
+    engine: "InferenceEngineAPI" = Depends(get_engine),
+    ocr_reader: Any = Depends(get_ocr_reader),
+):
+    if not confirm:
+        return TrainResponse(
+            status="aborted",
+            warning="请仔细阅读风险提示，确认后将 confirm 设为 true 重新提交。",
+        )
+
+    from app.ai_detection.train_pipeline_v2 import TrainPipeline
+
+    try:
+        summary = await run_in_threadpool(
+            lambda: TrainPipeline(ocr_reader=ocr_reader).run()
+        )
+        return TrainResponse(status="completed", summary=summary)
+    except Exception as e:
+        logger.exception("训练失败")
+        return TrainResponse(status="failed", warning=f"训练异常: {str(e)}")
+
+
+@router.get(
+    "/api/v3/train/viz/{filename}",
+    summary="获取训练可视化图片",
+    description=(
+        "获取训练过程中生成的可视化图片（特征重要性、分数分布、学习曲线）。\n\n"
+        "**路径参数**：`filename` — 可视化文件名（如 `feature_importance_20250101_120000.png`）\n"
+    ),
+)
+async def get_train_visualization(filename: str):
+    from app.ai_detection.train_pipeline_v2 import TrainPipeline
+
+    pipeline = TrainPipeline()
+    viz_file = pipeline.viz_dir / filename
+    if not viz_file.exists():
+        raise HTTPException(404, "可视化图片不存在")
+    return FileResponse(str(viz_file), media_type="image/png")
+
+
+# ---- 运维端点：健康检查 / 模型版本 / 模型重载 ----
+
+
+@router.get(
+    "/api/v3/health",
+    summary="AI 鉴伪服务健康检查",
+    description=(
+        "返回推理引擎状态指标，包括模型、字体库、OCR 就绪情况。\n\n"
+        "前端可在鉴伪页面加载时调用，用于展示服务可用性。"
+    ),
+)
+async def health_check():
+    engine = EngineContainer.instance
+    ocr_reader = EngineContainer.ocr_reader
+    metrics = engine.get_metrics() if engine is not None else {}
+    return {
+        "status": "ok",
+        "font_lib_ready": bool(metrics.get("font_lib_ready", False)),
+        "font_lib_size": int(metrics.get("font_lib_size", 0)),
+        "global_model_loaded": bool(engine is not None and engine.global_model is not None),
+        "ocr_available": ocr_reader is not None,
+        "metrics": {
+            "total_predictions": metrics.get("total_predictions", 0),
+            "tampered_count": metrics.get("tampered_count", 0),
+            "suspicious_count": metrics.get("suspicious_count", 0),
+            "normal_count": metrics.get("normal_count", 0),
+            "error_count": metrics.get("error_count", 0),
+            "avg_inference_ms": metrics.get("avg_inference_ms", 0),
+            "inference_p50_ms": metrics.get("inference_p50_ms", 0),
+            "inference_p99_ms": metrics.get("inference_p99_ms", 0),
+        },
+    }
+
+
+@router.get(
+    "/api/v3/models",
+    summary="模型版本列表",
+    description="返回模型注册表中所有版本及当前活跃模型。",
+)
+async def list_models():
+    engine = EngineContainer.instance
+    if engine is not None:
+        return engine.list_model_versions()
+    return _list_model_versions_from_registry()
+
+
+@router.post(
+    "/api/v3/reload",
+    summary="热重载模型",
+    description=(
+        "无需重启服务即可重载 FAISS 字体库和 XGBoost 全局模型。\n\n"
+        "- `version`（可选）：指定注册表中的版本时间戳；不传则重新加载当前版本。\n"
+        "Python 属性赋值为原子操作，读取端无锁安全。"
+    ),
+)
+async def reload_model(
+    version: Optional[str] = Form(None),
+    engine: "InferenceEngineAPI" = Depends(get_engine),
+):
+    result = await run_in_threadpool(lambda: engine.reload_models(version))
+    return {"status": "ok", "detail": result}
