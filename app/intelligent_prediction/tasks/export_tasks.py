@@ -1,4 +1,4 @@
-﻿"""Celery：批量预测与 Excel 导出。"""
+"""Celery：批量预测与 Excel 导出。"""
 
 from __future__ import annotations
 
@@ -52,6 +52,7 @@ async def _run_batch_async(batch_id: str) -> None:
                             "predicted_weight": float(it.predicted_weight),
                             "confidence": str(it.confidence),
                             "warnings": ";".join(it.warnings),
+                            "analysis": it.analysis or "",
                         }
                     )
             df = pd.DataFrame(rows)

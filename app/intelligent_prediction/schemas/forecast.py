@@ -63,6 +63,10 @@ class PrdForecastChartResponse(BaseModel):
         default_factory=list,
         description="各库房价格敏感度与能力基线",
     )
+    summary_analysis: Optional[str] = Field(
+        default=None,
+        description="区间汇总级预测依据（规则模型解释）",
+    )
 
 
 class PrdForecastDetailResponse(BaseModel):
