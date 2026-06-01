@@ -93,6 +93,18 @@ def find_high_risk_pixel_rois(
     return _dedupe_rois(rois)[:max_rois]
 
 
+def should_auto_scan_high_risk_pixel_rois(
+    *,
+    manual_bbox: Optional[Sequence[int]],
+    business_rules: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """未手动框选时，是否对金额/余额/账户等多 ROI 做像素拼接扫描。"""
+    if manual_bbox is not None:
+        return False
+    rules = business_rules or {}
+    return bool(rules.get("auto_detect_high_risk_rois", True))
+
+
 def rule_checks_need_auto_pixel_rescan(
     *,
     manual_bbox: Optional[Sequence[int]],
@@ -101,17 +113,9 @@ def rule_checks_need_auto_pixel_rescan(
     pixel_overlap: Optional[Dict[str, Any]],
     business_rules: Optional[Dict[str, Any]] = None,
 ) -> bool:
-    """首轮未手动框选且未检出像素/语义/时间硬篡改时，触发高风险区域自动扫描。"""
-    if manual_bbox is not None:
-        return False
-    rules = business_rules or {}
-    if not bool(rules.get("auto_detect_high_risk_rois", True)):
-        return False
-
-    if bool(semantic.get("hard_tamper")) or bool(timestamp.get("hard_tamper")):
-        return False
-    if pixel_overlap and bool(pixel_overlap.get("hard_tamper")):
-        return False
-    if pixel_overlap and bool(pixel_overlap.get("alert")):
-        return False
-    return True
+    """兼容旧调用；语义/像素已有结论时仍继续扫金额等区域。"""
+    _ = semantic, timestamp, pixel_overlap
+    return should_auto_scan_high_risk_pixel_rois(
+        manual_bbox=manual_bbox,
+        business_rules=business_rules,
+    )

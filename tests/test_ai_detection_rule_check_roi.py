@@ -20,6 +20,15 @@ class RuleCheckRoiTests(unittest.TestCase):
                 business_rules={"auto_detect_high_risk_rois": True},
             )
         )
+        self.assertTrue(
+            rule_checks_need_auto_pixel_rescan(
+                manual_bbox=None,
+                semantic={"hard_tamper": True},
+                timestamp={"hard_tamper": False},
+                pixel_overlap={"alert": True, "hard_tamper": True},
+                business_rules={"auto_detect_high_risk_rois": True},
+            )
+        )
         self.assertFalse(
             rule_checks_need_auto_pixel_rescan(
                 manual_bbox=[1, 2, 3, 4],
@@ -34,6 +43,7 @@ class RuleCheckRoiTests(unittest.TestCase):
                 semantic={"hard_tamper": False},
                 timestamp={"hard_tamper": False},
                 pixel_overlap={"alert": True},
+                business_rules={"auto_detect_high_risk_rois": False},
             )
         )
 
