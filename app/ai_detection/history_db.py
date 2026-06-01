@@ -57,6 +57,32 @@ def get_ai_detection_history_image_path(record_id: int) -> Optional[Path]:
     return p if p.is_file() else None
 
 
+def delete_ai_detection_history(record_id: int) -> bool:
+    """删除单条鉴伪历史记录，并清理对应归档图。"""
+    rid = int(record_id)
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT stored_image FROM ai_detection_history WHERE id=%s",
+                (rid,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return False
+            stored_name = row[0]
+            if stored_name:
+                name = str(stored_name)
+                if "/" not in name and "\\" not in name and not name.startswith("."):
+                    fp = HISTORY_IMAGES_DIR / name
+                    try:
+                        if fp.is_file():
+                            fp.unlink()
+                    except OSError as exc:
+                        logger.warning("删除历史归档图失败 %s: %s", fp, exc)
+            cur.execute("DELETE FROM ai_detection_history WHERE id=%s", (rid,))
+            return bool(cur.rowcount)
+
+
 def get_rule_checks_history_by_task_id(task_id: str) -> Optional[Dict[str, Any]]:
     """按 task_id 返回最近一条 rule_checks 历史（AI+规则 聚合用）。"""
     tid = str(task_id or "").strip()

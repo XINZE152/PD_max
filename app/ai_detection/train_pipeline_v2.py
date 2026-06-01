@@ -9,7 +9,7 @@ import os
 import shutil
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 import cv2
 import joblib
@@ -71,7 +71,7 @@ class TrainPipeline:
         if self.extractor is None:
             self.extractor = FeatureExtractor(reader=self.ocr_reader)
 
-        feedback_wrong = self._load_feedback_wrong(feedback_dir)
+        feedback_entries = self._load_feedback_entries(feedback_dir)
         original_images = self._load_original_dataset()
 
         all_font_feats = []
@@ -79,7 +79,14 @@ class TrainPipeline:
         global_X = []
         global_y = []
 
-        total_samples = len(original_images) + len(feedback_wrong)
+        feedback_training = [
+            (path, metadata, label)
+            for path, metadata in feedback_entries
+            if (label := self.infer_feedback_label(metadata)) is not None
+        ]
+        skipped_feedback = len(feedback_entries) - len(feedback_training)
+
+        total_samples = len(original_images) + len(feedback_training)
         processed = 0
 
         # 处理原始数据集
@@ -90,7 +97,7 @@ class TrainPipeline:
                     continue
                 # 全局特征 + 增强
                 augs = build_global_augmentations(img, key=os.path.basename(img_path))
-                for aug_img, aug_name in augs:
+                for _aug_name, aug_img in augs:
                     feat = self.extractor.extract_global_feature(aug_img)
                     global_X.append(feat)
                     global_y.append(label)
@@ -105,17 +112,18 @@ class TrainPipeline:
             except Exception:
                 logger.warning("处理图像失败: %s", img_path, exc_info=True)
 
-        # 处理反馈的错误样本（作为篡改样本加入训练，label=1）
-        for fb_img_path, metadata in feedback_wrong:
+        # 处理人工反馈样本：correct 跟随引擎原判，wrong 使用相反真实标签；
+        # 未确认 suspicious 无法确定真实标签，已在 feedback_training 中跳过。
+        for fb_img_path, metadata, label in feedback_training:
             try:
                 img = cv2.imdecode(np.fromfile(fb_img_path, dtype=np.uint8), cv2.IMREAD_COLOR)
                 if img is None:
                     continue
                 augs = build_global_augmentations(img, key=os.path.basename(fb_img_path))
-                for aug_img, aug_name in augs:
+                for _aug_name, aug_img in augs:
                     feat = self.extractor.extract_global_feature(aug_img)
                     global_X.append(feat)
-                    global_y.append(1)
+                    global_y.append(label)
 
                 processed += 1
                 if progress_callback:
@@ -160,6 +168,9 @@ class TrainPipeline:
             "positive_samples": int(sum(global_y)),
             "negative_samples": int(len(global_y) - sum(global_y)),
             "font_library_size": len(all_font_labels),
+            "feedback_samples": len(feedback_entries),
+            "feedback_training_samples": len(feedback_training),
+            "feedback_skipped_samples": skipped_feedback,
             "model_path": model_path,
             "font_lib_path": font_lib_path,
             "visualizations": viz_paths,
@@ -183,22 +194,78 @@ class TrainPipeline:
             if src.exists():
                 shutil.copy2(str(src), str(backup_dir / pattern))
 
-    def _load_feedback_wrong(self, feedback_dir: Optional[str]) -> list:
-        """加载 feedback/wrong 目录中的错误样本。"""
+    @staticmethod
+    def infer_feedback_label(metadata: Dict[str, Any]) -> Optional[int]:
+        """根据用户反馈和引擎原始结果推断真实标签：0=正常，1=篡改。"""
+        explicit = metadata.get("training_label", metadata.get("true_label"))
+        if explicit in (0, 1):
+            return int(explicit)
+        if isinstance(explicit, str) and explicit.strip() in ("0", "1"):
+            return int(explicit.strip())
+
+        judgment = str(metadata.get("judgment", "")).strip().lower()
+        engine_result = metadata.get("engine_result") or {}
+        if not isinstance(engine_result, dict):
+            engine_result = {}
+        engine_label = str(engine_result.get("result", "")).strip()
+        if engine_label not in ("正常", "篡改", "可疑"):
+            return None
+        engine_tampered = engine_label in ("篡改", "可疑")
+
+        if judgment == "correct":
+            return 1 if engine_tampered else 0
+        if judgment == "wrong":
+            return 0 if engine_tampered else 1
+        return None
+
+    def _load_feedback_entries(self, feedback_dir: Optional[str]) -> list:
+        """加载反馈目录中可读取的人工标注条目。"""
         samples = []
         if not feedback_dir:
-            feedback_dir = str(Path(self._resolve(self.config.get("feedback", {}).get("storage_dir", "feedback"))) / "wrong")
-        fb_path = Path(feedback_dir)
-        if not fb_path.exists():
+            feedback_dir = self._resolve(self.config.get("feedback", {}).get("storage_dir", "feedback"))
+        fb_root = Path(feedback_dir)
+        if not fb_root.exists():
             return samples
-        for folder in fb_path.iterdir():
-            meta_file = folder / "metadata.json"
-            orig = folder / "original.jpg"
-            if meta_file.exists() and orig.exists():
-                with open(meta_file, "r", encoding="utf-8") as f:
-                    metadata = json.load(f)
+
+        search_dirs = []
+        if fb_root.name in ("correct", "wrong", "suspicious"):
+            search_dirs.append(fb_root)
+        else:
+            search_dirs.extend([fb_root / "correct", fb_root / "wrong", fb_root / "suspicious"])
+
+        for fb_path in search_dirs:
+            if not fb_path.exists():
+                continue
+            for folder in fb_path.iterdir():
+                meta_file = folder / "metadata.json"
+                if not meta_file.exists():
+                    continue
+                try:
+                    with open(meta_file, "r", encoding="utf-8") as f:
+                        metadata = json.load(f)
+                except (json.JSONDecodeError, OSError):
+                    continue
+                orig = self._feedback_original_path(folder, metadata)
+                if orig is None:
+                    continue
+                metadata.setdefault("judgment", fb_path.name)
                 samples.append((str(orig), metadata))
         return samples
+
+    @staticmethod
+    def _feedback_original_path(folder: Path, metadata: Dict[str, Any]) -> Optional[Path]:
+        raw = metadata.get("original_image")
+        if isinstance(raw, str) and raw.strip():
+            p = Path(raw)
+            if p.exists():
+                return p
+            fallback = folder / p.name
+            if fallback.exists():
+                return fallback
+        for candidate in folder.glob("original.*"):
+            if candidate.is_file():
+                return candidate
+        return None
 
     def _load_original_dataset(self) -> list:
         """加载原始 images/ 数据集并分配标签。"""
@@ -243,7 +310,7 @@ class TrainPipeline:
             if char_img.size == 0:
                 continue
             augs = build_roi_augmentations(char_img, key=f"{img_path}_{x1}_{y1}")
-            for aug_img, aug_name in augs:
+            for _aug_name, aug_img in augs:
                 tensor = self.extractor.transform_local(aug_img)
                 if self.extractor.device.type == "cuda":
                     tensor = tensor.cpu()

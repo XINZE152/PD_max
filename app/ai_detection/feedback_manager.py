@@ -104,34 +104,126 @@ class FeedbackManager:
 
         return metadata
 
+    def _dir_for_judgment(self, judgment: str) -> Optional[Path]:
+        mapping = {
+            "correct": self.correct_dir,
+            "wrong": self.wrong_dir,
+            "suspicious": self.suspicious_dir,
+        }
+        return mapping.get(str(judgment or "").strip().lower())
+
+    def _find_entry_folder(self, entry_folder: str) -> Optional[Path]:
+        name = Path(str(entry_folder or "").strip()).name
+        if not name or name in (".", ".."):
+            return None
+        for root in (self.correct_dir, self.wrong_dir, self.suspicious_dir):
+            candidate = root / name
+            if candidate.is_dir() and (candidate / "metadata.json").is_file():
+                return candidate
+        return None
+
+    def _read_entry(self, folder: Path) -> Optional[Dict[str, Any]]:
+        meta_file = folder / "metadata.json"
+        if not meta_file.exists():
+            return None
+        try:
+            with open(meta_file, "r", encoding="utf-8") as f:
+                metadata = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return None
+
+        judgment = folder.parent.name
+        metadata["judgment"] = metadata.get("judgment") or judgment
+        metadata["folder_name"] = folder.name
+        metadata["image_url"] = f"/ai-detection/api/v3/feedback/{folder.name}/image"
+        roi = folder / "roi.jpg"
+        metadata["roi_url"] = f"/ai-detection/api/v3/feedback/{folder.name}/roi" if roi.is_file() else None
+        metadata["can_confirm"] = judgment == "suspicious"
+        return metadata
+
+    def get_entry(self, entry_folder: str) -> Optional[Dict[str, Any]]:
+        """按文件夹名返回单条反馈元数据。"""
+        folder = self._find_entry_folder(entry_folder)
+        if folder is None:
+            return None
+        return self._read_entry(folder)
+
+    def get_entry_file(self, entry_folder: str, kind: str = "image") -> Optional[Path]:
+        """返回反馈条目的原图或 ROI 图片路径。kind=image|roi。"""
+        folder = self._find_entry_folder(entry_folder)
+        if folder is None:
+            return None
+        if kind == "roi":
+            roi = folder / "roi.jpg"
+            return roi if roi.is_file() else None
+
+        metadata = self._read_entry(folder) or {}
+        raw = metadata.get("original_image")
+        if isinstance(raw, str) and raw.strip():
+            p = Path(raw)
+            if p.is_file():
+                return p
+            fallback = folder / p.name
+            if fallback.is_file():
+                return fallback
+        for candidate in folder.glob("original.*"):
+            if candidate.is_file():
+                return candidate
+        return None
+
+    def update_entry(self, entry_folder: str, judgment: str, note: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """修改反馈判断类型，可在 correct / wrong / suspicious 之间移动。"""
+        dst_root = self._dir_for_judgment(judgment)
+        src = self._find_entry_folder(entry_folder)
+        if src is None or dst_root is None:
+            return None
+
+        dst = dst_root / src.name
+        if dst != src:
+            if dst.exists():
+                shutil.rmtree(str(dst))
+            shutil.move(str(src), str(dst))
+        else:
+            dst = src
+
+        meta_file = dst / "metadata.json"
+        with open(meta_file, "r", encoding="utf-8") as f:
+            metadata = json.load(f)
+        metadata["judgment"] = judgment
+        metadata["updated_at"] = datetime.now().strftime("%Y%m%d_%H%M%S")
+        if note is not None:
+            metadata["user_note"] = note
+        with open(meta_file, "w", encoding="utf-8") as f:
+            json.dump(metadata, f, ensure_ascii=False, indent=2)
+        return self._read_entry(dst)
+
+    def delete_entry(self, entry_folder: str) -> bool:
+        """删除一条反馈记录，相当于撤销该标注。"""
+        folder = self._find_entry_folder(entry_folder)
+        if folder is None:
+            return False
+        shutil.rmtree(str(folder))
+        return True
+
     def confirm_suspicious(self, entry_folder: str, final_judgment: str) -> Optional[Dict[str, Any]]:
         """将 suspicious 条目确认后移入 correct 或 wrong 目录。"""
-        src = self.suspicious_dir / entry_folder
+        src = self.suspicious_dir / Path(entry_folder).name
         if not src.exists():
             return None
 
-        meta_file = src / "metadata.json"
-        if not meta_file.exists():
-            return None
-
-        with open(meta_file, "r", encoding="utf-8") as f:
-            metadata = json.load(f)
-
-        if final_judgment == "wrong":
-            dst = self.wrong_dir / entry_folder
-        else:
-            dst = self.correct_dir / entry_folder
-
-        if dst.exists():
-            shutil.rmtree(str(dst))
-        shutil.move(str(src), str(dst))
-
-        metadata["judgment"] = final_judgment
-        metadata["confirmed_at"] = datetime.now().strftime("%Y%m%d_%H%M%S")
-        with open(dst / "metadata.json", "w", encoding="utf-8") as f:
-            json.dump(metadata, f, ensure_ascii=False, indent=2)
-
-        return metadata
+        entry = self.update_entry(src.name, final_judgment)
+        if entry:
+            entry["confirmed_at"] = entry.get("updated_at")
+            folder = self._find_entry_folder(src.name)
+            if folder:
+                meta_file = folder / "metadata.json"
+                with open(meta_file, "r", encoding="utf-8") as f:
+                    metadata = json.load(f)
+                metadata["confirmed_at"] = entry["confirmed_at"]
+                with open(meta_file, "w", encoding="utf-8") as f:
+                    json.dump(metadata, f, ensure_ascii=False, indent=2)
+                return self._read_entry(folder)
+        return entry
 
     def list_entries(self, judgment_filter: Optional[str] = None) -> List[Dict[str, Any]]:
         """列出反馈条目。"""
@@ -149,9 +241,8 @@ class FeedbackManager:
             if not d.exists():
                 continue
             for folder in sorted(d.iterdir(), reverse=True):
-                meta_file = folder / "metadata.json"
-                if meta_file.exists():
-                    with open(meta_file, "r", encoding="utf-8") as f:
-                        entries.append(json.load(f))
+                entry = self._read_entry(folder)
+                if entry:
+                    entries.append(entry)
 
         return entries

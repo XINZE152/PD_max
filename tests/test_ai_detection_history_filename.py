@@ -1,6 +1,7 @@
 import unittest
+from unittest.mock import MagicMock, patch
 
-from app.ai_detection.history_db import normalize_history_original_filename
+from app.ai_detection.history_db import delete_ai_detection_history, normalize_history_original_filename
 
 
 class NormalizeHistoryOriginalFilenameTests(unittest.TestCase):
@@ -31,6 +32,33 @@ class NormalizeHistoryOriginalFilenameTests(unittest.TestCase):
             fallback_path="/data/uploads/task-id.jpg",
         )
         self.assertEqual(name, "task-id.jpg")
+
+    @patch("app.ai_detection.history_db.get_conn")
+    def test_delete_history_removes_database_row(self, mock_get_conn):
+        cursor = MagicMock()
+        cursor.fetchone.return_value = (None,)
+        cursor.rowcount = 1
+        conn = MagicMock()
+        conn.__enter__.return_value = conn
+        conn.cursor.return_value.__enter__.return_value = cursor
+        mock_get_conn.return_value = conn
+
+        removed = delete_ai_detection_history(12)
+
+        self.assertTrue(removed)
+        executed = [call.args[0] for call in cursor.execute.call_args_list]
+        self.assertTrue(any("DELETE FROM ai_detection_history" in sql for sql in executed))
+
+    @patch("app.ai_detection.history_db.get_conn")
+    def test_delete_history_returns_false_when_missing(self, mock_get_conn):
+        cursor = MagicMock()
+        cursor.fetchone.return_value = None
+        conn = MagicMock()
+        conn.__enter__.return_value = conn
+        conn.cursor.return_value.__enter__.return_value = cursor
+        mock_get_conn.return_value = conn
+
+        self.assertFalse(delete_ai_detection_history(99))
 
 
 if __name__ == "__main__":

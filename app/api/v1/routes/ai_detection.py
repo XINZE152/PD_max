@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import mimetypes
 import os
 import time
 import shutil
@@ -34,6 +35,7 @@ from app.config import AI_RULE_CHECK_PERSIST, AI_RULE_CHECK_STORE_IMAGE, UPLOAD_
 from app.ai_detection.easyocr_download_patch import patch_easyocr_download
 from app.ai_detection.history_db import (
     HISTORY_RETENTION_DAYS,
+    delete_ai_detection_history,
     get_ai_detection_history_image_path,
     get_latest_ai_detection_history_by_task_id,
     get_rule_checks_history_by_task_id,
@@ -1563,6 +1565,18 @@ async def get_detection_history_image(record_id: int):
     )
 
 
+@router.delete(
+    "/api/v1/history/{record_id}",
+    summary="删除鉴伪历史记录",
+    description="删除单条历史记录，并清理其归档图片（若存在）。",
+)
+async def delete_detection_history(record_id: int):
+    removed = await run_in_threadpool(delete_ai_detection_history, record_id)
+    if not removed:
+        raise HTTPException(status_code=404, detail="历史记录不存在")
+    return {"status": "success"}
+
+
 @router.post(
     "/api/v3/detect",
     summary="提交鉴伪任务（异步）",
@@ -1746,6 +1760,15 @@ class JudgmentRequest(BaseModel):
     note: str = ""
 
 
+class FeedbackUpdateRequest(BaseModel):
+    judgment: str = Field(..., pattern="^(correct|wrong|suspicious)$")
+    note: Optional[str] = None
+
+
+class DatasetUpdateRequest(BaseModel):
+    label: int = Field(..., ge=0, le=1, description="训练标签：0=正常，1=篡改")
+
+
 @router.post(
     "/api/v3/feedback/judge",
     summary="提交人工判断标注",
@@ -1815,6 +1838,80 @@ async def list_feedback(judgment: Optional[str] = Query(None, pattern="^(correct
     return {"total": len(entries), "items": entries}
 
 
+@router.get(
+    "/api/v3/feedback/{folder_name}",
+    summary="获取反馈详情",
+    description="按反馈条目文件夹名返回元数据、AI 原始结果、图片访问地址等。",
+)
+async def get_feedback_detail(folder_name: str):
+    from app.ai_detection.feedback_manager import FeedbackManager
+
+    fb = FeedbackManager()
+    entry = fb.get_entry(folder_name)
+    if not entry:
+        raise HTTPException(404, "反馈条目不存在")
+    return {"status": "success", "entry": entry}
+
+
+@router.get(
+    "/api/v3/feedback/{folder_name}/image",
+    summary="获取反馈原图",
+    response_class=FileResponse,
+)
+async def get_feedback_image(folder_name: str):
+    from app.ai_detection.feedback_manager import FeedbackManager
+
+    fb = FeedbackManager()
+    path = fb.get_entry_file(folder_name, "image")
+    if path is None:
+        raise HTTPException(404, "反馈原图不存在")
+    media_type, _enc = mimetypes.guess_type(path.name)
+    return FileResponse(str(path), media_type=media_type or "application/octet-stream", filename=path.name)
+
+
+@router.get(
+    "/api/v3/feedback/{folder_name}/roi",
+    summary="获取反馈裁剪区域图",
+    response_class=FileResponse,
+)
+async def get_feedback_roi(folder_name: str):
+    from app.ai_detection.feedback_manager import FeedbackManager
+
+    fb = FeedbackManager()
+    path = fb.get_entry_file(folder_name, "roi")
+    if path is None:
+        raise HTTPException(404, "反馈裁剪图不存在")
+    return FileResponse(str(path), media_type="image/jpeg", filename=path.name)
+
+
+@router.patch(
+    "/api/v3/feedback/{folder_name}",
+    summary="修改反馈判断",
+    description="在 correct / wrong / suspicious 之间移动反馈条目，可用于纠错或撤回疑似状态。",
+)
+async def update_feedback(folder_name: str, req: FeedbackUpdateRequest):
+    from app.ai_detection.feedback_manager import FeedbackManager
+
+    fb = FeedbackManager()
+    entry = fb.update_entry(folder_name, req.judgment, note=req.note)
+    if not entry:
+        raise HTTPException(404, "反馈条目不存在")
+    return {"status": "success", "entry": entry}
+
+
+@router.delete(
+    "/api/v3/feedback/{folder_name}",
+    summary="删除/撤销反馈标注",
+)
+async def delete_feedback(folder_name: str):
+    from app.ai_detection.feedback_manager import FeedbackManager
+
+    fb = FeedbackManager()
+    if not fb.delete_entry(folder_name):
+        raise HTTPException(404, "反馈条目不存在")
+    return {"status": "success"}
+
+
 @router.post(
     "/api/v3/feedback/confirm",
     summary="确认疑似标注转向",
@@ -1833,6 +1930,94 @@ async def confirm_suspicious(folder_name: str = Form(...), judgment: str = Form(
     if not entry:
         raise HTTPException(404, "疑似条目不存在或已处理")
     return {"status": "success", "entry": entry}
+
+
+# ---- 原始训练集管理 ----
+
+@router.get(
+    "/api/v3/training-dataset/list",
+    summary="列出图片检测训练集样本",
+    description="列出训练管线读取的 images/ 样本，可按 label 过滤。label=0 为正常，label=1 为篡改。",
+)
+async def list_training_dataset(
+    label: Optional[int] = Query(None, ge=0, le=1, description="可选。0=正常，1=篡改"),
+    include_enhanced: bool = Query(True, description="是否包含 *_enhanced 增强样本"),
+):
+    from app.ai_detection.dataset_manager import DatasetManager
+
+    manager = DatasetManager()
+    entries = await run_in_threadpool(manager.list_entries, label, include_enhanced)
+    return {
+        "status": "success",
+        "summary": manager.summary(),
+        "total": len(entries),
+        "items": entries,
+    }
+
+
+@router.get(
+    "/api/v3/training-dataset/{filename}/image",
+    summary="获取训练集样本原图",
+    response_class=FileResponse,
+)
+async def get_training_dataset_image(filename: str):
+    from app.ai_detection.dataset_manager import DatasetManager
+
+    manager = DatasetManager()
+    path = await run_in_threadpool(manager.get_image_file, filename)
+    if path is None:
+        raise HTTPException(404, "训练样本不存在")
+    return FileResponse(str(path), media_type=manager.image_media_type(path.name), filename=path.name)
+
+
+@router.get(
+    "/api/v3/training-dataset/{filename}/annotation",
+    summary="获取训练集样本区域标注 JSON",
+)
+async def get_training_dataset_annotation(filename: str):
+    from app.ai_detection.dataset_manager import DatasetManager
+
+    manager = DatasetManager()
+    annotation = await run_in_threadpool(manager.get_annotation, filename)
+    if annotation is None:
+        raise HTTPException(404, "训练样本标注不存在")
+    return {"status": "success", "annotation": annotation}
+
+
+@router.patch(
+    "/api/v3/training-dataset/{filename}",
+    summary="修改训练集样本标签",
+    description="通过重命名样本及其 *_enhanced 配套图、locate_json 标注来修改训练标签。",
+)
+async def update_training_dataset_entry(filename: str, req: DatasetUpdateRequest):
+    from app.ai_detection.dataset_manager import DatasetManager
+
+    manager = DatasetManager()
+    try:
+        entry = await run_in_threadpool(manager.update_label, filename, req.label)
+    except FileExistsError as exc:
+        raise HTTPException(409, str(exc))
+    if entry is None:
+        raise HTTPException(404, "训练样本不存在")
+    return {"status": "success", "entry": entry, "summary": manager.summary()}
+
+
+@router.delete(
+    "/api/v3/training-dataset/{filename}",
+    summary="删除训练集样本",
+    description="删除该样本，默认同时删除同名 *_enhanced 配套图和 locate_json 标注。",
+)
+async def delete_training_dataset_entry(
+    filename: str,
+    delete_family: bool = Query(True, description="是否同时删除同一基础样本的增强图和 JSON 标注"),
+):
+    from app.ai_detection.dataset_manager import DatasetManager
+
+    manager = DatasetManager()
+    removed = await run_in_threadpool(manager.delete_entry, filename, delete_family)
+    if not removed:
+        raise HTTPException(404, "训练样本不存在")
+    return {"status": "success", "summary": manager.summary()}
 
 
 # ---- 训练端点 (含风险提示) ----
