@@ -73,12 +73,17 @@ class _DummyFontLib:
     def __init__(self, similarity=0.2):
 
         self.similarity = similarity
+        self.is_ready = True
 
 
 
     def search_similarity(self, query_feat):
 
         return self.similarity
+
+    def search_similarity_batch(self, query_feats):
+
+        return [self.similarity for _ in query_feats]
 
 
 
@@ -92,7 +97,7 @@ class _DummyPixelDetector:
 
 
 
-    def detect(self, cropped_img_np, quality=85):
+    def detect(self, cropped_img_np, quality=85, **kwargs):
 
         return self.score
 
@@ -150,6 +155,20 @@ class InferenceEngineApiTests(unittest.TestCase):
 
         engine.pixel_detector = _DummyPixelDetector(score=0.1)
 
+        engine._origin_enabled = False
+
+        engine._calibration_temp = 1.0
+
+        engine._metrics = {
+            "total_predictions": 0,
+            "tampered_count": 0,
+            "suspicious_count": 0,
+            "normal_count": 0,
+            "error_count": 0,
+            "total_inference_time_ms": 0.0,
+            "inference_times_ms": [],
+        }
+
         return engine
 
 
@@ -177,8 +196,6 @@ class InferenceEngineApiTests(unittest.TestCase):
         }
 
         engine = self._build_engine()
-
-
 
         result = json.loads(engine.predict("/tmp/mock.jpg", [10, 20, 40, 50], bbox_format="xyxy"))
 
@@ -222,8 +239,6 @@ class InferenceEngineApiTests(unittest.TestCase):
 
         engine = self._build_engine()
 
-
-
         result = json.loads(engine.predict("/tmp/mock.jpg", [10, 20, 40, 50], bbox_format="xyxy"))
 
 
@@ -257,6 +272,9 @@ class InferenceEngineApiTests(unittest.TestCase):
         }
 
         engine = self._build_engine()
+        engine.font_lib = _DummyFontLib(similarity=0.3)
+        engine.global_model = _DummyGlobalModel(tamper_prob=0.7)
+        engine.pixel_detector = _DummyPixelDetector(score=0.8)
 
 
 
@@ -268,6 +286,36 @@ class InferenceEngineApiTests(unittest.TestCase):
 
         self.assertIn("局部字体风格异常", result["reason"])
 
+    def test_file_size_metadata_is_hard_tamper_evidence(self):
+        engine = self._build_engine()
+
+        self.assertTrue(
+            engine._has_hard_metadata_evidence(
+                0.50,
+                ["文件体积/像素比异常(疑似工具导出)"],
+            )
+        )
+
+    def test_structural_metadata_is_hard_tamper_evidence(self):
+        engine = self._build_engine()
+
+        self.assertTrue(
+            engine._has_hard_metadata_evidence(
+                0.55,
+                ["缺少EXIF且图像结构异常(疑似生成图)", "色彩分布过于均匀(疑似生成图或纯色背景)"],
+            )
+        )
+
+    def test_color_uniformity_alone_is_not_hard_tamper_evidence(self):
+        engine = self._build_engine()
+
+        self.assertFalse(
+            engine._has_hard_metadata_evidence(
+                0.55,
+                ["色彩分布过于均匀(疑似生成图或纯色背景)"],
+            )
+        )
+
 
 
 
@@ -275,4 +323,3 @@ class InferenceEngineApiTests(unittest.TestCase):
 if __name__ == "__main__":
 
     unittest.main()
-

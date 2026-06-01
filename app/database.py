@@ -342,6 +342,23 @@ TABLE_STATEMENTS = [
         INDEX idx_wcrp_cat (category_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='库房按品种收货价格';
     """,
+    # 库房按品种收货价格历史（按库房+品类+日期快照；当前有效价同步至 warehouse_category_receipt_prices）
+    """
+    CREATE TABLE IF NOT EXISTS warehouse_category_receipt_price_history (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '主键',
+        warehouse_id INT NOT NULL COMMENT '库房ID',
+        category_id INT NOT NULL COMMENT '品类分组ID（dict_categories.category_id）',
+        price_per_ton DECIMAL(14, 4) NOT NULL COMMENT '库房回收单价(元/吨)',
+        price_date DATE NOT NULL COMMENT '价格日期',
+        source VARCHAR(32) NOT NULL DEFAULT 'manual' COMMENT '来源：import/manual',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        CONSTRAINT fk_wcrph_warehouse FOREIGN KEY (warehouse_id) REFERENCES dict_warehouses (id)
+            ON UPDATE CASCADE ON DELETE CASCADE,
+        UNIQUE KEY uk_wcrph_wh_cat_date (warehouse_id, category_id, price_date),
+        INDEX idx_wcrph_wh_cat_date (warehouse_id, category_id, price_date)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='库房按品种收货价格历史快照';
+    """,
     # 冶炼厂需求主表（预留）
     """
     CREATE TABLE IF NOT EXISTS factory_demands (
@@ -1593,6 +1610,41 @@ def ensure_warehouse_inventory_and_receipt_price_tables() -> None:
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='库房按品种收货价格';
                 """
             )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS warehouse_category_receipt_price_history (
+                    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '主键',
+                    warehouse_id INT NOT NULL COMMENT '库房ID',
+                    category_id INT NOT NULL COMMENT '品类分组ID（dict_categories.category_id）',
+                    price_per_ton DECIMAL(14, 4) NOT NULL COMMENT '库房回收单价(元/吨)',
+                    price_date DATE NOT NULL COMMENT '价格日期',
+                    source VARCHAR(32) NOT NULL DEFAULT 'manual' COMMENT '来源：import/manual',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    CONSTRAINT fk_wcrph_warehouse FOREIGN KEY (warehouse_id) REFERENCES dict_warehouses (id)
+                        ON UPDATE CASCADE ON DELETE CASCADE,
+                    UNIQUE KEY uk_wcrph_wh_cat_date (warehouse_id, category_id, price_date),
+                    INDEX idx_wcrph_wh_cat_date (warehouse_id, category_id, price_date)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='库房按品种收货价格历史快照';
+                """
+            )
+            cursor.execute("SHOW TABLES LIKE 'warehouse_category_receipt_price_history'")
+            if cursor.fetchone():
+                cursor.execute(
+                    """
+                    INSERT IGNORE INTO warehouse_category_receipt_price_history
+                        (warehouse_id, category_id, price_per_ton, price_date, source)
+                    SELECT warehouse_id, category_id, price_per_ton,
+                           COALESCE(DATE(updated_at), DATE(created_at)), 'manual'
+                    FROM warehouse_category_receipt_prices
+                    """
+                )
+                if cursor.rowcount:
+                    logger.info(
+                        "已从 warehouse_category_receipt_prices backfill "
+                        "%s 条收货价格历史",
+                        cursor.rowcount,
+                    )
         connection.commit()
     finally:
         connection.close()

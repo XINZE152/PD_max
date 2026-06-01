@@ -10,37 +10,22 @@ import logging
 import re
 from typing import Any, Optional
 
-from app.ai_detection.easyocr_download_patch import patch_easyocr_download
-from app.ai_detection.runtime_assets import get_easyocr_reader_kwargs
-
 logger = logging.getLogger(__name__)
 
 
 class FeatureExtractor:
-    def __init__(self, reader: Optional[Any] = None):
+    def __init__(self, reader: Optional[Any] = None, preserve_aspect_ratio: bool = True):
         """
-        :param reader: 若传入已初始化的 easyocr.Reader，则复用（与 HTTP 层异步自动框选共用同一份模型，省一份内存）。
+        :param reader: 复用已初始化的 easyocr.Reader，避免双份模型常驻内存
+        :param preserve_aspect_ratio: Resize 前用 PadToSquare 保持宽高比
         """
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         if reader is not None:
             self.reader = reader
         else:
-            try:
-                import easyocr
-            except ModuleNotFoundError as exc:
-                raise ModuleNotFoundError(
-                    "Missing dependency 'easyocr'. Install dependencies with `uv sync` "
-                    "or `pip install easyocr`."
-                ) from exc
+            import easyocr
+            self.reader = easyocr.Reader(['ch_sim', 'en'], gpu=(self.device.type == 'cuda'))
 
-            patch_easyocr_download()
-
-            self.reader = easyocr.Reader(
-                ['ch_sim', 'en'],
-                **get_easyocr_reader_kwargs(gpu=(self.device.type == 'cuda')),
-            )
-
-        # 加载 ResNet 用于提取特征
         resnet = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
         self.feature_extractor = torch.nn.Sequential(*list(resnet.children())[:-1]).to(self.device)
         self.feature_extractor.eval()
@@ -52,12 +37,15 @@ class FeatureExtractor:
             transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
         ])
 
-        self.transform_global = transforms.Compose([
-            transforms.ToPILImage(),
+        global_steps = [transforms.ToPILImage()]
+        if preserve_aspect_ratio:
+            global_steps.append(PadToSquare())
+        global_steps += [
             transforms.Resize((224, 224)),
             transforms.ToTensor(),
-            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-        ])
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ]
+        self.transform_global = transforms.Compose(global_steps)
 
     def extract_global_feature(self, img_np):
         if img_np is None or img_np.size == 0:
@@ -78,8 +66,6 @@ class FeatureExtractor:
 
         valid_stats = []
         tensor_list = []
-
-        # 记录哪些索引是真正需要提取字体特征的（纯数字/金额）
         feature_indices = []
 
         for idx, (bbox, text, conf) in enumerate(ocr_results):
@@ -94,11 +80,8 @@ class FeatureExtractor:
             if x2 <= x1 or y2 <= y1:
                 continue
 
-            # 【核心优化 1：精准打击】
-            # 判断这个框里是不是包含数字（剔除纯汉字如“净重”、“吨”）
             has_digit = bool(re.search(r'\d', text))
 
-            # 保存所有的排版信息（用于检测对齐）
             stat_info = {
                 'text': text,
                 'bbox': [x1, y1, x2, y2],
@@ -107,7 +90,6 @@ class FeatureExtractor:
             }
             valid_stats.append(stat_info)
 
-            # 只有包含数字的框，才截图喂给 ResNet 提特征
             if has_digit:
                 char_img = roi_rgb[y1:y2, x1:x2]
                 if char_img.size > 0:
@@ -115,7 +97,6 @@ class FeatureExtractor:
                     tensor_list.append(tensor)
                     feature_indices.append(idx)
 
-        # Batch 批量推理
         feats_list = []
         if tensor_list:
             batch_tensor = torch.stack(tensor_list).to(self.device)
@@ -161,12 +142,75 @@ class TamperAnalyzer:
 
         return reasons, float(min(0.5, score_penalty))  # 排版惩罚最高不超过 0.5
 
+    @staticmethod
+    def check_cross_roi_consistency(roi_stats_list: list) -> tuple[float, list[str]]:
+        """跨 ROI 一致性分析 — 比较多个候选区域之间的字体特征一致性。
+
+        多个金额区域应具有相似的字体高度、基线对齐和颜色分布。
+        如果某区域与其他区域显著不一致，则可能是拼接篡改。
+        """
+        if len(roi_stats_list) < 2:
+            return 0.0, []
+
+        penalty = 0.0
+        reasons = []
+
+        heights_all = []
+        for stats in roi_stats_list:
+            num_stats = [s for s in stats if s.get('is_core_number', False)]
+            if num_stats:
+                h = [s['bbox'][3] - s['bbox'][1] for s in num_stats]
+                heights_all.append(np.mean(h))
+
+        if len(heights_all) >= 2:
+            h_arr = np.array(heights_all)
+            h_mean = np.mean(h_arr)
+            if h_mean > 0:
+                max_dev = max(abs(h_arr - h_mean)) / h_mean
+                if max_dev > 0.5:
+                    penalty += 0.15
+                    reasons.append("跨区域字体高度不一致(疑似不同来源拼接)")
+
+            y_baselines = []
+            for stats in roi_stats_list:
+                num_stats = [s for s in stats if s.get('is_core_number', False)]
+                if num_stats:
+                    y_baselines.append(np.mean([s['bbox'][1] for s in num_stats]))
+            if len(y_baselines) >= 2:
+                y_arr = np.array(y_baselines)
+                y_std = float(np.std(y_arr))
+                if y_std > 25:
+                    penalty += 0.20
+                    reasons.append("跨区域基线偏移过大(疑似不同行拼接)")
+
+        return float(min(0.4, penalty)), reasons
+
+
+class PadToSquare:
+    """用边缘复制填充为正方形，保持宽高比后再 Resize。"""
+
+    def __call__(self, img):
+        w, h = img.size
+        if w == h:
+            return img
+        size = max(w, h)
+        pad_w = (size - w) // 2
+        pad_h = (size - h) // 2
+        padding = (pad_w, pad_h, size - w - pad_w, size - h - pad_h)
+        import torchvision.transforms.functional as F
+        return F.pad(img, padding, padding_mode="edge")
+
 
 class FontFeatureLibrary:
     def __init__(self, dim=512):
         self.dim = dim
         self.index = faiss.IndexFlatL2(dim)
         self.char_labels = []
+        self._dist_decay: float = 100.0
+
+    @property
+    def is_ready(self) -> bool:
+        return self.index.ntotal > 0
 
     def add(self, feats, texts):
         if len(feats) == 0: return
@@ -177,19 +221,46 @@ class FontFeatureLibrary:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         faiss.write_index(self.index, f"{path}.index")
         with open(f"{path}_meta.pkl", 'wb') as f:
-            pickle.dump({'char_labels': self.char_labels}, f)
+            pickle.dump({"char_labels": self.char_labels, "dist_decay": self._dist_decay}, f)
 
     def load(self, path):
         if not os.path.exists(f"{path}.index"): return False
         self.index = faiss.read_index(f"{path}.index")
-        with open(f"{path}_meta.pkl", 'rb') as f:
+        with open(f"{path}_meta.pkl", "rb") as f:
             meta = pickle.load(f)
-            self.char_labels = meta['char_labels']
+            self.char_labels = meta["char_labels"]
+            self._dist_decay = float(meta.get("dist_decay", 100.0))
         return True
+
+    def _calibrate_decay(self, sample_feats: np.ndarray | None = None):
+        """基于库内距离分布校准衰减系数，使 median 相似度 ≈ 0.5。"""
+        if self.index.ntotal < 2:
+            self._dist_decay = 100.0
+            return
+        if sample_feats is None:
+            n_sample = min(self.index.ntotal, 500)
+            sample_feats = np.array(self.index.reconstruct_n(0, n_sample), dtype=np.float32)
+        if sample_feats.shape[0] < 2:
+            return
+        D, _ = self.index.search(sample_feats, 2)
+        median_dist = float(np.median(D[:, 1]))
+        if median_dist > 0:
+            self._dist_decay = median_dist / np.log(2.0)
 
     def search_similarity(self, query_feat):
         if self.index.ntotal == 0: return 0.5
-        D, I = self.index.search(np.array([query_feat]).astype('float32'), 1)
+        D, _ = self.index.search(np.array([query_feat]).astype("float32"), 1)
         dist = D[0][0]
-        sim = np.exp(-dist / 100.0)
+        sim = np.exp(-dist / max(self._dist_decay, 1.0))
         return float(np.clip(sim, 0.0, 1.0))
+
+    def search_similarity_batch(self, query_feats: list) -> list[float]:
+        """批量查询字体相似度，避免逐条 FAISS 往返开销。"""
+        if not query_feats:
+            return []
+        if self.index.ntotal == 0:
+            return [0.5] * len(query_feats)
+        arr = np.array(query_feats, dtype="float32")
+        D, _ = self.index.search(arr, 1)
+        sims = np.exp(-D[:, 0] / max(self._dist_decay, 1.0))
+        return [float(np.clip(s, 0.0, 1.0)) for s in sims]

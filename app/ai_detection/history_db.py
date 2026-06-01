@@ -12,11 +12,27 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from app.config import UPLOAD_DIR
 from app.database import get_conn
+from app.ai_detection.rule_check_display import build_rule_check_public_summary
 
 logger = logging.getLogger(__name__)
 
 HISTORY_RETENTION_DAYS = int(os.getenv("AI_DETECTION_HISTORY_DAYS", "7"))
 HISTORY_IMAGES_DIR = Path(UPLOAD_DIR) / "ai_detection_history_images"
+HISTORY_ORIGINAL_FILENAME_MAX = 512
+
+
+def normalize_history_original_filename(
+    upload_name: Optional[str],
+    *,
+    fallback_path: str,
+) -> str:
+    """历史记录展示用文件名：优先用户上传名，否则用磁盘路径 basename。"""
+    raw = str(upload_name or "").strip()
+    if raw:
+        name = os.path.basename(raw.replace("\\", "/"))
+        if name and name not in (".", ".."):
+            return name[:HISTORY_ORIGINAL_FILENAME_MAX]
+    return os.path.basename(str(fallback_path))[:HISTORY_ORIGINAL_FILENAME_MAX]
 
 
 def _ensure_history_images_dir() -> None:
@@ -41,6 +57,130 @@ def get_ai_detection_history_image_path(record_id: int) -> Optional[Path]:
     return p if p.is_file() else None
 
 
+def delete_ai_detection_history(record_id: int) -> bool:
+    """删除单条鉴伪历史记录，并清理对应归档图。"""
+    rid = int(record_id)
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT stored_image FROM ai_detection_history WHERE id=%s",
+                (rid,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return False
+            stored_name = row[0]
+            if stored_name:
+                name = str(stored_name)
+                if "/" not in name and "\\" not in name and not name.startswith("."):
+                    fp = HISTORY_IMAGES_DIR / name
+                    try:
+                        if fp.is_file():
+                            fp.unlink()
+                    except OSError as exc:
+                        logger.warning("删除历史归档图失败 %s: %s", fp, exc)
+            cur.execute("DELETE FROM ai_detection_history WHERE id=%s", (rid,))
+            return bool(cur.rowcount)
+
+
+def get_rule_checks_history_by_task_id(task_id: str) -> Optional[Dict[str, Any]]:
+    """按 task_id 返回最近一条 rule_checks 历史（AI+规则 聚合用）。"""
+    tid = str(task_id or "").strip()
+    if not tid:
+        return None
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, task_id, status, outcome_json, original_filename, created_at
+                FROM ai_detection_history
+                WHERE task_id=%s AND mode='rule_checks' AND status='COMPLETED'
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (tid,),
+            )
+            row = cur.fetchone()
+    if not row:
+        return None
+
+    rid, _task_id, status, outcome_json, original_filename, created_at = row
+    try:
+        outcome = json.loads(outcome_json) if isinstance(outcome_json, str) else _jsonish(outcome_json)
+    except json.JSONDecodeError:
+        outcome = {}
+
+    created_text = created_at.isoformat(sep=" ", timespec="seconds") if hasattr(created_at, "isoformat") else created_at
+    return {
+        "id": int(rid),
+        "task_id": _task_id,
+        "status": status,
+        "outcome": outcome or {},
+        "original_filename": original_filename,
+        "created_at": created_text,
+    }
+
+
+def get_async_v3_history_by_task_id(task_id: str) -> Optional[Dict[str, Any]]:
+    """按 task_id 返回最近一条 async_v3 历史（任意 status），供重启后恢复任务结果。"""
+    tid = str(task_id or "").strip()
+    if not tid:
+        return None
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, task_id, status, outcome_json, stored_image, original_filename,
+                       created_at, bbox
+                FROM ai_detection_history
+                WHERE task_id=%s AND mode='async_v3'
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (tid,),
+            )
+            row = cur.fetchone()
+    if not row:
+        return None
+
+    (
+        rid,
+        _task_id,
+        status,
+        outcome_json,
+        stored_image,
+        original_filename,
+        created_at,
+        bbox_raw,
+    ) = row
+    try:
+        outcome = json.loads(outcome_json) if isinstance(outcome_json, str) else _jsonish(outcome_json)
+    except json.JSONDecodeError:
+        outcome = {}
+    bbox_val = bbox_raw
+    if isinstance(bbox_val, str):
+        try:
+            bbox_val = json.loads(bbox_val)
+        except json.JSONDecodeError:
+            bbox_val = None
+
+    created_text = (
+        created_at.isoformat(sep=" ", timespec="seconds")
+        if hasattr(created_at, "isoformat")
+        else str(created_at or "")
+    )
+    return {
+        "id": int(rid),
+        "task_id": _task_id,
+        "status": status,
+        "outcome": outcome or {},
+        "stored_image": stored_image,
+        "original_filename": original_filename,
+        "created_at": created_text,
+        "bbox": bbox_val,
+    }
+
+
 def get_latest_ai_detection_history_by_task_id(task_id: str) -> Optional[Dict[str, Any]]:
     """按异步 task_id 返回最近一条成功历史及归档图路径，用于任务内存丢失后的兜底读取。"""
     tid = str(task_id or "").strip()
@@ -52,7 +192,7 @@ def get_latest_ai_detection_history_by_task_id(task_id: str) -> Optional[Dict[st
                 """
                 SELECT id, task_id, status, outcome_json, stored_image
                 FROM ai_detection_history
-                WHERE task_id=%s AND status='COMPLETED'
+                WHERE task_id=%s AND mode='async_v3' AND status='COMPLETED'
                 ORDER BY id DESC
                 LIMIT 1
                 """,
@@ -252,6 +392,13 @@ def list_ai_detection_history(
                 outcome_obj = item.get("outcome")
                 if isinstance(outcome_obj, dict) and isinstance(outcome_obj.get("summary"), dict):
                     item["summary"] = outcome_obj["summary"]
+                linked_task_id = item.get("task_id")
+                if item.get("mode") == "async_v3" and linked_task_id:
+                    rule_row = get_rule_checks_history_by_task_id(str(linked_task_id))
+                    if rule_row:
+                        item["linked_rule_checks"] = build_rule_check_public_summary(rule_row.get("outcome") or {})
+                    else:
+                        item["linked_rule_checks"] = None
                 rid = item.get("id")
                 stored = item.pop("stored_image", None)
                 if stored and rid is not None:

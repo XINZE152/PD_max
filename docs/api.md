@@ -662,6 +662,64 @@ file: [报价单1.jpg]
 
 ---
 
+## 接口7e：永久删除品类分组（硬删除）
+- 方法：`DELETE`
+- 路由：`/tl/purge_category`
+- 传入（Query）：
+  - **`品类id`**（必填，`category_id`）
+  - **`cascade`**（可选，默认 `true`）：`true` 时同一事务内级联删除关联子表与 `quote_details` 后再物理删字典行；`false` 时仅当无任何子表引用才删组，否则 409
+- **前置条件**：该分组下**全部别名须已软删除**（`is_active=0`）；仍有启用中别名时返回 **400**
+- 级联清理范围（`cascade=true`）：`factory_demand_items`、`warehouse_inventories`（按组内 `row_id`）、`warehouse_inventory_snapshots`、`warehouse_category_receipt_prices`、`warehouse_category_receipt_price_history`（按 `category_id`）、`quote_details`（按组内全部 `name`）、`dict_categories`
+- 模拟请求：`DELETE /tl/purge_category?品类id=304`
+- 模拟返回JSON：
+```json
+{
+  "code": 200,
+  "msg": "已永久删除品类分组 id=304，并清除关联数据（见 deleted_counts）",
+  "cascade": true,
+  "deleted_counts": {
+    "factory_demand_items": 0,
+    "warehouse_inventories": 0,
+    "warehouse_inventory_snapshots": 2,
+    "warehouse_category_receipt_prices": 1,
+    "warehouse_category_receipt_price_history": 2,
+    "quote_details": 15,
+    "dict_categories": 2
+  }
+}
+```
+
+---
+
+## 接口7f：永久删除单条品类别名（硬删除）
+- 方法：`DELETE`
+- 路由：`/tl/purge_category_row`
+- 传入（Query）：
+  - **`行id`**（必填，`row_id`）
+  - **`cascade`**（可选，默认 `true`）
+- **前置条件**：该行须已软删除（`is_active=0`）；仍为启用状态时返回 **400**
+- 级联逻辑（`cascade=true`）：删该行关联的 `factory_demand_items`、`warehouse_inventories`、`quote_details`（按该别名 `name`）；若删后该 `category_id` 下无剩余行，顺带删 `warehouse_inventory_snapshots` / `warehouse_category_receipt_prices` / `warehouse_category_receipt_price_history`
+- 模拟请求：`DELETE /tl/purge_category_row?行id=3`
+- 模拟返回JSON：
+```json
+{
+  "code": 200,
+  "msg": "已永久删除品类别名 行id=3",
+  "cascade": true,
+  "deleted_counts": {
+    "factory_demand_items": 0,
+    "warehouse_inventories": 0,
+    "warehouse_inventory_snapshots": 0,
+    "warehouse_category_receipt_prices": 0,
+    "warehouse_category_receipt_price_history": 0,
+    "quote_details": 5,
+    "dict_categories": 1
+  }
+}
+```
+
+---
+
 ## 接口T1：获取税率表
 - 方法：`GET`
 - 路由：`/tl/get_tax_rates`
@@ -934,6 +992,11 @@ file: [报价单1.jpg]
 | 省份对标定价列表 | GET | `/tl/province_benchmark_prices` |
 | 新增 / 改 / 删省份对标定价 | POST、PUT、DELETE | `/tl/province_benchmark_prices`、`/tl/province_benchmark_prices/{price_id}` |
 | 冶炼厂标定价格 CRUD | GET/POST/PUT/DELETE | `/tl/smelter_calibration_prices`、`.../{price_id}` |
+| 库房库存列表 / 录入 / 删除某日快照 | GET/POST/DELETE | `/tl/warehouse_inventories` |
+| 库房库存 Excel 导入 / 模板 | POST/GET | `/tl/import_warehouse_inventory_excel`、`/tl/download_warehouse_inventory_template_excel` |
+| 库房按品种收货价格（当前最新价） | GET/POST/PUT/DELETE | `/tl/warehouse_receipt_prices`、`.../{price_id}` |
+| 库房按品种收货价格历史 | GET/DELETE | `/tl/warehouse_receipt_price_history`、`.../{history_id}` |
+| 库房收货价格 Excel 导入 / 模板 | POST/GET | `/tl/import_warehouse_receipt_prices_excel`、`/tl/download_warehouse_receipt_prices_template_excel` |
 | 库房差额与毛利配置 CRUD | GET/POST/PUT/DELETE | `/tl/warehouse_spread_configs`、`.../{config_id}` |
 | 实时 AI 对标分析（不落库） | GET | `/tl/ai_pricing_analysis` |
 | 快照列表 / 创建 / 详情 / 更新元数据 / 删除 | GET/POST/PUT/DELETE | `/tl/ai_pricing_snapshots`、`/tl/ai_pricing_snapshots/{snapshot_id}` |

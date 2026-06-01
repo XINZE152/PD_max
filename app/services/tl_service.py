@@ -2,6 +2,7 @@
 TL比价模块服务层
 负责仓库、冶炼厂、品类、比价、运费、价格表、品类映射等数据库操作
 """
+import difflib
 import hashlib
 import io
 import json
@@ -282,6 +283,46 @@ def _cell_json(v: Any) -> Any:
     if isinstance(v, date):
         return v.isoformat()
     return v
+
+
+def _compact_dict_name(s: str) -> str:
+    """去掉首尾与中间空白（含全角空格），用于库房名称宽松比较。"""
+    return re.sub(r"[\s\u3000]+", "", (s or "").strip())
+
+
+def _rank_warehouse_name_match(query: str, dict_name: str) -> Tuple[int, int]:
+    """分数越小越好；第二项用于同档排序。"""
+    q, n = query.strip(), dict_name.strip()
+    if not q:
+        return (99, 0)
+    if n == q:
+        return (0, 0)
+    qc, nc = _compact_dict_name(q), _compact_dict_name(n)
+    if qc and nc == qc:
+        return (1, 0)
+    if n and n in q:
+        return (2, -len(n))
+    if q and q in n:
+        return (3, len(n))
+    return (9, len(n))
+
+
+def _aggregate_import_skip_reasons(errors: List[str]) -> Dict[str, int]:
+    """从导入错误文案聚合跳过原因统计。"""
+    reasons: Dict[str, int] = {}
+    for err in errors:
+        if "回收品种" in err and "已停用" in err:
+            key = "品类已停用"
+        elif "回收品种" in err and "不存在" in err:
+            key = "品类不存在"
+        elif "匹配到多个库房" in err:
+            key = "库房歧义"
+        elif "库房名称" in err and "不存在" in err:
+            key = "库房不存在"
+        else:
+            key = "其他"
+        reasons[key] = reasons.get(key, 0) + 1
+    return reasons
 
 
 def _json_cell_to_dict(val: Any) -> Optional[Dict[str, Any]]:
@@ -5688,6 +5729,437 @@ class TLService:
             logger.error(f"删除品类别名失败: {e}")
             raise
 
+    # ==================== 接口7e/7f：品类硬删除 ====================
+
+    def _fetch_category_group_rows(
+        self, cur, category_id: int
+    ) -> List[Tuple[int, str, int]]:
+        cur.execute(
+            "SELECT row_id, name, is_active FROM dict_categories "
+            "WHERE category_id = %s ORDER BY row_id",
+            (category_id,),
+        )
+        return [(int(r[0]), str(r[1]), int(r[2])) for r in cur.fetchall()]
+
+    def _category_child_counts(
+        self,
+        cur,
+        *,
+        category_id: Optional[int] = None,
+        row_ids: Optional[List[int]] = None,
+        names: Optional[List[str]] = None,
+        count_group_snapshots: bool = False,
+    ) -> Dict[str, int]:
+        counts: Dict[str, int] = {
+            "factory_demand_items": 0,
+            "warehouse_inventories": 0,
+            "warehouse_inventory_snapshots": 0,
+            "warehouse_category_receipt_prices": 0,
+            "warehouse_category_receipt_price_history": 0,
+            "quote_details": 0,
+            "dict_categories": 0,
+        }
+        if row_ids:
+            ph = ",".join(["%s"] * len(row_ids))
+            cur.execute(
+                f"SELECT COUNT(*) FROM factory_demand_items WHERE category_id IN ({ph})",
+                tuple(row_ids),
+            )
+            counts["factory_demand_items"] = int(cur.fetchone()[0] or 0)
+            cur.execute(
+                f"SELECT COUNT(*) FROM warehouse_inventories WHERE category_id IN ({ph})",
+                tuple(row_ids),
+            )
+            counts["warehouse_inventories"] = int(cur.fetchone()[0] or 0)
+            cur.execute(
+                f"SELECT COUNT(*) FROM dict_categories WHERE row_id IN ({ph})",
+                tuple(row_ids),
+            )
+            counts["dict_categories"] = int(cur.fetchone()[0] or 0)
+        if names:
+            ph = ",".join(["%s"] * len(names))
+            cur.execute(
+                f"SELECT COUNT(*) FROM quote_details WHERE category_name IN ({ph})",
+                tuple(names),
+            )
+            counts["quote_details"] = int(cur.fetchone()[0] or 0)
+        if count_group_snapshots and category_id is not None:
+            cur.execute(
+                "SELECT COUNT(*) FROM warehouse_inventory_snapshots WHERE category_id = %s",
+                (category_id,),
+            )
+            counts["warehouse_inventory_snapshots"] = int(cur.fetchone()[0] or 0)
+            cur.execute(
+                "SELECT COUNT(*) FROM warehouse_category_receipt_prices WHERE category_id = %s",
+                (category_id,),
+            )
+            counts["warehouse_category_receipt_prices"] = int(cur.fetchone()[0] or 0)
+            cur.execute(
+                "SELECT COUNT(*) FROM warehouse_category_receipt_price_history WHERE category_id = %s",
+                (category_id,),
+            )
+            counts["warehouse_category_receipt_price_history"] = int(
+                cur.fetchone()[0] or 0
+            )
+        return counts
+
+    def _purge_category_group_children(
+        self,
+        cur,
+        category_id: int,
+        row_ids: List[int],
+        names: List[str],
+        *,
+        delete_group_snapshots: bool,
+    ) -> None:
+        if row_ids:
+            ph = ",".join(["%s"] * len(row_ids))
+            cur.execute(
+                f"DELETE FROM factory_demand_items WHERE category_id IN ({ph})",
+                tuple(row_ids),
+            )
+            cur.execute(
+                f"DELETE FROM warehouse_inventories WHERE category_id IN ({ph})",
+                tuple(row_ids),
+            )
+        if names:
+            ph = ",".join(["%s"] * len(names))
+            cur.execute(
+                f"DELETE FROM quote_details WHERE category_name IN ({ph})",
+                tuple(names),
+            )
+        if delete_group_snapshots:
+            cur.execute(
+                "DELETE FROM warehouse_inventory_snapshots WHERE category_id = %s",
+                (category_id,),
+            )
+            cur.execute(
+                "DELETE FROM warehouse_category_receipt_prices WHERE category_id = %s",
+                (category_id,),
+            )
+            cur.execute(
+                "DELETE FROM warehouse_category_receipt_price_history WHERE category_id = %s",
+                (category_id,),
+            )
+
+    def _purge_category_cascade(self, cur, category_id: int) -> Dict[str, int]:
+        rows = self._fetch_category_group_rows(cur, category_id)
+        if not rows:
+            raise ValueError(f"品类 id={category_id} 不存在")
+        active = [r for r in rows if r[2] == 1]
+        if active:
+            active_names = "、".join(r[1] for r in active)
+            raise ValueError(
+                f"品类 id={category_id} 仍有启用中的别名（{active_names}），"
+                "请先调用软删除接口 delete_category 或 delete_category_row"
+            )
+        row_ids = [r[0] for r in rows]
+        names = [r[1] for r in rows]
+        counts = self._category_child_counts(
+            cur,
+            category_id=category_id,
+            row_ids=row_ids,
+            names=names,
+            count_group_snapshots=True,
+        )
+        self._purge_category_group_children(
+            cur,
+            category_id,
+            row_ids,
+            names,
+            delete_group_snapshots=True,
+        )
+        cur.execute(
+            "DELETE FROM dict_categories WHERE category_id = %s",
+            (category_id,),
+        )
+        if cur.rowcount == 0:
+            raise ValueError(f"品类 id={category_id} 删除失败")
+        return counts
+
+    def purge_category(self, category_id: int, *, cascade: bool = True) -> Dict[str, Any]:
+        """物理删除品类分组；仅允许 is_active=0 的全组别名。"""
+        if category_id < 1:
+            raise ValueError("品类id 无效")
+        try:
+            if cascade:
+                with get_conn() as conn:
+                    conn.autocommit(False)
+                    try:
+                        with conn.cursor() as cur:
+                            rows = self._fetch_category_group_rows(cur, category_id)
+                            if not rows:
+                                raise ValueError(f"品类 id={category_id} 不存在")
+                            deleted_counts = self._purge_category_cascade(
+                                cur, category_id
+                            )
+                        conn.commit()
+                    except Exception:
+                        conn.rollback()
+                        raise
+                log_finance_event(
+                    "品类硬删除(级联) | category_id=%s | 删 demand_items=%s "
+                    "inventories=%s snapshots=%s receipt_prices=%s "
+                    "receipt_price_history=%s quote_details=%s dict_categories=%s",
+                    category_id,
+                    deleted_counts["factory_demand_items"],
+                    deleted_counts["warehouse_inventories"],
+                    deleted_counts["warehouse_inventory_snapshots"],
+                    deleted_counts["warehouse_category_receipt_prices"],
+                    deleted_counts["warehouse_category_receipt_price_history"],
+                    deleted_counts["quote_details"],
+                    deleted_counts["dict_categories"],
+                )
+                return {
+                    "code": 200,
+                    "msg": (
+                        f"已永久删除品类分组 id={category_id}，"
+                        "并清除关联数据（见 deleted_counts）"
+                    ),
+                    "cascade": True,
+                    "deleted_counts": deleted_counts,
+                }
+
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    rows = self._fetch_category_group_rows(cur, category_id)
+                    if not rows:
+                        raise ValueError(f"品类 id={category_id} 不存在")
+                    active = [r for r in rows if r[2] == 1]
+                    if active:
+                        raise ValueError(
+                            f"品类 id={category_id} 仍有启用中的别名，请先软删除"
+                        )
+                    row_ids = [r[0] for r in rows]
+                    names = [r[1] for r in rows]
+                    counts = self._category_child_counts(
+                        cur,
+                        category_id=category_id,
+                        row_ids=row_ids,
+                        names=names,
+                        count_group_snapshots=True,
+                    )
+                    total_children = (
+                        counts["factory_demand_items"]
+                        + counts["warehouse_inventories"]
+                        + counts["warehouse_inventory_snapshots"]
+                        + counts["warehouse_category_receipt_prices"]
+                        + counts["warehouse_category_receipt_price_history"]
+                        + counts["quote_details"]
+                    )
+                    if total_children > 0:
+                        raise ValueError(
+                            "已指定 cascade=false（仅当无子表引用时才删组）。"
+                            f"品类 id={category_id} 仍存在关联："
+                            f"demand_items={counts['factory_demand_items']}, "
+                            f"inventories={counts['warehouse_inventories']}, "
+                            f"snapshots={counts['warehouse_inventory_snapshots']}, "
+                            f"receipt_prices={counts['warehouse_category_receipt_prices']}, "
+                            f"receipt_price_history={counts['warehouse_category_receipt_price_history']}, "
+                            f"quote_details={counts['quote_details']}。"
+                            "默认删除会级联清空上述数据，请勿传 cascade=false；"
+                            "或先手工清理子表。"
+                        )
+                    cur.execute(
+                        "DELETE FROM dict_categories WHERE category_id = %s",
+                        (category_id,),
+                    )
+                    if cur.rowcount == 0:
+                        raise ValueError(f"品类 id={category_id} 删除失败")
+            return {
+                "code": 200,
+                "msg": "品类分组已永久删除（cascade=false 且无关联子表）",
+                "cascade": False,
+            }
+        except ValueError:
+            raise
+        except Exception as e:
+            logger.error(f"硬删除品类分组失败: {e}")
+            raise
+
+    def purge_category_row(self, row_id: int, *, cascade: bool = True) -> Dict[str, Any]:
+        """物理删除单条品类别名；仅允许 is_active=0。"""
+        if row_id < 1:
+            raise ValueError("行id 无效")
+        try:
+            if cascade:
+                with get_conn() as conn:
+                    conn.autocommit(False)
+                    try:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                "SELECT row_id, category_id, name, is_active "
+                                "FROM dict_categories WHERE row_id = %s",
+                                (row_id,),
+                            )
+                            row = cur.fetchone()
+                            if not row:
+                                raise ValueError(
+                                    f"品类别名不存在: 行id={row_id}"
+                                )
+                            _rid, cat_id, name, is_active = (
+                                int(row[0]),
+                                int(row[1]),
+                                str(row[2]),
+                                int(row[3]),
+                            )
+                            if is_active == 1:
+                                raise ValueError(
+                                    f"行id={row_id} 仍为启用状态，"
+                                    "请先调用软删除接口 delete_category_row"
+                                )
+                            row_ids = [row_id]
+                            names = [name]
+                            counts = self._category_child_counts(
+                                cur,
+                                row_ids=row_ids,
+                                names=names,
+                            )
+                            cur.execute(
+                                "SELECT COUNT(*) FROM dict_categories "
+                                "WHERE category_id = %s",
+                                (cat_id,),
+                            )
+                            remaining_before = int(cur.fetchone()[0] or 0)
+                            is_last_row = remaining_before <= 1
+                            if is_last_row:
+                                snap_counts = self._category_child_counts(
+                                    cur,
+                                    category_id=cat_id,
+                                    count_group_snapshots=True,
+                                )
+                                counts["warehouse_inventory_snapshots"] = snap_counts[
+                                    "warehouse_inventory_snapshots"
+                                ]
+                                counts["warehouse_category_receipt_prices"] = snap_counts[
+                                    "warehouse_category_receipt_prices"
+                                ]
+                                counts["warehouse_category_receipt_price_history"] = snap_counts[
+                                    "warehouse_category_receipt_price_history"
+                                ]
+                            self._purge_category_group_children(
+                                cur,
+                                cat_id,
+                                row_ids,
+                                names,
+                                delete_group_snapshots=is_last_row,
+                            )
+                            cur.execute(
+                                "DELETE FROM dict_categories WHERE row_id = %s",
+                                (row_id,),
+                            )
+                            if cur.rowcount == 0:
+                                raise ValueError(
+                                    f"品类别名删除失败: 行id={row_id}"
+                                )
+                            counts["dict_categories"] = 1
+                        conn.commit()
+                    except Exception:
+                        conn.rollback()
+                        raise
+                log_finance_event(
+                    "品类别名硬删除(级联) | row_id=%s category_id=%s name=%s | "
+                    "删 demand_items=%s inventories=%s snapshots=%s "
+                    "receipt_prices=%s quote_details=%s",
+                    row_id,
+                    cat_id,
+                    name,
+                    counts["factory_demand_items"],
+                    counts["warehouse_inventories"],
+                    counts["warehouse_inventory_snapshots"],
+                    counts["warehouse_category_receipt_prices"],
+                    counts["quote_details"],
+                )
+                return {
+                    "code": 200,
+                    "msg": f"已永久删除品类别名 行id={row_id}",
+                    "cascade": True,
+                    "deleted_counts": counts,
+                }
+
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT row_id, category_id, name, is_active "
+                        "FROM dict_categories WHERE row_id = %s",
+                        (row_id,),
+                    )
+                    row = cur.fetchone()
+                    if not row:
+                        raise ValueError(f"品类别名不存在: 行id={row_id}")
+                    _rid, cat_id, name, is_active = (
+                        int(row[0]),
+                        int(row[1]),
+                        str(row[2]),
+                        int(row[3]),
+                    )
+                    if is_active == 1:
+                        raise ValueError(
+                            f"行id={row_id} 仍为启用状态，请先软删除"
+                        )
+                    counts = self._category_child_counts(
+                        cur,
+                        row_ids=[row_id],
+                        names=[name],
+                    )
+                    cur.execute(
+                        "SELECT COUNT(*) FROM dict_categories WHERE category_id = %s",
+                        (cat_id,),
+                    )
+                    remaining_before = int(cur.fetchone()[0] or 0)
+                    if remaining_before <= 1:
+                        snap_counts = self._category_child_counts(
+                            cur,
+                            category_id=cat_id,
+                            count_group_snapshots=True,
+                        )
+                        counts["warehouse_inventory_snapshots"] = snap_counts[
+                            "warehouse_inventory_snapshots"
+                        ]
+                        counts["warehouse_category_receipt_prices"] = snap_counts[
+                            "warehouse_category_receipt_prices"
+                        ]
+                        counts["warehouse_category_receipt_price_history"] = snap_counts[
+                            "warehouse_category_receipt_price_history"
+                        ]
+                    total_children = (
+                        counts["factory_demand_items"]
+                        + counts["warehouse_inventories"]
+                        + counts["warehouse_inventory_snapshots"]
+                        + counts["warehouse_category_receipt_prices"]
+                        + counts["warehouse_category_receipt_price_history"]
+                        + counts["quote_details"]
+                    )
+                    if total_children > 0:
+                        raise ValueError(
+                            "已指定 cascade=false（仅当无子表引用时才删别名）。"
+                            f"行id={row_id} 仍存在关联："
+                            f"demand_items={counts['factory_demand_items']}, "
+                            f"inventories={counts['warehouse_inventories']}, "
+                            f"snapshots={counts['warehouse_inventory_snapshots']}, "
+                            f"receipt_prices={counts['warehouse_category_receipt_prices']}, "
+                            f"receipt_price_history={counts['warehouse_category_receipt_price_history']}, "
+                            f"quote_details={counts['quote_details']}。"
+                            "默认删除会级联清空上述数据，请勿传 cascade=false；"
+                            "或先手工清理子表。"
+                        )
+                    cur.execute(
+                        "DELETE FROM dict_categories WHERE row_id = %s",
+                        (row_id,),
+                    )
+                    if cur.rowcount == 0:
+                        raise ValueError(f"品类别名删除失败: 行id={row_id}")
+            return {
+                "code": 200,
+                "msg": "品类别名已永久删除（cascade=false 且无关联子表）",
+                "cascade": False,
+            }
+        except ValueError:
+            raise
+        except Exception as e:
+            logger.error(f"硬删除品类别名失败: {e}")
+            raise
+
     # ==================== 接口A7：采购建议 ====================
 
     def get_purchase_suggestion(
@@ -7375,6 +7847,51 @@ class TLService:
             return None, "ambiguous"
         return None, "missing"
 
+    @staticmethod
+    def _load_warehouse_fuzzy_candidates(cur) -> List[Tuple[int, str]]:
+        cur.execute(
+            "SELECT id, name FROM dict_warehouses "
+            "WHERE name IS NOT NULL AND TRIM(name) <> ''"
+        )
+        return [(int(r[0]), str(r[1]).strip()) for r in cur.fetchall()]
+
+    @staticmethod
+    def _fuzzy_match_warehouse_id_from_candidates(
+        excel_name: str,
+        candidates: List[Tuple[int, str]],
+    ) -> Tuple[Optional[int], str]:
+        name = excel_name.strip()
+        if len(name) < 2:
+            return None, "missing"
+        ranked: List[Tuple[Tuple[int, int], int]] = []
+        for wid, db_name in candidates:
+            rank = _rank_warehouse_name_match(name, db_name)
+            if rank[0] >= 9:
+                continue
+            ranked.append((rank, wid))
+        if not ranked:
+            return None, "missing"
+        ranked.sort(key=lambda x: x[0])
+        best_rank = ranked[0][0]
+        best_ids = [wid for rank, wid in ranked if rank == best_rank]
+        if len(set(best_ids)) > 1:
+            return None, "ambiguous"
+        return best_ids[0], "fuzzy"
+
+    def _match_warehouse_id_for_import(
+        self,
+        excel_name: str,
+        exact: Dict[str, int],
+        canon: Dict[str, List[int]],
+        fuzzy_candidates: List[Tuple[int, str]],
+    ) -> Tuple[Optional[int], str]:
+        wh_id, match_kind = self._match_warehouse_id(excel_name, exact, canon)
+        if wh_id is not None or match_kind == "ambiguous":
+            return wh_id, match_kind
+        return self._fuzzy_match_warehouse_id_from_candidates(
+            excel_name, fuzzy_candidates
+        )
+
     def _load_warehouse_price_map(self, cur) -> Dict[int, Decimal]:
         cur.execute(
             "SELECT warehouse_id, warehouse_price FROM pd_warehouse_spread_configs "
@@ -8230,6 +8747,65 @@ class TLService:
             },
         }
 
+    def delete_warehouse_inventory(
+        self,
+        *,
+        warehouse_id: int,
+        inventory_date: str,
+        category_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        if warehouse_id < 1:
+            raise ValueError("库房 id 无效")
+        inv_day = date.fromisoformat(str(inventory_date).strip())
+        with get_conn() as conn:
+            conn.autocommit(False)
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT id FROM dict_warehouses WHERE id = %s AND is_active = 1",
+                        (int(warehouse_id),),
+                    )
+                    if not cur.fetchone():
+                        raise ValueError("库房不存在或已停用")
+                    if category_id is not None:
+                        self._validate_warehouse_category_for_inventory(
+                            cur, int(warehouse_id), int(category_id)
+                        )
+                        cur.execute(
+                            """
+                            DELETE FROM warehouse_inventory_snapshots
+                            WHERE warehouse_id = %s AND inventory_date = %s
+                                AND category_id = %s
+                            """,
+                            (int(warehouse_id), inv_day, int(category_id)),
+                        )
+                    else:
+                        cur.execute(
+                            """
+                            DELETE FROM warehouse_inventory_snapshots
+                            WHERE warehouse_id = %s AND inventory_date = %s
+                            """,
+                            (int(warehouse_id), inv_day),
+                        )
+                    deleted_count = int(cur.rowcount)
+                    if deleted_count == 0:
+                        raise ValueError("该日期无库存记录")
+                    self._sync_warehouse_current_inventory_from_snapshot(
+                        cur, int(warehouse_id)
+                    )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        data: Dict[str, Any] = {
+            "deleted_count": deleted_count,
+            "库房id": int(warehouse_id),
+            "库存日期": inv_day.isoformat(),
+        }
+        if category_id is not None:
+            data["品类id"] = int(category_id)
+        return {"code": 200, "msg": "库存记录已删除", "data": data}
+
     def import_warehouse_inventory_excel(
         self, content: bytes, *, overwrite: bool = True
     ) -> Dict[str, Any]:
@@ -8253,10 +8829,11 @@ class TLService:
             try:
                 with conn.cursor() as cur:
                     exact, canon, _provinces = self._load_warehouse_match_indexes(cur)
+                    fuzzy_wh = self._load_warehouse_fuzzy_candidates(cur)
                     for row in parsed_rows:
                         try:
-                            wh_id, match_kind = self._match_warehouse_id(
-                                row.warehouse_name, exact, canon
+                            wh_id, match_kind = self._match_warehouse_id_for_import(
+                                row.warehouse_name, exact, canon, fuzzy_wh
                             )
                             if wh_id is None:
                                 if match_kind == "ambiguous":
@@ -8325,7 +8902,13 @@ class TLService:
         return {
             "code": 200,
             "msg": msg,
-            "data": {**meta, **stats, "errors": errors[:50], "samples": samples},
+            "data": {
+                **meta,
+                **stats,
+                "skip_reasons": _aggregate_import_skip_reasons(errors),
+                "errors": errors[:50],
+                "samples": samples,
+            },
         }
 
     def download_warehouse_inventory_template_excel(self) -> bytes:
@@ -8342,18 +8925,140 @@ class TLService:
 
     # ==================== 库房按品种收货价格 ====================
 
+    def _upsert_warehouse_receipt_price_history(
+        self,
+        cur,
+        *,
+        warehouse_id: int,
+        category_id: int,
+        price_per_ton: float,
+        price_date: date,
+        source: str = "manual",
+    ) -> int:
+        cur.execute(
+            """
+            INSERT INTO warehouse_category_receipt_price_history
+            (warehouse_id, category_id, price_per_ton, price_date, source)
+            VALUES (%s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                price_per_ton = VALUES(price_per_ton),
+                source = VALUES(source),
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (int(warehouse_id), int(category_id), price_per_ton, price_date, source),
+        )
+        history_id = int(cur.lastrowid)
+        if history_id == 0:
+            cur.execute(
+                """
+                SELECT id FROM warehouse_category_receipt_price_history
+                WHERE warehouse_id = %s AND category_id = %s AND price_date = %s
+                """,
+                (int(warehouse_id), int(category_id), price_date),
+            )
+            row = cur.fetchone()
+            history_id = int(row[0]) if row else 0
+        return history_id
+
+    def _sync_warehouse_receipt_price_from_history(
+        self, cur, warehouse_id: int, category_id: int
+    ) -> None:
+        cur.execute(
+            """
+            SELECT wcrph.price_per_ton
+            FROM warehouse_category_receipt_price_history wcrph
+            INNER JOIN (
+                SELECT warehouse_id, category_id, MAX(price_date) AS max_date
+                FROM warehouse_category_receipt_price_history
+                WHERE warehouse_id = %s AND category_id = %s
+                GROUP BY warehouse_id, category_id
+            ) latest ON wcrph.warehouse_id = latest.warehouse_id
+                AND wcrph.category_id = latest.category_id
+                AND wcrph.price_date = latest.max_date
+            WHERE wcrph.warehouse_id = %s AND wcrph.category_id = %s
+            LIMIT 1
+            """,
+            (int(warehouse_id), int(category_id), int(warehouse_id), int(category_id)),
+        )
+        row = cur.fetchone()
+        if row:
+            cur.execute(
+                """
+                INSERT INTO warehouse_category_receipt_prices
+                (warehouse_id, category_id, price_per_ton)
+                VALUES (%s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    price_per_ton = VALUES(price_per_ton),
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (int(warehouse_id), int(category_id), row[0]),
+            )
+        else:
+            cur.execute(
+                """
+                DELETE FROM warehouse_category_receipt_prices
+                WHERE warehouse_id = %s AND category_id = %s
+                """,
+                (int(warehouse_id), int(category_id)),
+            )
+
     def _resolve_category_id_by_name(self, cur, category_name: str) -> int:
         name = str(category_name).strip()
         if not name:
             raise ValueError("回收品种不能为空")
+
         cur.execute(
             "SELECT category_id FROM dict_categories WHERE name = %s AND is_active = 1",
             (name,),
         )
         row = cur.fetchone()
-        if not row:
-            raise ValueError(f"回收品种「{name}」不存在")
-        return int(row[0])
+        if row:
+            return int(row[0])
+
+        cur.execute(
+            "SELECT category_id, is_active FROM dict_categories WHERE name = %s",
+            (name,),
+        )
+        inactive = cur.fetchone()
+        if inactive:
+            if inactive[1] != 1:
+                raise ValueError(
+                    f"回收品种「{name}」已停用，请先在品类管理中启用后再导入"
+                )
+            return int(inactive[0])
+
+        cur.execute(
+            "SELECT category_id, name FROM dict_categories WHERE is_active = 1"
+        )
+        active_rows = cur.fetchall()
+        active_names = [str(r[1]).strip() for r in active_rows if r[1]]
+
+        best_cid: Optional[int] = None
+        best_db_len = -1
+        for category_id, db_name in active_rows:
+            n = str(db_name or "").strip()
+            if len(n) < 2 or name not in n:
+                continue
+            if len(n) > best_db_len:
+                best_db_len = len(n)
+                best_cid = int(category_id)
+        if best_cid is not None:
+            return best_cid
+
+        fuzzy_cid = self._fuzzy_match_quote_category_id_from_rows(active_rows, name)
+        if fuzzy_cid is not None:
+            return fuzzy_cid
+
+        close = difflib.get_close_matches(name, active_names, n=1, cutoff=0.75)
+        if close:
+            matched = close[0]
+            for category_id, db_name in active_rows:
+                if str(db_name).strip() == matched:
+                    return int(category_id)
+
+        hints = difflib.get_close_matches(name, active_names, n=3, cutoff=0.5)
+        hint = f"；最接近：{'、'.join(hints)}" if hints else ""
+        raise ValueError(f"回收品种「{name}」不存在{hint}")
 
     def list_warehouse_receipt_prices(
         self,
@@ -8385,7 +9090,7 @@ class TLService:
             with conn.cursor() as cur:
                 cur.execute(
                     f"""
-                    SELECT COUNT(*)
+                    SELECT COUNT(DISTINCT wcrp.id)
                     FROM warehouse_category_receipt_prices wcrp
                     JOIN dict_warehouses dw ON dw.id = wcrp.warehouse_id
                     JOIN dict_categories dc ON dc.category_id = wcrp.category_id
@@ -8434,37 +9139,48 @@ class TLService:
         }
 
     def create_warehouse_receipt_price(
-        self, *, warehouse_id: int, category_id: int, price_per_ton: float
+        self,
+        *,
+        warehouse_id: int,
+        category_id: int,
+        price_per_ton: float,
+        price_date: Optional[str] = None,
+        source: str = "manual",
     ) -> Dict[str, Any]:
         if warehouse_id < 1 or category_id < 1:
             raise ValueError("库房或品类 id 无效")
+        pd_day = (
+            date.fromisoformat(str(price_date).strip())
+            if price_date and str(price_date).strip()
+            else self._pricing_calendar_date()
+        )
         with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT id FROM dict_warehouses WHERE id = %s AND is_active = 1",
-                    (int(warehouse_id),),
-                )
-                if not cur.fetchone():
-                    raise ValueError("库房不存在或已停用")
-                cur.execute(
-                    "SELECT category_id FROM dict_categories WHERE category_id = %s AND is_active = 1 LIMIT 1",
-                    (int(category_id),),
-                )
-                if not cur.fetchone():
-                    raise ValueError("品类不存在或已停用")
-                cur.execute(
-                    """
-                    INSERT INTO warehouse_category_receipt_prices
-                    (warehouse_id, category_id, price_per_ton)
-                    VALUES (%s, %s, %s)
-                    ON DUPLICATE KEY UPDATE
-                        price_per_ton = VALUES(price_per_ton),
-                        updated_at = CURRENT_TIMESTAMP
-                    """,
-                    (int(warehouse_id), int(category_id), price_per_ton),
-                )
-                rec_id = int(cur.lastrowid)
-                if rec_id == 0:
+            conn.autocommit(False)
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT id FROM dict_warehouses WHERE id = %s AND is_active = 1",
+                        (int(warehouse_id),),
+                    )
+                    if not cur.fetchone():
+                        raise ValueError("库房不存在或已停用")
+                    cur.execute(
+                        "SELECT category_id FROM dict_categories WHERE category_id = %s AND is_active = 1 LIMIT 1",
+                        (int(category_id),),
+                    )
+                    if not cur.fetchone():
+                        raise ValueError("品类不存在或已停用")
+                    history_id = self._upsert_warehouse_receipt_price_history(
+                        cur,
+                        warehouse_id=int(warehouse_id),
+                        category_id=int(category_id),
+                        price_per_ton=price_per_ton,
+                        price_date=pd_day,
+                        source=source,
+                    )
+                    self._sync_warehouse_receipt_price_from_history(
+                        cur, int(warehouse_id), int(category_id)
+                    )
                     cur.execute(
                         """
                         SELECT id FROM warehouse_category_receipt_prices
@@ -8474,14 +9190,20 @@ class TLService:
                     )
                     row = cur.fetchone()
                     rec_id = int(row[0]) if row else 0
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
         return {
             "code": 200,
             "msg": "收货价格已保存",
             "data": {
                 "id": rec_id,
+                "history_id": history_id,
                 "库房id": int(warehouse_id),
                 "品类id": int(category_id),
                 "价格": float(price_per_ton),
+                "价格日期": pd_day.isoformat(),
             },
         }
 
@@ -8490,19 +9212,40 @@ class TLService:
     ) -> Dict[str, Any]:
         if price_id < 1:
             raise ValueError("id 无效")
+        pd_day = self._pricing_calendar_date()
         with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    UPDATE warehouse_category_receipt_prices
-                    SET price_per_ton = %s, updated_at = CURRENT_TIMESTAMP
-                    WHERE id = %s
-                    """,
-                    (price_per_ton, int(price_id)),
-                )
-                if cur.rowcount == 0:
-                    raise ValueError("记录不存在")
-        return {"code": 200, "msg": "已更新收货价格"}
+            conn.autocommit(False)
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT warehouse_id, category_id
+                        FROM warehouse_category_receipt_prices WHERE id = %s
+                        """,
+                        (int(price_id),),
+                    )
+                    row = cur.fetchone()
+                    if not row:
+                        raise ValueError("记录不存在")
+                    wh_id, cat_id = int(row[0]), int(row[1])
+                    history_id = self._upsert_warehouse_receipt_price_history(
+                        cur,
+                        warehouse_id=wh_id,
+                        category_id=cat_id,
+                        price_per_ton=price_per_ton,
+                        price_date=pd_day,
+                        source="manual",
+                    )
+                    self._sync_warehouse_receipt_price_from_history(cur, wh_id, cat_id)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        return {
+            "code": 200,
+            "msg": "已更新收货价格",
+            "data": {"history_id": history_id, "价格日期": pd_day.isoformat()},
+        }
 
     def delete_warehouse_receipt_price(self, price_id: int) -> Dict[str, Any]:
         if price_id < 1:
@@ -8526,16 +9269,18 @@ class TLService:
         stats = {"success": 0, "skipped_errors": 0}
         errors: List[str] = []
         samples: List[Dict[str, Any]] = []
+        default_day = self._pricing_calendar_date()
 
         with get_conn() as conn:
             conn.autocommit(False)
             try:
                 with conn.cursor() as cur:
                     exact, canon, _provinces = self._load_warehouse_match_indexes(cur)
+                    fuzzy_wh = self._load_warehouse_fuzzy_candidates(cur)
                     for row in parsed_rows:
                         try:
-                            wh_id, match_kind = self._match_warehouse_id(
-                                row.warehouse_name, exact, canon
+                            wh_id, match_kind = self._match_warehouse_id_for_import(
+                                row.warehouse_name, exact, canon, fuzzy_wh
                             )
                             if wh_id is None:
                                 if match_kind == "ambiguous":
@@ -8548,39 +9293,40 @@ class TLService:
                             cat_id = self._resolve_category_id_by_name(
                                 cur, row.category_name
                             )
+                            pd_day = row.price_date or default_day
+                            history_id = self._upsert_warehouse_receipt_price_history(
+                                cur,
+                                warehouse_id=wh_id,
+                                category_id=cat_id,
+                                price_per_ton=float(row.price_per_ton),
+                                price_date=pd_day,
+                                source="import",
+                            )
+                            self._sync_warehouse_receipt_price_from_history(
+                                cur, wh_id, cat_id
+                            )
                             cur.execute(
                                 """
-                                INSERT INTO warehouse_category_receipt_prices
-                                (warehouse_id, category_id, price_per_ton)
-                                VALUES (%s, %s, %s)
-                                ON DUPLICATE KEY UPDATE
-                                    price_per_ton = VALUES(price_per_ton),
-                                    updated_at = CURRENT_TIMESTAMP
+                                SELECT id FROM warehouse_category_receipt_prices
+                                WHERE warehouse_id = %s AND category_id = %s
                                 """,
-                                (wh_id, cat_id, row.price_per_ton),
+                                (wh_id, cat_id),
                             )
-                            rec_id = int(cur.lastrowid)
-                            if rec_id == 0:
-                                cur.execute(
-                                    """
-                                    SELECT id FROM warehouse_category_receipt_prices
-                                    WHERE warehouse_id = %s AND category_id = %s
-                                    """,
-                                    (wh_id, cat_id),
-                                )
-                                found = cur.fetchone()
-                                rec_id = int(found[0]) if found else 0
+                            found = cur.fetchone()
+                            rec_id = int(found[0]) if found else 0
                             stats["success"] += 1
                             if len(samples) < 20:
                                 samples.append(
                                     {
                                         "Excel行": row.excel_row,
                                         "id": rec_id,
+                                        "history_id": history_id,
                                         "库房id": wh_id,
                                         "库房名称": row.warehouse_name,
                                         "品类id": cat_id,
                                         "品类名": row.category_name,
                                         "价格": _cell_json(row.price_per_ton),
+                                        "价格日期": pd_day.isoformat(),
                                         "匹配": match_kind,
                                     }
                                 )
@@ -8598,7 +9344,13 @@ class TLService:
         return {
             "code": 200,
             "msg": msg,
-            "data": {**meta, **stats, "errors": errors[:50], "samples": samples},
+            "data": {
+                **meta,
+                **stats,
+                "skip_reasons": _aggregate_import_skip_reasons(errors),
+                "errors": errors[:50],
+                "samples": samples,
+            },
         }
 
     def download_warehouse_receipt_prices_template_excel(self) -> bytes:
@@ -8607,11 +9359,130 @@ class TLService:
         wb = Workbook()
         ws = wb.active
         ws.title = "导入数据"
-        ws.append(["库房名称", "回收品种", "价格"])
-        ws.append(["示例库房A", "电动电瓶", 15200])
+        ws.append(["库房名称", "回收品种", "价格", "价格日期"])
+        ws.append(["示例库房A", "电动电瓶", 15200, "2026-06-01"])
         buf = io.BytesIO()
         wb.save(buf)
         return buf.getvalue()
+
+    def list_warehouse_receipt_price_history(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 20,
+        warehouse_id: Optional[int] = None,
+        category_id: Optional[int] = None,
+        keyword: Optional[str] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        if page < 1:
+            raise ValueError("page 必须 >= 1")
+        page_size = min(max(page_size, 1), 500)
+        offset = (page - 1) * page_size
+        conditions = ["1=1"]
+        params: List[Any] = []
+        if warehouse_id is not None:
+            conditions.append("wcrph.warehouse_id = %s")
+            params.append(int(warehouse_id))
+        if category_id is not None:
+            conditions.append("wcrph.category_id = %s")
+            params.append(int(category_id))
+        kw = (keyword or "").strip()
+        if kw:
+            conditions.append("(dw.name LIKE %s OR dc.name LIKE %s)")
+            params.extend([f"%{kw}%", f"%{kw}%"])
+        if date_from and str(date_from).strip():
+            conditions.append("wcrph.price_date >= %s")
+            params.append(date.fromisoformat(str(date_from).strip()))
+        if date_to and str(date_to).strip():
+            conditions.append("wcrph.price_date <= %s")
+            params.append(date.fromisoformat(str(date_to).strip()))
+        where_sql = " AND ".join(conditions)
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT COUNT(DISTINCT wcrph.id)
+                    FROM warehouse_category_receipt_price_history wcrph
+                    JOIN dict_warehouses dw ON dw.id = wcrph.warehouse_id
+                    JOIN dict_categories dc ON dc.category_id = wcrph.category_id
+                        AND dc.is_active = 1
+                    WHERE {where_sql}
+                    """,
+                    tuple(params),
+                )
+                total = int(cur.fetchone()[0])
+                cur.execute(
+                    f"""
+                    SELECT wcrph.id, wcrph.warehouse_id, dw.name, wcrph.category_id,
+                           COALESCE(
+                               MAX(CASE WHEN dc.is_main = 1 THEN dc.name END),
+                               MAX(dc.name)
+                           ) AS cat_name,
+                           wcrph.price_per_ton, wcrph.price_date, wcrph.source,
+                           wcrph.updated_at
+                    FROM warehouse_category_receipt_price_history wcrph
+                    JOIN dict_warehouses dw ON dw.id = wcrph.warehouse_id
+                    JOIN dict_categories dc ON dc.category_id = wcrph.category_id
+                        AND dc.is_active = 1
+                    WHERE {where_sql}
+                    GROUP BY wcrph.id, wcrph.warehouse_id, dw.name, wcrph.category_id,
+                             wcrph.price_per_ton, wcrph.price_date, wcrph.source,
+                             wcrph.updated_at
+                    ORDER BY wcrph.price_date DESC, wcrph.id DESC
+                    LIMIT %s OFFSET %s
+                    """,
+                    tuple(params) + (page_size, offset),
+                )
+                items = []
+                for r in cur.fetchall():
+                    items.append(
+                        {
+                            "id": int(r[0]),
+                            "库房id": int(r[1]),
+                            "库房名称": r[2],
+                            "品类id": int(r[3]),
+                            "品类名": r[4],
+                            "价格": float(r[5]),
+                            "价格日期": r[6].isoformat() if r[6] else None,
+                            "来源": r[7],
+                            "更新时间": r[8].isoformat() if r[8] else None,
+                        }
+                    )
+        return {
+            "code": 200,
+            "data": {"total": total, "list": items, "page": page, "page_size": page_size},
+        }
+
+    def delete_warehouse_receipt_price_history(self, history_id: int) -> Dict[str, Any]:
+        if history_id < 1:
+            raise ValueError("id 无效")
+        with get_conn() as conn:
+            conn.autocommit(False)
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT warehouse_id, category_id
+                        FROM warehouse_category_receipt_price_history WHERE id = %s
+                        """,
+                        (int(history_id),),
+                    )
+                    row = cur.fetchone()
+                    if not row:
+                        raise ValueError("记录不存在")
+                    wh_id, cat_id = int(row[0]), int(row[1])
+                    cur.execute(
+                        "DELETE FROM warehouse_category_receipt_price_history WHERE id = %s",
+                        (int(history_id),),
+                    )
+                    self._sync_warehouse_receipt_price_from_history(cur, wh_id, cat_id)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        return {"code": 200, "msg": "已删除收货价格历史记录"}
 
 
 # ==================== 单例工厂 ====================

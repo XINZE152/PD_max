@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional, Tuple
 _WAREHOUSE_NAME_CANDIDATES = ("库房名称", "仓库名称", "名称", "库房名")
 _CATEGORY_CANDIDATES = ("回收品种", "品种", "品类", "品类名称", "category")
 _INVENTORY_CANDIDATES = ("当前库存", "库存", "库存(吨)", "库存吨数")
+_PRICE_CANDIDATES = ("价格", "收货价格", "回收单价", "元每吨", "单价", "元/吨")
 _DATE_CANDIDATES = ("库存日期", "日期", "inventory_date")
 
 
@@ -96,6 +97,7 @@ def _parse_date_cell(v: object) -> Optional[date]:
 
 def _find_header_row(all_rows: List[tuple], *, max_scan_rows: int = 30) -> Tuple[int, List[str]]:
     scan = min(len(all_rows), max_scan_rows)
+    saw_receipt_price_header = False
     for ri in range(scan):
         row = all_rows[ri]
         if not row:
@@ -104,8 +106,16 @@ def _find_header_row(all_rows: List[tuple], *, max_scan_rows: int = 30) -> Tuple
         has_wh = _resolve_col_index(headers, _WAREHOUSE_NAME_CANDIDATES) is not None
         has_cat = _resolve_col_index(headers, _CATEGORY_CANDIDATES) is not None
         has_inv = _resolve_col_index(headers, _INVENTORY_CANDIDATES) is not None
+        has_price = _resolve_col_index(headers, _PRICE_CANDIDATES) is not None
         if has_wh and has_cat and has_inv:
             return ri, headers
+        if has_wh and has_cat and has_price and not has_inv:
+            saw_receipt_price_header = True
+    if saw_receipt_price_header:
+        raise WarehouseInventoryExcelError(
+            "表头为收货价格格式（含「价格」列），库存导入请使用「当前库存」列，"
+            "或下载库房库存导入模板"
+        )
     raise WarehouseInventoryExcelError(
         "未识别到表头：需包含「库房名称」「回收品种」与「当前库存」列"
     )

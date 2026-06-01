@@ -1,0 +1,11 @@
+{
+  "task_id": "0634173e-2eb3-4a91-b072-45ff0ab96143",
+  "judgment": "correct",
+  "timestamp": "20260601_173648",
+  "bbox": null,
+  "engine_result": {},
+  "user_note": "test fallback",
+  "entry_id": "ea8bc850",
+  "original_image": "/home/quyu/PD_new/PD_max/app/ai_detection/feedback/correct/20260601_173648_0634173e-2eb3-4a91-b072-45ff0ab96143_ea8bc850/original.jpg",
+  "cropped_roi": null
+}

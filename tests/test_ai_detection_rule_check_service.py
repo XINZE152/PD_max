@@ -140,7 +140,16 @@ class RuleCheckServiceTests(unittest.TestCase):
 
     @patch("app.ai_detection.rule_check_service.run_timestamp_check")
     @patch("app.ai_detection.rule_check_service.run_pixel_overlap_check")
-    def test_run_rule_checks_aggregates(self, mock_pixel, mock_ts):
+    @patch("app.ai_detection.rule_check_service.run_semantic_check")
+    def test_run_rule_checks_aggregates(self, mock_semantic, mock_pixel, mock_ts):
+        mock_semantic.return_value = {
+            "semantic_check": {},
+            "risk": 0.0,
+            "reasons": [],
+            "anomalies": [],
+            "hard_tamper": False,
+            "account_field_bbox": None,
+        }
         mock_pixel.return_value = {
             "pixel_overlap_score": 0.2,
             "reasons": [],
@@ -164,10 +173,20 @@ class RuleCheckServiceTests(unittest.TestCase):
         )
         self.assertIsNotNone(result["pixel_overlap"])
         self.assertIsNotNone(result["timestamp"])
+        self.assertIsNotNone(result["semantic"])
         self.assertIn("hard_tamper_flags", result)
 
     @patch("app.ai_detection.rule_check_service.run_timestamp_check")
-    def test_run_rule_checks_without_bbox(self, mock_ts):
+    @patch("app.ai_detection.rule_check_service.run_semantic_check")
+    def test_run_rule_checks_without_bbox(self, mock_semantic, mock_ts):
+        mock_semantic.return_value = {
+            "semantic_check": {},
+            "risk": 0.0,
+            "reasons": [],
+            "anomalies": [],
+            "hard_tamper": False,
+            "account_field_bbox": None,
+        }
         mock_ts.return_value = {
             "timestamp_check": {},
             "risk": 0.0,
@@ -179,6 +198,7 @@ class RuleCheckServiceTests(unittest.TestCase):
         result = run_rule_checks("dummy.jpg", MagicMock(), ocr_tokens=[], image_shape=(10, 10, 3))
         self.assertIsNone(result["pixel_overlap"])
         mock_ts.assert_called_once()
+        mock_semantic.assert_called_once()
 
 
 if __name__ == "__main__":

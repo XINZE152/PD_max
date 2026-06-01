@@ -19,7 +19,7 @@ DATETIME_GLUED_PATTERN = re.compile(
 )
 DATETIME_COMPACT_PATTERN = re.compile(r"(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})")
 TRANSACTION_TIME_LABELS = ("申请时间", "交易时间", "转账时间", "收款时间")
-BAD_SOFTWARE_KEYWORDS = ("photoshop", "picsart", "美图", "snapseed", "lightroom", "醒图", "meitu")
+BAD_SOFTWARE_KEYWORDS = ("photoshop", "picsart", "美图", "snapseed", "lightroom", "醒图", "meitu", "chatgpt", "dall-e", "midjourney", "stable diffusion", "firefly")
 
 # 图内时间自洽类异常：触发后直接判「篡改」（可与 config hard_tamper_anomalies 合并）
 # business_* 仅作风险提示（可疑），见 timestamp_business_mismatch_risk
