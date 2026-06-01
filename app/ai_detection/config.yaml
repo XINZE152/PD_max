@@ -14,6 +14,10 @@ dataset:
 business_rules:
   roi_expand_margin: 15          # 局部微观分析时的外扩像素边距
   max_core_text_length: 15       # 核心金额字符串最大长度（超过此长度视为订单号/非核心项）
+  auto_detect_account_field: true  # 未传 bbox 时 OCR 自动定位「收款账号」并做拼接检测
+  auto_detect_high_risk_rois: true  # 首轮未检出拼接/硬篡改时，自动扫描金额等高风险区域（同 AI 候选框）
+  auto_pixel_rescan_max_rois: 5     # 自动二次扫描最多 ROI 数
+  auto_pixel_rescan_min_amount_score: 0.35  # 金额候选最低分，低于此不扫描
 
 # 【新增】自适应判定权重
 weights:
@@ -30,6 +34,12 @@ thresholds:
   pixel_overlap_blend_alert: 0.55           # blend 分 >= 此值即告警
   pixel_overlap_structural_alert: 0.79      # structural 告警需同时满足 de_min
   pixel_overlap_structural_de_min: 0.018    # structural 告警所需最低双重边缘占比
+  pixel_overlap_text_splice_alert: 0.38    # ELA/噪声条带文字替换告警阈值
+  pixel_overlap_ela_corroboration_min: 0.22  # ELA 佐证 + structural 联合告警
+  pixel_overlap_structural_text_min: 0.52    # 文字 ROI structural 联合告警下限
+  pixel_overlap_text_splice_hard_min: 0.42  # 文字替换 hard 佐证阈值
+  pixel_overlap_ela_hard_min: 0.28         # ELA hard 佐证阈值
+  pixel_overlap_text_hard_score: 0.48      # 有 ELA 佐证时的 hard 最低总分
   pixel_overlap_hard_blend_min: 0.55        # hard 判所需最低 blend 分
   pixel_overlap_hard_de_min: 0.045          # hard 判所需最低双重边缘占比
   exempt_pixel_safe: 0.40        # 非核心字段的像素风险 < 此值，直接豁免清零
@@ -60,5 +70,17 @@ thresholds:
     - future_datetime
     - status_transaction_time_mismatch
     - exif_visible_datetime_mismatch
+  hard_semantic_anomalies:               # 语义规则硬判篡改
+    - invalid_amount_format
+    - detail_field_typography_anomaly
+    - account_mask_pattern_inconsistent
+    - synthetic_image_signals
+  semantic_amount_format_risk: 0.78       # 金额千分位格式异常风险分
+  semantic_typography_risk: 0.72          # 明细行排版不一致风险分
+  semantic_account_mask_risk: 0.76        # 账号脱敏格式不一致风险分
+  semantic_synthetic_risk: 0.75           # 无 EXIF 合成/AI 重绘风险分
+  synthetic_bg_var_max: 0.08              # 背景方差低于此视为过于平滑
+  synthetic_noise_std_max: 55.0           # 噪声标准差低于此视为异常
+  synthetic_min_signals: 3                # 触发合成图判定的最少信号数
   # 业务单据比对（business_*）仅写入 timestamp_check.anomalies 并抬高风险至「可疑」，
   # 不列入 hard_tamper_anomalies，避免错误 document_time 导致真图一律判篡改。
