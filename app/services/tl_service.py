@@ -2,6 +2,7 @@
 TL比价模块服务层
 负责仓库、冶炼厂、品类、比价、运费、价格表、品类映射等数据库操作
 """
+import difflib
 import hashlib
 import io
 import json
@@ -282,6 +283,46 @@ def _cell_json(v: Any) -> Any:
     if isinstance(v, date):
         return v.isoformat()
     return v
+
+
+def _compact_dict_name(s: str) -> str:
+    """去掉首尾与中间空白（含全角空格），用于库房名称宽松比较。"""
+    return re.sub(r"[\s\u3000]+", "", (s or "").strip())
+
+
+def _rank_warehouse_name_match(query: str, dict_name: str) -> Tuple[int, int]:
+    """分数越小越好；第二项用于同档排序。"""
+    q, n = query.strip(), dict_name.strip()
+    if not q:
+        return (99, 0)
+    if n == q:
+        return (0, 0)
+    qc, nc = _compact_dict_name(q), _compact_dict_name(n)
+    if qc and nc == qc:
+        return (1, 0)
+    if n and n in q:
+        return (2, -len(n))
+    if q and q in n:
+        return (3, len(n))
+    return (9, len(n))
+
+
+def _aggregate_import_skip_reasons(errors: List[str]) -> Dict[str, int]:
+    """从导入错误文案聚合跳过原因统计。"""
+    reasons: Dict[str, int] = {}
+    for err in errors:
+        if "回收品种" in err and "已停用" in err:
+            key = "品类已停用"
+        elif "回收品种" in err and "不存在" in err:
+            key = "品类不存在"
+        elif "匹配到多个库房" in err:
+            key = "库房歧义"
+        elif "库房名称" in err and "不存在" in err:
+            key = "库房不存在"
+        else:
+            key = "其他"
+        reasons[key] = reasons.get(key, 0) + 1
+    return reasons
 
 
 def _json_cell_to_dict(val: Any) -> Optional[Dict[str, Any]]:
@@ -7806,6 +7847,51 @@ class TLService:
             return None, "ambiguous"
         return None, "missing"
 
+    @staticmethod
+    def _load_warehouse_fuzzy_candidates(cur) -> List[Tuple[int, str]]:
+        cur.execute(
+            "SELECT id, name FROM dict_warehouses "
+            "WHERE name IS NOT NULL AND TRIM(name) <> ''"
+        )
+        return [(int(r[0]), str(r[1]).strip()) for r in cur.fetchall()]
+
+    @staticmethod
+    def _fuzzy_match_warehouse_id_from_candidates(
+        excel_name: str,
+        candidates: List[Tuple[int, str]],
+    ) -> Tuple[Optional[int], str]:
+        name = excel_name.strip()
+        if len(name) < 2:
+            return None, "missing"
+        ranked: List[Tuple[Tuple[int, int], int]] = []
+        for wid, db_name in candidates:
+            rank = _rank_warehouse_name_match(name, db_name)
+            if rank[0] >= 9:
+                continue
+            ranked.append((rank, wid))
+        if not ranked:
+            return None, "missing"
+        ranked.sort(key=lambda x: x[0])
+        best_rank = ranked[0][0]
+        best_ids = [wid for rank, wid in ranked if rank == best_rank]
+        if len(set(best_ids)) > 1:
+            return None, "ambiguous"
+        return best_ids[0], "fuzzy"
+
+    def _match_warehouse_id_for_import(
+        self,
+        excel_name: str,
+        exact: Dict[str, int],
+        canon: Dict[str, List[int]],
+        fuzzy_candidates: List[Tuple[int, str]],
+    ) -> Tuple[Optional[int], str]:
+        wh_id, match_kind = self._match_warehouse_id(excel_name, exact, canon)
+        if wh_id is not None or match_kind == "ambiguous":
+            return wh_id, match_kind
+        return self._fuzzy_match_warehouse_id_from_candidates(
+            excel_name, fuzzy_candidates
+        )
+
     def _load_warehouse_price_map(self, cur) -> Dict[int, Decimal]:
         cur.execute(
             "SELECT warehouse_id, warehouse_price FROM pd_warehouse_spread_configs "
@@ -8743,10 +8829,11 @@ class TLService:
             try:
                 with conn.cursor() as cur:
                     exact, canon, _provinces = self._load_warehouse_match_indexes(cur)
+                    fuzzy_wh = self._load_warehouse_fuzzy_candidates(cur)
                     for row in parsed_rows:
                         try:
-                            wh_id, match_kind = self._match_warehouse_id(
-                                row.warehouse_name, exact, canon
+                            wh_id, match_kind = self._match_warehouse_id_for_import(
+                                row.warehouse_name, exact, canon, fuzzy_wh
                             )
                             if wh_id is None:
                                 if match_kind == "ambiguous":
@@ -8815,7 +8902,13 @@ class TLService:
         return {
             "code": 200,
             "msg": msg,
-            "data": {**meta, **stats, "errors": errors[:50], "samples": samples},
+            "data": {
+                **meta,
+                **stats,
+                "skip_reasons": _aggregate_import_skip_reasons(errors),
+                "errors": errors[:50],
+                "samples": samples,
+            },
         }
 
     def download_warehouse_inventory_template_excel(self) -> bytes:
@@ -8913,14 +9006,59 @@ class TLService:
         name = str(category_name).strip()
         if not name:
             raise ValueError("回收品种不能为空")
+
         cur.execute(
             "SELECT category_id FROM dict_categories WHERE name = %s AND is_active = 1",
             (name,),
         )
         row = cur.fetchone()
-        if not row:
-            raise ValueError(f"回收品种「{name}」不存在")
-        return int(row[0])
+        if row:
+            return int(row[0])
+
+        cur.execute(
+            "SELECT category_id, is_active FROM dict_categories WHERE name = %s",
+            (name,),
+        )
+        inactive = cur.fetchone()
+        if inactive:
+            if inactive[1] != 1:
+                raise ValueError(
+                    f"回收品种「{name}」已停用，请先在品类管理中启用后再导入"
+                )
+            return int(inactive[0])
+
+        cur.execute(
+            "SELECT category_id, name FROM dict_categories WHERE is_active = 1"
+        )
+        active_rows = cur.fetchall()
+        active_names = [str(r[1]).strip() for r in active_rows if r[1]]
+
+        best_cid: Optional[int] = None
+        best_db_len = -1
+        for category_id, db_name in active_rows:
+            n = str(db_name or "").strip()
+            if len(n) < 2 or name not in n:
+                continue
+            if len(n) > best_db_len:
+                best_db_len = len(n)
+                best_cid = int(category_id)
+        if best_cid is not None:
+            return best_cid
+
+        fuzzy_cid = self._fuzzy_match_quote_category_id_from_rows(active_rows, name)
+        if fuzzy_cid is not None:
+            return fuzzy_cid
+
+        close = difflib.get_close_matches(name, active_names, n=1, cutoff=0.75)
+        if close:
+            matched = close[0]
+            for category_id, db_name in active_rows:
+                if str(db_name).strip() == matched:
+                    return int(category_id)
+
+        hints = difflib.get_close_matches(name, active_names, n=3, cutoff=0.5)
+        hint = f"；最接近：{'、'.join(hints)}" if hints else ""
+        raise ValueError(f"回收品种「{name}」不存在{hint}")
 
     def list_warehouse_receipt_prices(
         self,
@@ -9138,10 +9276,11 @@ class TLService:
             try:
                 with conn.cursor() as cur:
                     exact, canon, _provinces = self._load_warehouse_match_indexes(cur)
+                    fuzzy_wh = self._load_warehouse_fuzzy_candidates(cur)
                     for row in parsed_rows:
                         try:
-                            wh_id, match_kind = self._match_warehouse_id(
-                                row.warehouse_name, exact, canon
+                            wh_id, match_kind = self._match_warehouse_id_for_import(
+                                row.warehouse_name, exact, canon, fuzzy_wh
                             )
                             if wh_id is None:
                                 if match_kind == "ambiguous":
@@ -9205,7 +9344,13 @@ class TLService:
         return {
             "code": 200,
             "msg": msg,
-            "data": {**meta, **stats, "errors": errors[:50], "samples": samples},
+            "data": {
+                **meta,
+                **stats,
+                "skip_reasons": _aggregate_import_skip_reasons(errors),
+                "errors": errors[:50],
+                "samples": samples,
+            },
         }
 
     def download_warehouse_receipt_prices_template_excel(self) -> bytes:
