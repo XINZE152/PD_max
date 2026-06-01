@@ -37,6 +37,7 @@ ACCOUNT_FIELD_LABELS = (
     "付款账号",
     "收款方账户",
     "付款方账户",
+    "对方账户",
 )
 
 DEFAULT_HARD_SEMANTIC_ANOMALIES = frozenset({
@@ -186,7 +187,7 @@ def find_account_field_bbox(
     tokens: Sequence[OCRToken],
 ) -> Optional[List[int]]:
     """优先定位收款侧账号字段 bbox（xyxy）。"""
-    for label in ("收款账号", "收款方账户", "付款账号", "付款方账户"):
+    for label in ACCOUNT_FIELD_LABELS:
         bbox = find_labeled_field_bbox(tokens, label)
         if bbox is not None:
             return bbox

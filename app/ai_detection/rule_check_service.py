@@ -10,6 +10,10 @@ import yaml
 
 from app.ai_detection.core.detectors import PixelLevelDetector
 from app.ai_detection.core.utils import safe_read_image
+from app.ai_detection.rule_check_roi import (
+    find_high_risk_pixel_rois,
+    rule_checks_need_auto_pixel_rescan,
+)
 from app.ai_detection.semantic_checker import (
     check_receipt_semantics,
     find_account_field_bbox,
@@ -310,6 +314,94 @@ def _resolve_pixel_overlap_bbox(
     return None
 
 
+def _annotate_pixel_overlap_scan(
+    result: Dict[str, Any],
+    *,
+    auto_label: Optional[str] = None,
+    auto_source: Optional[str] = None,
+) -> Dict[str, Any]:
+    tagged = dict(result)
+    if auto_label:
+        tagged["auto_label"] = auto_label
+    if auto_source:
+        tagged["auto_source"] = auto_source
+    return tagged
+
+
+def merge_pixel_overlap_results(
+    primary: Optional[Dict[str, Any]],
+    scans: Sequence[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """合并多 ROI 像素检测结果，取最高分并汇总告警。"""
+    items = [dict(x) for x in ([primary] if primary else []) + list(scans)]
+    items = [x for x in items if x]
+    if not items:
+        return {}
+
+    best = max(items, key=lambda row: float(row.get("pixel_overlap_score") or 0.0))
+    merged = dict(best)
+    merged["alert"] = any(bool(x.get("alert")) for x in items)
+    merged["hard_tamper"] = any(bool(x.get("hard_tamper")) for x in items)
+
+    reasons: List[str] = []
+    for row in items:
+        for reason in row.get("reasons") or []:
+            if reason and reason not in reasons:
+                reasons.append(reason)
+    if merged["alert"] and "检测到疑似像素重叠/拼接痕迹" not in reasons:
+        reasons.insert(0, "检测到疑似像素重叠/拼接痕迹")
+    merged["reasons"] = reasons
+
+    regions: List[Dict[str, Any]] = []
+    for row in items:
+        regions.append(
+            {
+                "bbox_xyxy": row.get("bbox_xyxy"),
+                "pixel_overlap_score": row.get("pixel_overlap_score"),
+                "alert": bool(row.get("alert")),
+                "label": row.get("auto_label"),
+                "source": row.get("auto_source"),
+            }
+        )
+    merged["auto_scan_regions"] = regions
+    return merged
+
+
+def run_auto_high_risk_pixel_scans(
+    image_path: str,
+    pixel_detector: PixelLevelDetector,
+    *,
+    rois: Sequence[Dict[str, Any]],
+    thresholds: Dict[str, Any],
+    margin: int,
+    bbox_format: str,
+    corroboration_signals: Dict[str, bool],
+) -> List[Dict[str, Any]]:
+    """对自动定位的高风险 ROI 逐个执行像素拼接检测。"""
+    results: List[Dict[str, Any]] = []
+    for roi in rois:
+        bbox = roi.get("bbox")
+        if not bbox or len(bbox) != 4:
+            continue
+        checked = run_pixel_overlap_check(
+            image_path,
+            bbox,
+            pixel_detector,
+            thresholds=thresholds,
+            margin=margin,
+            bbox_format=bbox_format,
+            corroboration_signals=corroboration_signals,
+        )
+        results.append(
+            _annotate_pixel_overlap_scan(
+                checked,
+                auto_label=str(roi.get("label") or ""),
+                auto_source=str(roi.get("source") or "auto_high_risk"),
+            )
+        )
+    return results
+
+
 def run_rule_checks(
     image_path: str,
     pixel_detector: PixelLevelDetector,
@@ -370,6 +462,37 @@ def run_rule_checks(
         business_datetime=business_datetime,
         thresholds=thresh,
     )
+
+    if (
+        ocr_tokens
+        and image_shape
+        and rule_checks_need_auto_pixel_rescan(
+            manual_bbox=bbox_xyxy,
+            semantic=semantic,
+            timestamp=timestamp,
+            pixel_overlap=pixel_overlap,
+            business_rules=rules,
+        )
+    ):
+        high_risk_rois = find_high_risk_pixel_rois(
+            ocr_tokens,
+            image_shape,
+            business_rules=rules,
+        )
+        if high_risk_rois:
+            auto_scans = run_auto_high_risk_pixel_scans(
+                image_path,
+                pixel_detector,
+                rois=high_risk_rois,
+                thresholds=thresh,
+                margin=margin,
+                bbox_format=bbox_format,
+                corroboration_signals=merged_signals,
+            )
+            if auto_scans:
+                pixel_overlap = merge_pixel_overlap_results(pixel_overlap, auto_scans)
+                pixel_overlap["auto_detected"] = True
+                pixel_overlap_source = "auto_high_risk_rois"
 
     reasons: List[str] = []
     if pixel_overlap and pixel_overlap.get("reasons"):
