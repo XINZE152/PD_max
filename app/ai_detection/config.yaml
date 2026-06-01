@@ -15,6 +15,9 @@ business_rules:
   roi_expand_margin: 15          # 局部微观分析时的外扩像素边距
   max_core_text_length: 15       # 核心金额字符串最大长度（超过此长度视为订单号/非核心项）
   auto_detect_account_field: true  # 未传 bbox 时 OCR 自动定位「收款账号」并做拼接检测
+  auto_detect_high_risk_rois: true  # 首轮未检出拼接/硬篡改时，自动扫描金额等高风险区域（同 AI 候选框）
+  auto_pixel_rescan_max_rois: 5     # 自动二次扫描最多 ROI 数
+  auto_pixel_rescan_min_amount_score: 0.35  # 金额候选最低分，低于此不扫描
 
 # 【新增】自适应判定权重
 weights:

@@ -55,13 +55,26 @@ def build_rule_check_public_summary(data: Optional[Dict[str, Any]]) -> Dict[str,
     semantic = data.get("semantic")
     status = derive_rule_check_status(data)
 
+    pixel_message = "未在检查区域内发现明显拼接/贴图痕迹"
+    if pixel:
+        if pixel.get("alert"):
+            pixel_message = "检测到疑似像素重叠/拼接痕迹"
+        elif pixel.get("auto_scan_regions"):
+            region_count = len(pixel.get("auto_scan_regions") or [])
+            pixel_message = (
+                f"已对 {region_count} 个高风险区域（金额/账户等）自动检测，"
+                "未发现明显拼接/贴图痕迹"
+            )
+        elif data.get("pixel_overlap_source") in (None, ""):
+            pixel_message = (
+                "本次未指定关注区域，未做局部拼接检查。"
+                "如需排查某一块是否被改过，可在左侧开启「仅分析框选区域」并框选后重新检测。"
+            )
+
     pixel_item = {
         "passed": not bool(pixel and pixel.get("alert")),
-        "message": (
-            "检测到疑似像素重叠/拼接痕迹"
-            if pixel and pixel.get("alert")
-            else "未在检查区域内发现明显拼接/贴图痕迹"
-        ),
+        "message": pixel_message,
+        "auto_scan_regions": list(pixel.get("auto_scan_regions") or []) if pixel else [],
     } if pixel is not None else None
 
     ts_check = (timestamp or {}).get("timestamp_check") or {}
