@@ -662,6 +662,62 @@ file: [报价单1.jpg]
 
 ---
 
+## 接口7e：永久删除品类分组（硬删除）
+- 方法：`DELETE`
+- 路由：`/tl/purge_category`
+- 传入（Query）：
+  - **`品类id`**（必填，`category_id`）
+  - **`cascade`**（可选，默认 `true`）：`true` 时同一事务内级联删除关联子表与 `quote_details` 后再物理删字典行；`false` 时仅当无任何子表引用才删组，否则 409
+- **前置条件**：该分组下**全部别名须已软删除**（`is_active=0`）；仍有启用中别名时返回 **400**
+- 级联清理范围（`cascade=true`）：`factory_demand_items`、`warehouse_inventories`（按组内 `row_id`）、`warehouse_inventory_snapshots`、`warehouse_category_receipt_prices`（按 `category_id`）、`quote_details`（按组内全部 `name`）、`dict_categories`
+- 模拟请求：`DELETE /tl/purge_category?品类id=304`
+- 模拟返回JSON：
+```json
+{
+  "code": 200,
+  "msg": "已永久删除品类分组 id=304，并清除关联数据（见 deleted_counts）",
+  "cascade": true,
+  "deleted_counts": {
+    "factory_demand_items": 0,
+    "warehouse_inventories": 0,
+    "warehouse_inventory_snapshots": 2,
+    "warehouse_category_receipt_prices": 1,
+    "quote_details": 15,
+    "dict_categories": 2
+  }
+}
+```
+
+---
+
+## 接口7f：永久删除单条品类别名（硬删除）
+- 方法：`DELETE`
+- 路由：`/tl/purge_category_row`
+- 传入（Query）：
+  - **`行id`**（必填，`row_id`）
+  - **`cascade`**（可选，默认 `true`）
+- **前置条件**：该行须已软删除（`is_active=0`）；仍为启用状态时返回 **400**
+- 级联逻辑（`cascade=true`）：删该行关联的 `factory_demand_items`、`warehouse_inventories`、`quote_details`（按该别名 `name`）；若删后该 `category_id` 下无剩余行，顺带删 `warehouse_inventory_snapshots` / `warehouse_category_receipt_prices`
+- 模拟请求：`DELETE /tl/purge_category_row?行id=3`
+- 模拟返回JSON：
+```json
+{
+  "code": 200,
+  "msg": "已永久删除品类别名 行id=3",
+  "cascade": true,
+  "deleted_counts": {
+    "factory_demand_items": 0,
+    "warehouse_inventories": 0,
+    "warehouse_inventory_snapshots": 0,
+    "warehouse_category_receipt_prices": 0,
+    "quote_details": 5,
+    "dict_categories": 1
+  }
+}
+```
+
+---
+
 ## 接口T1：获取税率表
 - 方法：`GET`
 - 路由：`/tl/get_tax_rates`

@@ -5688,6 +5688,414 @@ class TLService:
             logger.error(f"删除品类别名失败: {e}")
             raise
 
+    # ==================== 接口7e/7f：品类硬删除 ====================
+
+    def _fetch_category_group_rows(
+        self, cur, category_id: int
+    ) -> List[Tuple[int, str, int]]:
+        cur.execute(
+            "SELECT row_id, name, is_active FROM dict_categories "
+            "WHERE category_id = %s ORDER BY row_id",
+            (category_id,),
+        )
+        return [(int(r[0]), str(r[1]), int(r[2])) for r in cur.fetchall()]
+
+    def _category_child_counts(
+        self,
+        cur,
+        *,
+        category_id: Optional[int] = None,
+        row_ids: Optional[List[int]] = None,
+        names: Optional[List[str]] = None,
+        count_group_snapshots: bool = False,
+    ) -> Dict[str, int]:
+        counts: Dict[str, int] = {
+            "factory_demand_items": 0,
+            "warehouse_inventories": 0,
+            "warehouse_inventory_snapshots": 0,
+            "warehouse_category_receipt_prices": 0,
+            "quote_details": 0,
+            "dict_categories": 0,
+        }
+        if row_ids:
+            ph = ",".join(["%s"] * len(row_ids))
+            cur.execute(
+                f"SELECT COUNT(*) FROM factory_demand_items WHERE category_id IN ({ph})",
+                tuple(row_ids),
+            )
+            counts["factory_demand_items"] = int(cur.fetchone()[0] or 0)
+            cur.execute(
+                f"SELECT COUNT(*) FROM warehouse_inventories WHERE category_id IN ({ph})",
+                tuple(row_ids),
+            )
+            counts["warehouse_inventories"] = int(cur.fetchone()[0] or 0)
+            cur.execute(
+                f"SELECT COUNT(*) FROM dict_categories WHERE row_id IN ({ph})",
+                tuple(row_ids),
+            )
+            counts["dict_categories"] = int(cur.fetchone()[0] or 0)
+        if names:
+            ph = ",".join(["%s"] * len(names))
+            cur.execute(
+                f"SELECT COUNT(*) FROM quote_details WHERE category_name IN ({ph})",
+                tuple(names),
+            )
+            counts["quote_details"] = int(cur.fetchone()[0] or 0)
+        if count_group_snapshots and category_id is not None:
+            cur.execute(
+                "SELECT COUNT(*) FROM warehouse_inventory_snapshots WHERE category_id = %s",
+                (category_id,),
+            )
+            counts["warehouse_inventory_snapshots"] = int(cur.fetchone()[0] or 0)
+            cur.execute(
+                "SELECT COUNT(*) FROM warehouse_category_receipt_prices WHERE category_id = %s",
+                (category_id,),
+            )
+            counts["warehouse_category_receipt_prices"] = int(cur.fetchone()[0] or 0)
+        return counts
+
+    def _purge_category_group_children(
+        self,
+        cur,
+        category_id: int,
+        row_ids: List[int],
+        names: List[str],
+        *,
+        delete_group_snapshots: bool,
+    ) -> None:
+        if row_ids:
+            ph = ",".join(["%s"] * len(row_ids))
+            cur.execute(
+                f"DELETE FROM factory_demand_items WHERE category_id IN ({ph})",
+                tuple(row_ids),
+            )
+            cur.execute(
+                f"DELETE FROM warehouse_inventories WHERE category_id IN ({ph})",
+                tuple(row_ids),
+            )
+        if names:
+            ph = ",".join(["%s"] * len(names))
+            cur.execute(
+                f"DELETE FROM quote_details WHERE category_name IN ({ph})",
+                tuple(names),
+            )
+        if delete_group_snapshots:
+            cur.execute(
+                "DELETE FROM warehouse_inventory_snapshots WHERE category_id = %s",
+                (category_id,),
+            )
+            cur.execute(
+                "DELETE FROM warehouse_category_receipt_prices WHERE category_id = %s",
+                (category_id,),
+            )
+
+    def _purge_category_cascade(self, cur, category_id: int) -> Dict[str, int]:
+        rows = self._fetch_category_group_rows(cur, category_id)
+        if not rows:
+            raise ValueError(f"品类 id={category_id} 不存在")
+        active = [r for r in rows if r[2] == 1]
+        if active:
+            active_names = "、".join(r[1] for r in active)
+            raise ValueError(
+                f"品类 id={category_id} 仍有启用中的别名（{active_names}），"
+                "请先调用软删除接口 delete_category 或 delete_category_row"
+            )
+        row_ids = [r[0] for r in rows]
+        names = [r[1] for r in rows]
+        counts = self._category_child_counts(
+            cur,
+            category_id=category_id,
+            row_ids=row_ids,
+            names=names,
+            count_group_snapshots=True,
+        )
+        self._purge_category_group_children(
+            cur,
+            category_id,
+            row_ids,
+            names,
+            delete_group_snapshots=True,
+        )
+        cur.execute(
+            "DELETE FROM dict_categories WHERE category_id = %s",
+            (category_id,),
+        )
+        if cur.rowcount == 0:
+            raise ValueError(f"品类 id={category_id} 删除失败")
+        return counts
+
+    def purge_category(self, category_id: int, *, cascade: bool = True) -> Dict[str, Any]:
+        """物理删除品类分组；仅允许 is_active=0 的全组别名。"""
+        if category_id < 1:
+            raise ValueError("品类id 无效")
+        try:
+            if cascade:
+                with get_conn() as conn:
+                    conn.autocommit(False)
+                    try:
+                        with conn.cursor() as cur:
+                            rows = self._fetch_category_group_rows(cur, category_id)
+                            if not rows:
+                                raise ValueError(f"品类 id={category_id} 不存在")
+                            deleted_counts = self._purge_category_cascade(
+                                cur, category_id
+                            )
+                        conn.commit()
+                    except Exception:
+                        conn.rollback()
+                        raise
+                log_finance_event(
+                    "品类硬删除(级联) | category_id=%s | 删 demand_items=%s "
+                    "inventories=%s snapshots=%s receipt_prices=%s "
+                    "quote_details=%s dict_categories=%s",
+                    category_id,
+                    deleted_counts["factory_demand_items"],
+                    deleted_counts["warehouse_inventories"],
+                    deleted_counts["warehouse_inventory_snapshots"],
+                    deleted_counts["warehouse_category_receipt_prices"],
+                    deleted_counts["quote_details"],
+                    deleted_counts["dict_categories"],
+                )
+                return {
+                    "code": 200,
+                    "msg": (
+                        f"已永久删除品类分组 id={category_id}，"
+                        "并清除关联数据（见 deleted_counts）"
+                    ),
+                    "cascade": True,
+                    "deleted_counts": deleted_counts,
+                }
+
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    rows = self._fetch_category_group_rows(cur, category_id)
+                    if not rows:
+                        raise ValueError(f"品类 id={category_id} 不存在")
+                    active = [r for r in rows if r[2] == 1]
+                    if active:
+                        raise ValueError(
+                            f"品类 id={category_id} 仍有启用中的别名，请先软删除"
+                        )
+                    row_ids = [r[0] for r in rows]
+                    names = [r[1] for r in rows]
+                    counts = self._category_child_counts(
+                        cur,
+                        category_id=category_id,
+                        row_ids=row_ids,
+                        names=names,
+                        count_group_snapshots=True,
+                    )
+                    total_children = (
+                        counts["factory_demand_items"]
+                        + counts["warehouse_inventories"]
+                        + counts["warehouse_inventory_snapshots"]
+                        + counts["warehouse_category_receipt_prices"]
+                        + counts["quote_details"]
+                    )
+                    if total_children > 0:
+                        raise ValueError(
+                            "已指定 cascade=false（仅当无子表引用时才删组）。"
+                            f"品类 id={category_id} 仍存在关联："
+                            f"demand_items={counts['factory_demand_items']}, "
+                            f"inventories={counts['warehouse_inventories']}, "
+                            f"snapshots={counts['warehouse_inventory_snapshots']}, "
+                            f"receipt_prices={counts['warehouse_category_receipt_prices']}, "
+                            f"quote_details={counts['quote_details']}。"
+                            "默认删除会级联清空上述数据，请勿传 cascade=false；"
+                            "或先手工清理子表。"
+                        )
+                    cur.execute(
+                        "DELETE FROM dict_categories WHERE category_id = %s",
+                        (category_id,),
+                    )
+                    if cur.rowcount == 0:
+                        raise ValueError(f"品类 id={category_id} 删除失败")
+            return {
+                "code": 200,
+                "msg": "品类分组已永久删除（cascade=false 且无关联子表）",
+                "cascade": False,
+            }
+        except ValueError:
+            raise
+        except Exception as e:
+            logger.error(f"硬删除品类分组失败: {e}")
+            raise
+
+    def purge_category_row(self, row_id: int, *, cascade: bool = True) -> Dict[str, Any]:
+        """物理删除单条品类别名；仅允许 is_active=0。"""
+        if row_id < 1:
+            raise ValueError("行id 无效")
+        try:
+            if cascade:
+                with get_conn() as conn:
+                    conn.autocommit(False)
+                    try:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                "SELECT row_id, category_id, name, is_active "
+                                "FROM dict_categories WHERE row_id = %s",
+                                (row_id,),
+                            )
+                            row = cur.fetchone()
+                            if not row:
+                                raise ValueError(
+                                    f"品类别名不存在: 行id={row_id}"
+                                )
+                            _rid, cat_id, name, is_active = (
+                                int(row[0]),
+                                int(row[1]),
+                                str(row[2]),
+                                int(row[3]),
+                            )
+                            if is_active == 1:
+                                raise ValueError(
+                                    f"行id={row_id} 仍为启用状态，"
+                                    "请先调用软删除接口 delete_category_row"
+                                )
+                            row_ids = [row_id]
+                            names = [name]
+                            counts = self._category_child_counts(
+                                cur,
+                                row_ids=row_ids,
+                                names=names,
+                            )
+                            cur.execute(
+                                "SELECT COUNT(*) FROM dict_categories "
+                                "WHERE category_id = %s",
+                                (cat_id,),
+                            )
+                            remaining_before = int(cur.fetchone()[0] or 0)
+                            is_last_row = remaining_before <= 1
+                            if is_last_row:
+                                snap_counts = self._category_child_counts(
+                                    cur,
+                                    category_id=cat_id,
+                                    count_group_snapshots=True,
+                                )
+                                counts["warehouse_inventory_snapshots"] = snap_counts[
+                                    "warehouse_inventory_snapshots"
+                                ]
+                                counts["warehouse_category_receipt_prices"] = snap_counts[
+                                    "warehouse_category_receipt_prices"
+                                ]
+                            self._purge_category_group_children(
+                                cur,
+                                cat_id,
+                                row_ids,
+                                names,
+                                delete_group_snapshots=is_last_row,
+                            )
+                            cur.execute(
+                                "DELETE FROM dict_categories WHERE row_id = %s",
+                                (row_id,),
+                            )
+                            if cur.rowcount == 0:
+                                raise ValueError(
+                                    f"品类别名删除失败: 行id={row_id}"
+                                )
+                            counts["dict_categories"] = 1
+                        conn.commit()
+                    except Exception:
+                        conn.rollback()
+                        raise
+                log_finance_event(
+                    "品类别名硬删除(级联) | row_id=%s category_id=%s name=%s | "
+                    "删 demand_items=%s inventories=%s snapshots=%s "
+                    "receipt_prices=%s quote_details=%s",
+                    row_id,
+                    cat_id,
+                    name,
+                    counts["factory_demand_items"],
+                    counts["warehouse_inventories"],
+                    counts["warehouse_inventory_snapshots"],
+                    counts["warehouse_category_receipt_prices"],
+                    counts["quote_details"],
+                )
+                return {
+                    "code": 200,
+                    "msg": f"已永久删除品类别名 行id={row_id}",
+                    "cascade": True,
+                    "deleted_counts": counts,
+                }
+
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT row_id, category_id, name, is_active "
+                        "FROM dict_categories WHERE row_id = %s",
+                        (row_id,),
+                    )
+                    row = cur.fetchone()
+                    if not row:
+                        raise ValueError(f"品类别名不存在: 行id={row_id}")
+                    _rid, cat_id, name, is_active = (
+                        int(row[0]),
+                        int(row[1]),
+                        str(row[2]),
+                        int(row[3]),
+                    )
+                    if is_active == 1:
+                        raise ValueError(
+                            f"行id={row_id} 仍为启用状态，请先软删除"
+                        )
+                    counts = self._category_child_counts(
+                        cur,
+                        row_ids=[row_id],
+                        names=[name],
+                    )
+                    cur.execute(
+                        "SELECT COUNT(*) FROM dict_categories WHERE category_id = %s",
+                        (cat_id,),
+                    )
+                    remaining_before = int(cur.fetchone()[0] or 0)
+                    if remaining_before <= 1:
+                        snap_counts = self._category_child_counts(
+                            cur,
+                            category_id=cat_id,
+                            count_group_snapshots=True,
+                        )
+                        counts["warehouse_inventory_snapshots"] = snap_counts[
+                            "warehouse_inventory_snapshots"
+                        ]
+                        counts["warehouse_category_receipt_prices"] = snap_counts[
+                            "warehouse_category_receipt_prices"
+                        ]
+                    total_children = (
+                        counts["factory_demand_items"]
+                        + counts["warehouse_inventories"]
+                        + counts["warehouse_inventory_snapshots"]
+                        + counts["warehouse_category_receipt_prices"]
+                        + counts["quote_details"]
+                    )
+                    if total_children > 0:
+                        raise ValueError(
+                            "已指定 cascade=false（仅当无子表引用时才删别名）。"
+                            f"行id={row_id} 仍存在关联："
+                            f"demand_items={counts['factory_demand_items']}, "
+                            f"inventories={counts['warehouse_inventories']}, "
+                            f"snapshots={counts['warehouse_inventory_snapshots']}, "
+                            f"receipt_prices={counts['warehouse_category_receipt_prices']}, "
+                            f"quote_details={counts['quote_details']}。"
+                            "默认删除会级联清空上述数据，请勿传 cascade=false；"
+                            "或先手工清理子表。"
+                        )
+                    cur.execute(
+                        "DELETE FROM dict_categories WHERE row_id = %s",
+                        (row_id,),
+                    )
+                    if cur.rowcount == 0:
+                        raise ValueError(f"品类别名删除失败: 行id={row_id}")
+            return {
+                "code": 200,
+                "msg": "品类别名已永久删除（cascade=false 且无关联子表）",
+                "cascade": False,
+            }
+        except ValueError:
+            raise
+        except Exception as e:
+            logger.error(f"硬删除品类别名失败: {e}")
+            raise
+
     # ==================== 接口A7：采购建议 ====================
 
     def get_purchase_suggestion(

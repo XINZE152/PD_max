@@ -47,6 +47,8 @@ TL比价模块路由
   7b.POST /tl/update_category_row      - 按行修改品类别名（改名/设主名称）
   7c.DELETE /tl/delete_category        - 删除品类分组（软删除）
   7d.DELETE /tl/delete_category_row    - 删除单条品类别名（软删除）
+  7e.DELETE /tl/purge_category         - 永久删除品类分组（硬删除；须先软删；默认级联）
+  7f.DELETE /tl/purge_category_row     - 永久删除单条品类别名（硬删除；须先软删；默认级联）
   8. 对标定价 / 标定价格 / 库房差额 / AI 分析快照：
       GET/POST/PUT/DELETE /tl/province_benchmark_prices — 省份对标城市定价历史
       GET/POST/PUT/DELETE /tl/smelter_calibration_prices — 冶炼厂标定价格历史
@@ -1736,6 +1738,63 @@ def delete_category_row(
         return service.delete_category_row(row_id=行id)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ===================== 接口7e/7f：品类硬删除 =====================
+
+
+@router.delete("/purge_category", summary="永久删除品类分组（硬删除）")
+def purge_category(
+    品类id: int,
+    cascade: bool = Query(
+        True,
+        description=(
+            "默认 true：同一事务内级联删除该组关联的需求/库存/报价等后再删字典行。"
+            "传 false 时仅当无任何子表引用才删组，否则 409（严格校验）。"
+            "须先软删除整组（delete_category）。"
+        ),
+    ),
+    service: TLService = Depends(get_tl_service),
+):
+    """物理删除品类分组；仅允许已软删除（is_active=0）的全组别名。"""
+    try:
+        return service.purge_category(category_id=品类id, cascade=cascade)
+    except ValueError as e:
+        detail = str(e)
+        if "不存在" in detail or detail == "品类id 无效":
+            raise HTTPException(status_code=404, detail=detail)
+        if "仍为启用" in detail or "请先" in detail:
+            raise HTTPException(status_code=400, detail=detail)
+        raise HTTPException(status_code=409, detail=detail)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/purge_category_row", summary="永久删除单条品类别名（硬删除）")
+def purge_category_row(
+    行id: int,
+    cascade: bool = Query(
+        True,
+        description=(
+            "默认 true：同一事务内级联删除该别名关联的子表与 quote_details 后再删字典行。"
+            "传 false 时仅当无任何子表引用才删行，否则 409。"
+            "须先软删除该别名（delete_category_row）。"
+        ),
+    ),
+    service: TLService = Depends(get_tl_service),
+):
+    """物理删除单条品类别名；仅允许已软删除（is_active=0）的行。"""
+    try:
+        return service.purge_category_row(row_id=行id, cascade=cascade)
+    except ValueError as e:
+        detail = str(e)
+        if "不存在" in detail or detail == "行id 无效":
+            raise HTTPException(status_code=404, detail=detail)
+        if "仍为启用" in detail or "请先" in detail:
+            raise HTTPException(status_code=400, detail=detail)
+        raise HTTPException(status_code=409, detail=detail)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
