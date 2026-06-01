@@ -205,8 +205,23 @@ class PrdForecastService:
         if not daily_wv:
             dates = list(_daterange_inclusive(q.date_from, q.date_to))
             z = [Decimal("0").quantize(Decimal("0.01"))] * len(dates)
+            from app.intelligent_prediction.services.forecast_analysis_service import (
+                explain_chart_summary,
+            )
+
+            empty_summary = explain_chart_summary(
+                date_from=q.date_from,
+                date_to=q.date_to,
+                dates=dates,
+                total_by_date=z,
+                detail_rows=[],
+            )
             return [], PrdForecastChartResponse(
-                dates=dates, total_by_date=z, by_regional_manager=[], warehouse_profiles=[]
+                dates=dates,
+                total_by_date=z,
+                by_regional_manager=[],
+                warehouse_profiles=[],
+                summary_analysis=empty_summary,
             )
 
         wh_set = {wh for (wh, _, _) in daily_wv.keys()} or {wh for (wh, _, _) in rm_map.keys()}
@@ -296,9 +311,23 @@ class PrdForecastService:
             )
             for rm in rms_sorted
         ]
+        total_by_date = [
+            by_d_total.get(dt, Decimal("0")).quantize(Decimal("0.01")) for dt in dates
+        ]
+        from app.intelligent_prediction.services.forecast_analysis_service import (
+            explain_chart_summary,
+        )
+
+        summary = explain_chart_summary(
+            date_from=q.date_from,
+            date_to=q.date_to,
+            dates=dates,
+            total_by_date=total_by_date,
+            detail_rows=detail_rows,
+        )
         chart = PrdForecastChartResponse(
             dates=dates,
-            total_by_date=[by_d_total.get(dt, Decimal("0")).quantize(Decimal("0.01")) for dt in dates],
+            total_by_date=total_by_date,
             by_regional_manager=by_rm_series,
             warehouse_profiles=[
                 PrdForecastWarehouseProfile(
@@ -312,6 +341,7 @@ class PrdForecastService:
                 )
                 for (wh, v), prof in sorted(profile_cache.items())
             ],
+            summary_analysis=summary,
         )
         return detail_rows, chart
 

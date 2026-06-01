@@ -435,6 +435,7 @@ TABLE_STATEMENTS = [
         predicted_weight DECIMAL(18,4) NOT NULL COMMENT '预测重量',
         confidence VARCHAR(32) NOT NULL DEFAULT 'medium' COMMENT '信心',
         warnings JSON DEFAULT NULL COMMENT '警告列表',
+        analysis TEXT DEFAULT NULL COMMENT '预测依据文案',
         provider_used VARCHAR(64) DEFAULT NULL COMMENT '供应商',
         latency_ms DECIMAL(12,4) DEFAULT NULL COMMENT '延迟毫秒',
         cost_usd DECIMAL(12,6) DEFAULT NULL COMMENT '成本美元',
@@ -643,6 +644,29 @@ def ensure_pd_ip_prediction_results_smelter_column() -> None:
             except Exception:
                 pass
             logger.info("已为 pd_ip_prediction_results 添加 smelter 列")
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def ensure_pd_ip_prediction_results_analysis_column() -> None:
+    """已有库升级：为 pd_ip_prediction_results 补全 analysis（预测依据文案）。"""
+    config_dict = get_mysql_config()
+    connection = pymysql.connect(**config_dict)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SHOW TABLES LIKE 'pd_ip_prediction_results'")
+            if cursor.fetchone() is None:
+                return
+            cursor.execute("SHOW COLUMNS FROM pd_ip_prediction_results LIKE 'analysis'")
+            if cursor.fetchone() is not None:
+                return
+            cursor.execute(
+                "ALTER TABLE pd_ip_prediction_results "
+                "ADD COLUMN analysis TEXT DEFAULT NULL COMMENT '预测依据文案' "
+                "AFTER warnings"
+            )
+            logger.info("已为 pd_ip_prediction_results 添加 analysis 列")
         connection.commit()
     finally:
         connection.close()
@@ -1392,6 +1416,10 @@ def create_tables() -> None:
         ensure_pd_ip_prediction_results_smelter_column()
     except Exception:
         logger.exception("检查/添加 pd_ip_prediction_results.smelter 失败")
+    try:
+        ensure_pd_ip_prediction_results_analysis_column()
+    except Exception:
+        logger.exception("检查/添加 pd_ip_prediction_results.analysis 失败")
     try:
         ensure_pd_ip_lead_market_prices_table()
     except Exception:

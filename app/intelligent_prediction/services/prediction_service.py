@@ -25,6 +25,9 @@ from app.intelligent_prediction.schemas.prediction import (
 from app.intelligent_prediction.services.ai_client import AIModelClient
 from app.intelligent_prediction.services.cache_manager import CacheManager
 from app.intelligent_prediction.services.prompt_builder import PromptBuilder
+from app.intelligent_prediction.services.forecast_analysis_service import (
+    enrich_prediction_items_with_analysis,
+)
 from app.intelligent_prediction.services.price_context_service import build_intelligent_price_summary
 from app.intelligent_prediction.services.weather_client import (
     fetch_forecast_weather_by_dates,
@@ -190,6 +193,7 @@ class PredictionService:
                 predicted_weight=Decimal(str(w)),
                 confidence=conf,
                 warnings=warnings,
+                analysis=it.analysis,
             )
             if parse_error:
                 nw = list(new_it.warnings)
@@ -199,6 +203,7 @@ class PredictionService:
                     predicted_weight=new_it.predicted_weight,
                     confidence="low",
                     warnings=nw,
+                    analysis=new_it.analysis,
                 )
             if prev_w is not None and prev_w > 0:
                 ratio = abs(w - prev_w) / prev_w
@@ -210,6 +215,7 @@ class PredictionService:
                         predicted_weight=new_it.predicted_weight,
                         confidence=new_it.confidence,
                         warnings=nw,
+                        analysis=new_it.analysis,
                     )
             prev_w = w
             out.append(new_it)
@@ -327,6 +333,7 @@ class PredictionService:
                     predicted_weight=floor,
                     confidence="low",
                     warnings=warns,
+                    analysis=it.analysis,
                 )
             )
         return out
@@ -395,13 +402,14 @@ class PredictionService:
                 try:
                     hit = PredictionResultSchema.model_validate(cached)
                     stats_hit = self._prompt.analyze_history(req.history)
+                    items_hit = self._ensure_positive_daily_weights(
+                        hit.items, stats_hit, req.history
+                    )
+                    items_hit = await enrich_prediction_items_with_analysis(
+                        session, req, items_hit
+                    )
                     return hit.model_copy(
-                        update={
-                            "items": self._ensure_positive_daily_weights(
-                                hit.items, stats_hit, req.history
-                            ),
-                            "cache_hit": True,
-                        }
+                        update={"items": items_hit, "cache_hit": True}
                     )
                 except Exception:
                     logger.warning("redis prediction cache schema mismatch, ignoring")
@@ -425,6 +433,7 @@ class PredictionService:
             parse_note = (parse_note + "|" if parse_note else "") + perr
         items = self._post_process_items(items, parse_note)
         items = self._ensure_positive_daily_weights(items, stats, req.history)
+        items = await enrich_prediction_items_with_analysis(session, req, items)
 
         result = PredictionResultSchema(
             warehouse=req.warehouse,
@@ -484,6 +493,7 @@ class PredictionService:
                         predicted_weight=it.predicted_weight,
                         confidence=str(it.confidence),
                         warnings=list(it.warnings),
+                        analysis=it.analysis,
                         provider_used=pr.provider_used,
                         latency_ms=Decimal(str(pr.latency_ms)),
                         cost_usd=Decimal(str(pr.cost_usd)) if pr.cost_usd is not None else None,

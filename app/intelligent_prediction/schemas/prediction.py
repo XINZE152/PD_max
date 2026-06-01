@@ -42,6 +42,7 @@ class PredictionItem(BaseModel):
     predicted_weight: Decimal = Field(..., ge=0, description="预测重量（非负）")
     confidence: ConfidenceLevel | str = Field(default=ConfidenceLevel.MEDIUM, description="信心等级")
     warnings: list[str] = Field(default_factory=list, description="警告信息")
+    analysis: Optional[str] = Field(default=None, description="预测依据文案（规则侧解释）")
 
     @field_validator("predicted_weight", mode="before")
     @classmethod
@@ -223,6 +224,7 @@ class StoredPredictionResultItem(BaseModel):
     predicted_weight: Decimal
     confidence: str
     warnings: list[str] = Field(default_factory=list)
+    analysis: Optional[str] = Field(default=None, description="预测依据文案")
     provider_used: Optional[str] = None
     latency_ms: Optional[float] = None
     cost_usd: Optional[float] = None

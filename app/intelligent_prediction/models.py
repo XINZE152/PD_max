@@ -92,6 +92,7 @@ class PredictionResult(Base):
     predicted_weight: Mapped[Decimal] = mapped_column(Numeric(18, 4))
     confidence: Mapped[str] = mapped_column(String(32), default="medium")
     warnings: Mapped[Optional[list[Any]]] = mapped_column(JSON, nullable=True)
+    analysis: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     provider_used: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     latency_ms: Mapped[Optional[float]] = mapped_column(Numeric(12, 4), nullable=True)
     cost_usd: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6), nullable=True)
