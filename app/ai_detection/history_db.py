@@ -17,6 +17,21 @@ logger = logging.getLogger(__name__)
 
 HISTORY_RETENTION_DAYS = int(os.getenv("AI_DETECTION_HISTORY_DAYS", "7"))
 HISTORY_IMAGES_DIR = Path(UPLOAD_DIR) / "ai_detection_history_images"
+HISTORY_ORIGINAL_FILENAME_MAX = 512
+
+
+def normalize_history_original_filename(
+    upload_name: Optional[str],
+    *,
+    fallback_path: str,
+) -> str:
+    """历史记录展示用文件名：优先用户上传名，否则用磁盘路径 basename。"""
+    raw = str(upload_name or "").strip()
+    if raw:
+        name = os.path.basename(raw.replace("\\", "/"))
+        if name and name not in (".", ".."):
+            return name[:HISTORY_ORIGINAL_FILENAME_MAX]
+    return os.path.basename(str(fallback_path))[:HISTORY_ORIGINAL_FILENAME_MAX]
 
 
 def _ensure_history_images_dir() -> None:

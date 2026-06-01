@@ -37,6 +37,7 @@ from app.ai_detection.history_db import (
     get_latest_ai_detection_history_by_task_id,
     insert_ai_detection_history,
     list_ai_detection_history,
+    normalize_history_original_filename,
     purge_ai_detection_history_older_than,
 )
 from app.ai_detection.ocr_utils import build_detection_bboxes_from_tokens, run_full_image_ocr
@@ -98,6 +99,10 @@ class TaskRecordDTO(BaseModel):
     status: TaskStatusEnum = Field(description="任务状态")
     created_at: str = Field(description="创建时间（ISO8601）")
     image_path: Optional[str] = Field(None, description="服务端保存的原图路径（仅调试/内部用）")
+    original_filename: Optional[str] = Field(
+        None,
+        description="用户上传时的原始文件名（用于历史展示；磁盘文件仍为 task_id.jpg）",
+    )
     bbox: Optional[BBoxDTO] = Field(None, description="用户指定的检测框；未传则后台自动 OCR 找数字区域")
     result: Optional[Dict[str, Any]] = Field(
         None,
@@ -145,7 +150,12 @@ class TaskRecordDTO(BaseModel):
 
 class AbstractTaskRegistry(ABC):
     @abstractmethod
-    async def create_task(self, task_id: str, image_path: str) -> None:
+    async def create_task(
+        self,
+        task_id: str,
+        image_path: str,
+        original_filename: Optional[str] = None,
+    ) -> None:
         pass
 
     @abstractmethod
@@ -165,12 +175,21 @@ class MemoryTaskRegistry(AbstractTaskRegistry):
     def __init__(self):
         self._store: Dict[str, TaskRecordDTO] = {}
 
-    async def create_task(self, task_id: str, image_path: str) -> None:
+    async def create_task(
+        self,
+        task_id: str,
+        image_path: str,
+        original_filename: Optional[str] = None,
+    ) -> None:
         self._store[task_id] = TaskRecordDTO(
             task_id=task_id,
             status=TaskStatusEnum.UPLOADED,
             created_at=datetime.now().isoformat(),
             image_path=image_path,
+            original_filename=normalize_history_original_filename(
+                original_filename,
+                fallback_path=image_path,
+            ),
         )
 
     async def update_task(self, task_id: str, **kwargs) -> None:
@@ -801,7 +820,10 @@ class DetectionDomainServiceV3:
             return
 
         await self.registry.update_task(task_id, status=TaskStatusEnum.PROCESSING)
-        stored_name = Path(image_path).name
+        history_filename = normalize_history_original_filename(
+            task.original_filename,
+            fallback_path=image_path,
+        )
 
         try:
             await ensure_ai_detection_runtime()
@@ -833,7 +855,7 @@ class DetectionDomainServiceV3:
                 await self.registry.update_task(task_id, status=TaskStatusEnum.COMPLETED, result=res_dict)
                 await self._persist_history(
                     task_id=task_id,
-                    original_filename=stored_name,
+                    original_filename=history_filename,
                     bbox=bbox.model_dump(),
                     status="COMPLETED",
                     result=res_dict,
@@ -862,7 +884,7 @@ class DetectionDomainServiceV3:
                     )
                     await self._persist_history(
                         task_id=task_id,
-                        original_filename=stored_name,
+                        original_filename=history_filename,
                         bbox={"auto_ocr": True, "note": "document_rule_override"},
                         status="COMPLETED",
                         result=document_override,
@@ -875,7 +897,7 @@ class DetectionDomainServiceV3:
                 await self.registry.update_task(task_id, status=TaskStatusEnum.COMPLETED, result=empty_res)
                 await self._persist_history(
                     task_id=task_id,
-                    original_filename=stored_name,
+                    original_filename=history_filename,
                     bbox={"auto_ocr": True, "note": "no_numeric_regions"},
                     status="COMPLETED",
                     result=empty_res,
@@ -920,7 +942,7 @@ class DetectionDomainServiceV3:
             )
             await self._persist_history(
                 task_id=task_id,
-                original_filename=stored_name,
+                original_filename=history_filename,
                 bbox={"auto_ocr": True, "box_count": len(ordered_results)},
                 status="COMPLETED",
                 result=top_result,
@@ -933,7 +955,7 @@ class DetectionDomainServiceV3:
             await self.registry.update_task(task_id, status=TaskStatusEnum.FAILED, error_msg=str(exc))
             await self._persist_history(
                 task_id=task_id,
-                original_filename=stored_name,
+                original_filename=history_filename,
                 bbox=bbox.model_dump() if bbox else None,
                 status="FAILED",
                 error_msg=str(exc),
@@ -1422,7 +1444,11 @@ async def submit_detection(
         file_path = STORAGE_DIR / f"{task_id}.jpg"
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
-        await registry.create_task(task_id, str(file_path))
+        await registry.create_task(
+            task_id,
+            str(file_path),
+            original_filename=file.filename,
+        )
     elif not task_id:
         raise HTTPException(status_code=400, detail="必须提供上传文件 file，或已有任务的 task_id")
 
