@@ -209,6 +209,24 @@ class InferenceEngineAPI:
             "should_use_font_signal": float(should_use_font_signal),
         }
 
+    @staticmethod
+    def _has_hard_metadata_evidence(
+        metadata_risk: float,
+        metadata_reasons: List[str],
+        threshold: float = 0.50,
+    ) -> bool:
+        if metadata_risk < threshold:
+            return False
+        hard_markers = (
+            "EXIF检测到已知修图软件",
+            "文件体积/像素比异常",
+            "缺少EXIF且图像结构异常",
+        )
+        return any(
+            any(marker in reason for marker in hard_markers)
+            for reason in (metadata_reasons or [])
+        )
+
     def predict(
         self,
         full_image_path: str,
@@ -252,15 +270,18 @@ class InferenceEngineAPI:
 
             # ================== 0. EXIF/元数据分析 ==================
             metadata_risk = 0.0
+            metadata_reasons = []
             if self._origin_enabled:
                 orig_feats, hard_rule, _ = self.originality_checker.extract_features(full_image_path)
                 if hard_rule:
-                    reasons.append("EXIF检测到已知修图软件")
+                    metadata_reasons.append("EXIF检测到已知修图软件")
+                    reasons.extend(metadata_reasons)
                     metadata_risk = 0.55
                 elif orig_feats:
                     m_risk, m_reasons = OriginalityChecker.compute_metadata_risk(orig_feats)
                     metadata_risk = m_risk
-                    reasons.extend(m_reasons)
+                    metadata_reasons = list(m_reasons)
+                    reasons.extend(metadata_reasons)
 
             # ================== 1. 全局特征分析 ==================
             if precomputed_global_feat is not None:
@@ -391,6 +412,14 @@ class InferenceEngineAPI:
             if bbox_iou_risk > 0:
                 final_risk = max(final_risk, bbox_iou_risk * 0.65)
 
+            metadata_hard_tamper = self._has_hard_metadata_evidence(
+                metadata_risk,
+                metadata_reasons,
+                float(thresh.get("metadata_hard_evidence", 0.50)),
+            )
+            if metadata_hard_tamper:
+                final_risk = max(final_risk, float(thresh_high) + 0.02)
+
             final_risk = max(0.0, min(1.0, float(final_risk)))
 
             # ================== 5. 结果判定与理由梳理 ==================
@@ -408,6 +437,8 @@ class InferenceEngineAPI:
             if bbox_iou_hard_tamper:
                 result_status = "篡改"
                 final_risk = max(final_risk, float(thresh_high) + 0.05)
+            elif metadata_hard_tamper:
+                result_status = "篡改"
             elif final_risk > thresh_high:
                 result_status = "篡改"
             elif final_risk > thresh_low:
