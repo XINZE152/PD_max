@@ -26,7 +26,7 @@ class TaskRecoveryTests(unittest.TestCase):
             self.assertIsNotNone(task)
             assert task is not None
             self.assertEqual(task.status, TaskStatusEnum.FAILED)
-            self.assertIn("重启", task.error_msg or "")
+            self.assertIn("中断", task.error_msg or "")
         finally:
             if storage_path.is_file():
                 storage_path.unlink()

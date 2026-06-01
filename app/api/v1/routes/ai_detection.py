@@ -73,8 +73,9 @@ MAX_CONCURRENT_AI_TASKS = int(os.getenv("AI_MAX_CONCURRENT_TASKS", "1"))
 GC_MAX_AGE_HOURS = int(os.getenv("AI_GC_MAX_AGE_HOURS", "24"))
 GC_INTERVAL_SECONDS = int(os.getenv("AI_GC_INTERVAL_SECONDS", "3600"))
 
-TASK_RESTART_INTERRUPTED_MSG = (
-    "服务已重启，异步检测任务已中断，请重新点击「提交检测」或重新上传图片。"
+TASK_INTERRUPTED_MSG = (
+    "检测任务已中断：后端进程曾退出并重新启动（常见于崩溃后自动拉起、部署或内存不足），"
+    "任务队列在内存中已丢失。请重新点击「提交检测」；若原图仍在，无需重新选文件。"
 )
 
 
@@ -474,17 +475,21 @@ def build_task_record_from_persistence(task_id: str) -> Optional[TaskRecordDTO]:
                 image_path=image_path,
                 original_filename=original_filename,
                 bbox=bbox_dto,
-                error_msg=outcome.get("error_msg") or TASK_RESTART_INTERRUPTED_MSG,
+                error_msg=outcome.get("error_msg") or TASK_INTERRUPTED_MSG,
             )
 
     if image_path:
+        logger.warning(
+            "Task %s not in memory registry; image still on disk — likely process recycle (crash/deploy/OOM)",
+            tid,
+        )
         return TaskRecordDTO(
             task_id=tid,
             status=TaskStatusEnum.FAILED,
             created_at=created_at,
             image_path=image_path,
             original_filename=original_filename,
-            error_msg=TASK_RESTART_INTERRUPTED_MSG,
+            error_msg=TASK_INTERRUPTED_MSG,
         )
     return None
 
