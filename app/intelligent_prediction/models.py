@@ -97,6 +97,18 @@ class PredictionResult(Base):
     latency_ms: Mapped[Optional[float]] = mapped_column(Numeric(12, 4), nullable=True)
     cost_usd: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6), nullable=True)
     raw_response_excerpt: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # 综合预测（v2）字段
+    ship_probability: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    expected_ship_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    expected_shipment: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 4), nullable=True)
+    confidence_level: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    main_factors: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    history_analysis: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    price_sensitivity_analysis: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    price_competitiveness_analysis: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    holiday_analysis: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    weather_analysis: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    comprehensive_analysis: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime,
         server_default=func.current_timestamp(),
