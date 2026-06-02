@@ -35,13 +35,16 @@ from app.config import AI_RULE_CHECK_PERSIST, AI_RULE_CHECK_STORE_IMAGE, UPLOAD_
 from app.ai_detection.easyocr_download_patch import patch_easyocr_download
 from app.ai_detection.history_db import (
     HISTORY_RETENTION_DAYS,
+    clear_feedback_status,
     delete_ai_detection_history,
     get_ai_detection_history_image_path,
     get_async_v3_history_by_task_id,
+    get_feedback_status,
     get_latest_ai_detection_history_by_task_id,
     get_rule_checks_history_by_task_id,
     insert_ai_detection_history,
     list_ai_detection_history,
+    mark_feedback_status,
     normalize_history_original_filename,
     purge_ai_detection_history_older_than,
 )
@@ -1919,6 +1922,14 @@ async def submit_judgment(
 ):
     from app.ai_detection.feedback_manager import FeedbackManager
 
+    # 检查是否已标注（一个检测任务只允许标注一次）
+    existing_status = await run_in_threadpool(get_feedback_status, req.task_id)
+    if existing_status:
+        raise HTTPException(
+            409,
+            f"该任务已标注为「{existing_status}」，不可重复标注。如需修改请使用 PATCH 接口或先删除原标注。",
+        )
+
     fb = FeedbackManager()
 
     task = await registry.get_task(req.task_id)
@@ -1947,6 +1958,8 @@ async def submit_judgment(
         result=result,
         note=req.note,
     )
+    # 同步标注状态到数据库
+    await run_in_threadpool(mark_feedback_status, req.task_id, req.judgment)
     logger.info("反馈已保存: task=%s judgment=%s entry=%s", req.task_id, req.judgment, entry.get("entry_id"))
     return {"status": "success", "entry": entry}
 
@@ -2025,6 +2038,10 @@ async def update_feedback(folder_name: str, req: FeedbackUpdateRequest):
     entry = fb.update_entry(folder_name, req.judgment, note=req.note)
     if not entry:
         raise HTTPException(404, "反馈条目不存在")
+    # 同步标注状态到数据库
+    task_id = entry.get("task_id")
+    if task_id:
+        await run_in_threadpool(mark_feedback_status, task_id, req.judgment)
     return {"status": "success", "entry": entry}
 
 
@@ -2036,8 +2053,14 @@ async def delete_feedback(folder_name: str):
     from app.ai_detection.feedback_manager import FeedbackManager
 
     fb = FeedbackManager()
+    # 删除前先获取 task_id
+    entry = fb.get_entry(folder_name)
+    task_id = entry.get("task_id") if entry else None
     if not fb.delete_entry(folder_name):
         raise HTTPException(404, "反馈条目不存在")
+    # 同步清除数据库标注状态（恢复为可再次标注）
+    if task_id:
+        await run_in_threadpool(clear_feedback_status, task_id)
     return {"status": "success"}
 
 
@@ -2058,6 +2081,10 @@ async def confirm_suspicious(folder_name: str = Form(...), judgment: str = Form(
     entry = fb.confirm_suspicious(folder_name, judgment)
     if not entry:
         raise HTTPException(404, "疑似条目不存在或已处理")
+    # 同步标注状态到数据库
+    task_id = entry.get("task_id")
+    if task_id:
+        await run_in_threadpool(mark_feedback_status, task_id, judgment)
     return {"status": "success", "entry": entry}
 
 
