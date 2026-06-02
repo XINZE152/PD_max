@@ -757,6 +757,10 @@ class UpdateQuoteDetailRequest(BaseModel):
         None,
         description="与确认写入接口相同；未传则保留库中 JSON，重算后含税列会标为「换算」",
     )
+    跳过税率换算: bool = Field(
+        False,
+        description="为 true 时直接保存传入的价格值，不触发基准价反算与含税价自动换算",
+    )
 
     @model_validator(mode="after")
     def _category_name_nonempty(self) -> "UpdateQuoteDetailRequest":
@@ -997,3 +1001,4 @@ class WarehouseReceiptPriceUpdate(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     价格: float = Field(..., description="库房回收单价，元/吨")
+    价格日期: Optional[str] = Field(None, description="YYYY-MM-DD；缺省为当天")
