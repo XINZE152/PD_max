@@ -2,6 +2,7 @@
 TL比价模块服务层
 负责仓库、冶炼厂、品类、比价、运费、价格表、品类映射等数据库操作
 """
+import base64
 import difflib
 import hashlib
 import io
@@ -9135,14 +9136,21 @@ class TLService:
                                MAX(CASE WHEN dc.is_main = 1 THEN dc.name END),
                                MAX(dc.name)
                            ) AS cat_name,
-                           wcrp.price_per_ton, wcrp.updated_at
+                           wcrp.price_per_ton, wcrp.updated_at,
+                           latest_price.price_date
                     FROM warehouse_category_receipt_prices wcrp
                     JOIN dict_warehouses dw ON dw.id = wcrp.warehouse_id
                     JOIN dict_categories dc ON dc.category_id = wcrp.category_id
                         AND dc.is_active = 1
+                    LEFT JOIN (
+                        SELECT warehouse_id, category_id, MAX(price_date) AS price_date
+                        FROM warehouse_category_receipt_price_history
+                        GROUP BY warehouse_id, category_id
+                    ) latest_price ON latest_price.warehouse_id = wcrp.warehouse_id
+                        AND latest_price.category_id = wcrp.category_id
                     WHERE {where_sql}
                     GROUP BY wcrp.id, wcrp.warehouse_id, dw.name, wcrp.category_id,
-                             wcrp.price_per_ton, wcrp.updated_at
+                             wcrp.price_per_ton, wcrp.updated_at, latest_price.price_date
                     ORDER BY wcrp.id DESC
                     LIMIT %s OFFSET %s
                     """,
@@ -9158,6 +9166,7 @@ class TLService:
                             "品类id": int(r[3]),
                             "品类名": r[4],
                             "价格": float(r[5]),
+                            "价格日期": r[7].isoformat() if r[7] else None,
                             "更新时间": r[6].isoformat() if r[6] else None,
                         }
                     )
@@ -9298,9 +9307,9 @@ class TLService:
         except WarehouseReceiptPriceExcelError as e:
             raise ValueError(str(e)) from e
 
-        stats = {"success": 0, "skipped_errors": 0}
-        errors: List[str] = []
-        samples: List[Dict[str, Any]] = []
+        stats = {"success": 0, "failed": 0}
+        success_list: List[Dict[str, Any]] = []
+        failed_list: List[Dict[str, Any]] = []
         default_day = self._pricing_calendar_date()
 
         with get_conn() as conn:
@@ -9347,43 +9356,100 @@ class TLService:
                             found = cur.fetchone()
                             rec_id = int(found[0]) if found else 0
                             stats["success"] += 1
-                            if len(samples) < 20:
-                                samples.append(
-                                    {
-                                        "Excel行": row.excel_row,
-                                        "id": rec_id,
-                                        "history_id": history_id,
-                                        "库房id": wh_id,
-                                        "库房名称": row.warehouse_name,
-                                        "品类id": cat_id,
-                                        "品类名": row.category_name,
-                                        "价格": _cell_json(row.price_per_ton),
-                                        "价格日期": pd_day.isoformat(),
-                                        "匹配": match_kind,
-                                    }
-                                )
+                            success_list.append(
+                                {
+                                    "Excel行": row.excel_row,
+                                    "id": rec_id,
+                                    "history_id": history_id,
+                                    "库房id": wh_id,
+                                    "库房名称": row.warehouse_name,
+                                    "品类id": cat_id,
+                                    "品类名": row.category_name,
+                                    "价格": float(row.price_per_ton),
+                                    "价格日期": pd_day.isoformat(),
+                                    "匹配方式": match_kind,
+                                }
+                            )
                         except ValueError as e:
-                            stats["skipped_errors"] += 1
-                            errors.append(f"第 {row.excel_row} 行：{e}")
+                            stats["failed"] += 1
+                            failed_list.append(
+                                {
+                                    "库房名称": row.warehouse_name,
+                                    "回收品种": row.category_name,
+                                    "价格": float(row.price_per_ton) if row.price_per_ton else None,
+                                    "价格日期": row.price_date.isoformat() if row.price_date else None,
+                                    "失败原因": str(e),
+                                }
+                            )
                 conn.commit()
             except Exception:
                 conn.rollback()
                 raise
 
+        failed_excel_bytes: Optional[bytes] = None
+        if failed_list:
+            failed_excel_bytes = self._build_failed_receipt_price_excel(failed_list)
+
         msg = f"已导入 {stats['success']} 条收货价格"
-        if stats["skipped_errors"]:
-            msg += f"，{stats['skipped_errors']} 行跳过"
+        if stats["failed"]:
+            msg += f"，{stats['failed']} 条失败"
         return {
             "code": 200,
             "msg": msg,
             "data": {
                 **meta,
                 **stats,
-                "skip_reasons": _aggregate_import_skip_reasons(errors),
-                "errors": errors[:50],
-                "samples": samples,
+                "success_list": success_list,
+                "failed_list": failed_list,
+                "failed_excel_base64": base64.b64encode(failed_excel_bytes).decode() if failed_excel_bytes else None,
             },
         }
+
+    def _build_failed_receipt_price_excel(self, failed_list: List[Dict[str, Any]]) -> bytes:
+        """生成失败数据 Excel 文件"""
+        try:
+            from openpyxl import Workbook
+            from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+        except ImportError as e:
+            raise ValueError("缺少 openpyxl 依赖") from e
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "导入失败数据"
+
+        headers = ["库房名称", "回收品种", "价格", "价格日期", "失败原因"]
+        header_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+        header_font = Font(bold=True, color="9C0006")
+        thin_border = Border(
+            left=Side(style="thin"),
+            right=Side(style="thin"),
+            top=Side(style="thin"),
+            bottom=Side(style="thin"),
+        )
+
+        for col_idx, header in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=col_idx, value=header)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center")
+            cell.border = thin_border
+
+        for row_idx, item in enumerate(failed_list, 2):
+            for col_idx, key in enumerate(headers, 1):
+                cell = ws.cell(row=row_idx, column=col_idx, value=item.get(key))
+                cell.border = thin_border
+                if key == "失败原因":
+                    cell.font = Font(color="FF0000")
+
+        ws.column_dimensions["A"].width = 20
+        ws.column_dimensions["B"].width = 15
+        ws.column_dimensions["C"].width = 12
+        ws.column_dimensions["D"].width = 15
+        ws.column_dimensions["E"].width = 40
+
+        buf = io.BytesIO()
+        wb.save(buf)
+        return buf.getvalue()
 
     def download_warehouse_receipt_prices_template_excel(self) -> bytes:
         from openpyxl import Workbook

@@ -2506,6 +2506,34 @@ async def import_warehouse_receipt_prices_excel(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.post(
+    "/download_import_failed_excel",
+    summary="下载导入失败数据 Excel（base64 编码）",
+)
+async def download_import_failed_excel(
+    body: Dict[str, Any] = Body(..., description="包含 failed_excel_base64 字段"),
+    service: TLService = Depends(get_tl_service),
+):
+    """接收 import_warehouse_receipt_prices_excel 返回的 failed_excel_base64，解码后返回 Excel 文件。"""
+    import base64 as b64
+
+    b64_str = body.get("failed_excel_base64")
+    if not b64_str:
+        raise HTTPException(status_code=400, detail="failed_excel_base64 为空，无失败数据可下载")
+    try:
+        excel_bytes = b64.b64decode(b64_str)
+    except Exception:
+        raise HTTPException(status_code=400, detail="failed_excel_base64 格式无效")
+    fn = "收货价格导入失败数据.xlsx"
+    return StreamingResponse(
+        io.BytesIO(excel_bytes),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": f"attachment; filename*=UTF-8''{quote(fn)}",
+        },
+    )
+
+
 @router.get("/warehouse_receipt_price_history", summary="库房按品种收货价格历史列表")
 def warehouse_receipt_price_history(
     page: int = Query(1, ge=1),
