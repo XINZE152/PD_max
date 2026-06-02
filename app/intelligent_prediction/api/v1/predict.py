@@ -1,4 +1,4 @@
-"""预测 HTTP 接口。"""
+"""预测 HTTP 接口（综合预测 v2）。"""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from app.intelligent_prediction.exceptions import (
     ServiceUnavailableBusinessException,
 )
 from app.intelligent_prediction.logging_utils import get_logger
-from app.intelligent_prediction.api.deps import get_prediction_db_session, get_prediction_service_dep
+from app.intelligent_prediction.api.deps import get_prediction_db_session, get_comprehensive_prediction_service_dep
 from app.intelligent_prediction.models import PredictionBatch
 from app.intelligent_prediction.models import PredictionResult as PredictionResultRow
 from app.intelligent_prediction.schemas.audit import OperationAuditItem, OperationAuditListResponse
@@ -29,18 +29,21 @@ from app.intelligent_prediction.schemas.prediction import (
     AsyncPredictionAccepted,
     BatchPredictionRequest,
     BatchStatusResponse,
-    PredictionResultSchema,
+    ComprehensiveBatchRequest,
+    ComprehensivePredictionResult,
     StoredPredictionResultItem,
     StoredPredictionResultListResponse,
 )
 from app.intelligent_prediction.services.audit_service import list_audit_events
+from app.intelligent_prediction.services.comprehensive_prediction_service import (
+    ComprehensivePredictionService,
+)
 from app.intelligent_prediction.services.dimension_options_service import (
     list_dimensions_from_prediction_results,
 )
 from app.intelligent_prediction.services.dict_geo_lookup import (
     lookup_warehouse_smelter_dict_addresses,
 )
-from app.intelligent_prediction.services.prediction_service import PredictionService
 
 logger = get_logger(__name__)
 router = APIRouter()
@@ -103,16 +106,19 @@ async def list_operation_audit(
 
 @router.post(
     "",
-    response_model=list[PredictionResultSchema],
-    summary="同步批量预测",
-    description="调用大模型对多笔请求做预测，并将结果写入数据库。",
+    response_model=list[ComprehensivePredictionResult],
+    summary="同步批量预测（v2 综合预测）",
+    description=(
+        "调用大模型对多笔请求做综合预测（历史规律40%、价格30%、敏感度15%、"
+        "节假日10%、天气5%），并将结果写入数据库。"
+    ),
 )
 async def predict_sync(
-    body: BatchPredictionRequest,
+    body: ComprehensiveBatchRequest,
     session: AsyncSession = Depends(get_prediction_db_session),
-    svc: PredictionService = Depends(get_prediction_service_dep),
-) -> list[PredictionResultSchema]:
-    """同步批量预测并写库。"""
+    svc: ComprehensivePredictionService = Depends(get_comprehensive_prediction_service_dep),
+) -> list[ComprehensivePredictionResult]:
+    """同步批量综合预测并写库。"""
     try:
         results = await svc.predict_batch(body)
         await svc.persist_sync_results(session, results, batch_id=None)
@@ -127,11 +133,11 @@ async def predict_sync(
 @router.post(
     "/async",
     response_model=AsyncPredictionAccepted,
-    summary="异步批量预测",
+    summary="异步批量预测（v2 综合预测）",
     description="创建预测批次并入队 Celery，返回任务编号与批次编号。",
 )
 async def predict_async(
-    body: BatchPredictionRequest,
+    body: ComprehensiveBatchRequest,
     session: AsyncSession = Depends(get_prediction_db_session),
 ) -> AsyncPredictionAccepted:
     """异步预测：入队 Celery。"""

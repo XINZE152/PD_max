@@ -1,4 +1,4 @@
-"""Celery：批量预测与 Excel 导出。"""
+"""Celery：批量预测与 Excel 导出（综合预测 v2）。"""
 
 from __future__ import annotations
 
@@ -12,11 +12,14 @@ import pandas as pd
 from app.intelligent_prediction.logging_utils import get_logger
 from app.intelligent_prediction.db import get_prediction_session_factory
 from app.intelligent_prediction.models import PredictionBatch
-from app.intelligent_prediction.schemas.prediction import BatchPredictionRequest
+from app.intelligent_prediction.schemas.prediction import ComprehensiveBatchRequest
 from app.intelligent_prediction.services.ai_client import get_ai_client
 from app.intelligent_prediction.services.cache_manager import get_cache_manager
-from app.intelligent_prediction.services.prediction_service import PredictionService
-from app.intelligent_prediction.services.prompt_builder import PromptBuilder
+from app.intelligent_prediction.services.comprehensive_prediction_service import (
+    ComprehensivePredictionService,
+    get_comprehensive_prediction_service,
+)
+from app.intelligent_prediction.services.comprehensive_prompt_builder import ComprehensivePromptBuilder
 from app.intelligent_prediction.tasks.celery_app import celery_app
 
 logger = get_logger(__name__)
@@ -35,8 +38,10 @@ async def _run_batch_async(batch_id: str) -> None:
         await session.refresh(batch)
         try:
             meta = batch.meta or {}
-            req = BatchPredictionRequest.model_validate(meta)
-            svc = PredictionService(get_ai_client(), get_cache_manager(), PromptBuilder())
+            req = ComprehensiveBatchRequest.model_validate(meta)
+            svc: ComprehensivePredictionService = get_comprehensive_prediction_service(
+                get_ai_client(), get_cache_manager(), ComprehensivePromptBuilder()
+            )
             results = await svc.predict_batch(req)
             await svc.persist_sync_results(session, results, batch_id=batch_id)
             rows: list[dict[str, object]] = []
@@ -49,10 +54,12 @@ async def _run_batch_async(batch_id: str) -> None:
                             "smelter": pr.smelter or "",
                             "regional_manager": pr.regional_manager or "",
                             "target_date": it.target_date.isoformat(),
-                            "predicted_weight": float(it.predicted_weight),
-                            "confidence": str(it.confidence),
-                            "warnings": ";".join(it.warnings),
-                            "analysis": it.analysis or "",
+                            "ship_probability": it.ship_probability,
+                            "expected_ship_date": it.expected_ship_date.isoformat() if it.expected_ship_date else "",
+                            "expected_shipment": float(it.expected_shipment),
+                            "confidence_level": it.confidence_level,
+                            "main_factors": it.main_factors,
+                            "comprehensive_analysis": it.comprehensive_analysis,
                         }
                     )
             df = pd.DataFrame(rows)
