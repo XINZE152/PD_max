@@ -397,8 +397,10 @@ TABLE_STATEMENTS = [
         status VARCHAR(32) NOT NULL COMMENT 'COMPLETED | FAILED',
         outcome_json JSON NOT NULL COMMENT '结果摘要：result / multi_results / error_msg',
         stored_image VARCHAR(255) NULL COMMENT '归档图文件名（置于 ai_detection_history_images/）',
+        feedback_status VARCHAR(20) NULL COMMENT '标注状态：correct | wrong | suspicious，NULL=未标注',
         INDEX idx_ai_hist_created (created_at),
-        INDEX idx_ai_hist_task (task_id)
+        INDEX idx_ai_hist_task (task_id),
+        INDEX idx_ai_hist_feedback (feedback_status)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='AI图片鉴伪历史记录';
     """,
     # 智能送货量预测（与 intelligent_prediction ORM 表名一致）
@@ -1261,6 +1263,32 @@ def ensure_ai_detection_history_stored_image_column() -> None:
         connection.close()
 
 
+def ensure_ai_detection_history_feedback_status_column() -> None:
+    """已有库升级：为 ai_detection_history 增加 feedback_status（新建库已由 CREATE TABLE 包含）。"""
+    config_dict = get_mysql_config()
+    connection = pymysql.connect(**config_dict)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT COUNT(*) FROM information_schema.columns "
+                "WHERE table_schema = DATABASE() AND table_name = 'ai_detection_history' "
+                "AND column_name = 'feedback_status'"
+            )
+            if cursor.fetchone()[0] == 0:
+                cursor.execute(
+                    "ALTER TABLE ai_detection_history ADD COLUMN feedback_status VARCHAR(20) NULL "
+                    "COMMENT '标注状态：correct | wrong | suspicious，NULL=未标注' "
+                    "AFTER stored_image"
+                )
+                cursor.execute(
+                    "ALTER TABLE ai_detection_history ADD INDEX idx_ai_hist_feedback (feedback_status)"
+                )
+                logger.info("已为 ai_detection_history 添加 feedback_status 列及索引")
+        connection.commit()
+    finally:
+        connection.close()
+
+
 def ensure_pd_pricing_benchmark_tables() -> None:
     """旧库补建：对标定价 / 库房差额 / AI 分析快照等表（新建库已由 TABLE_STATEMENTS 创建）。"""
     config_dict = get_mysql_config()
@@ -1421,6 +1449,10 @@ def create_tables() -> None:
         ensure_ai_detection_history_stored_image_column()
     except Exception:
         logger.exception("检查/添加 ai_detection_history.stored_image 失败")
+    try:
+        ensure_ai_detection_history_feedback_status_column()
+    except Exception:
+        logger.exception("检查/添加 ai_detection_history.feedback_status 失败")
     try:
         ensure_pd_ip_delivery_records_smelter_column()
     except Exception:
