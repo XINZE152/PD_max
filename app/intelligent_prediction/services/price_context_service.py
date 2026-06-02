@@ -124,15 +124,17 @@ def explain_prediction(
     parts: list[str] = []
     parts.append(
         f"{target_date.isoformat()} 历史基线 {history_baseline}（近30日加权×周规律），"
-        f"价格乘数 {price_factor}（历史权重 {settings.prediction_history_weight:.0%}、"
-        f"价格权重 {settings.prediction_price_weight:.0%}），预测 {predicted}。"
+        f"价格乘数 {price_factor}（历史权重 {settings.prediction_history_weight:.0%}（近30日线性加权、星期几系数）、"
+        f"价格权重 {settings.prediction_price_weight:.0%}（竞品报价对比60%、铅行情对比40%、价格敏感度缩放）），"
+        f"预测 {predicted}。"
     )
     sens_label = {"sensitive": "敏感型", "medium": "中等", "stable": "稳定型"}.get(
         profile.sensitivity, profile.sensitivity
     )
     parts.append(
-        f"库房能力：最高 {profile.capacity_max}、最低 {profile.capacity_min}、"
-        f"平均 {profile.capacity_avg}；价格敏感度 {sens_label}。"
+        f"该仓过去单日发货：最多 {profile.capacity_max} 吨、"
+        f"最少 {profile.capacity_min} 吨、平均 {profile.capacity_avg} 吨；"
+        f"价格敏感度 {sens_label}。"
     )
     if ctx.own_calibration_price is not None:
         adv_bits: list[str] = []
@@ -142,7 +144,19 @@ def explain_prediction(
             adv_bits.append(f"竞品最高 {ctx.competitor_price_max}")
         adv_bits.append(f"己方 {ctx.own_calibration_price}")
         parts.append("当日价格：" + "，".join(adv_bits) + "。")
-        if ctx.vs_competitor_ratio is not None and ctx.vs_competitor_ratio < -0.02:
+        if (
+            ctx.vs_competitor_ratio is not None
+            and ctx.vs_competitor_ratio > 0.05
+            and ctx.vs_market_ratio is not None
+            and abs(ctx.vs_market_ratio) <= 0.02
+        ):
+            pct = ctx.vs_competitor_ratio * 100
+            parts.append(
+                f"竞品报价显著高于己方（高{pct:.1f}%），铅行情基本持平，"
+                f"竞品涨价让利使本厂竞争力提升，预计发货量增加；"
+                f"可考虑适度提价以扩大利润空间，同时保持竞争力。"
+            )
+        elif ctx.vs_competitor_ratio is not None and ctx.vs_competitor_ratio < -0.02:
             parts.append("相对竞品价格偏低，预计发货意愿减弱。")
         elif ctx.vs_competitor_ratio is not None and ctx.vs_competitor_ratio > 0.02:
             parts.append("相对竞品有价格优势，预计发货意愿增强。")

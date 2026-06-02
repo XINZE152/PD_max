@@ -45,9 +45,9 @@ class PrdForecastWarehouseProfile(BaseModel):
     product_variety: str
     price_sensitivity: str
     price_correlation: Optional[float] = None
-    capacity_max: Decimal
-    capacity_min: Decimal
-    capacity_avg: Decimal
+    capacity_max: Decimal = Field(description="近120日该仓单日发货量最多（吨）")
+    capacity_min: Decimal = Field(description="近120日该仓单日发货量最少（吨）")
+    capacity_avg: Decimal = Field(description="近120日该仓单日发货量平均（吨）")
 
 
 class PrdForecastByRmSeries(BaseModel):
@@ -61,7 +61,7 @@ class PrdForecastChartResponse(BaseModel):
     by_regional_manager: list[PrdForecastByRmSeries]
     warehouse_profiles: list[PrdForecastWarehouseProfile] = Field(
         default_factory=list,
-        description="各库房价格敏感度与能力基线",
+        description="各库房价格敏感度与历史单日发货量统计（吨）",
     )
     summary_analysis: Optional[str] = Field(
         default=None,
