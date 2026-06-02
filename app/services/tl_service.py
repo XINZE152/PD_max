@@ -80,6 +80,7 @@ from app.services.tl_dict_geo_crud import (
     warehouse_links_batch_bind as sa_wh_links_batch_bind,
     warehouse_links_batch_unbind as sa_wh_links_batch_unbind,
     warehouse_links_list_all as sa_wh_links_list_all,
+    resolve_ev_battery_category_id,
     warehouse_links_realtime_spread_list as sa_wh_links_realtime_spread_list,
     warehouse_list as sa_wh_list,
     warehouse_update as sa_wh_update,
@@ -1551,7 +1552,7 @@ class TLService:
         keyword: Optional[str] = None,
         has_realtime_spread: Optional[bool] = None,
     ) -> Dict[str, Any]:
-        """库房关联实时价差列表：每条出边返回源/对标库房定价及实时价差（源−对标）。"""
+        """库房关联实时价差列表：每条出边返回源/对标电动车电瓶收货价及实时价差（源−对标）。"""
         res = _raise_tl_geo_crud_result(
             sa_wh_links_realtime_spread_list(
                 page=page,
@@ -6526,6 +6527,32 @@ class TLService:
         except Exception:
             return datetime.utcnow().date()
 
+    @staticmethod
+    def _parse_calendar_date_str(
+        value: Optional[str], *, default: Optional[date] = None
+    ) -> date:
+        """解析 YYYY-MM-DD 或带时间的 ISO；空值时使用 default。"""
+        if value is None:
+            if default is None:
+                raise ValueError("日期不能为空")
+            return default
+        s = str(value).strip()
+        if not s:
+            if default is None:
+                raise ValueError("日期不能为空")
+            return default
+        head = s[:10]
+        try:
+            return date.fromisoformat(head)
+        except ValueError:
+            pass
+        for fmt in ("%Y/%m/%d", "%Y.%m.%d"):
+            try:
+                return datetime.strptime(head, fmt).date()
+            except ValueError:
+                continue
+        raise ValueError(f"日期格式无效: {value!r}，请使用 YYYY-MM-DD")
+
     _JINLI_FACTORY_NAMES: Tuple[str, ...] = (
         "河南金利金铅集团有限公司",
         "金利",
@@ -7916,10 +7943,21 @@ class TLService:
             excel_name, fuzzy_candidates
         )
 
+    def _resolve_ev_battery_category_id(self, cur) -> Optional[int]:
+        return resolve_ev_battery_category_id(cur)
+
     def _load_warehouse_price_map(self, cur) -> Dict[int, Decimal]:
+        """源/对标库房用于实时价差的单价：电动车电瓶品类收货价。"""
+        cat_id = self._resolve_ev_battery_category_id(cur)
+        if cat_id is None:
+            return {}
         cur.execute(
-            "SELECT warehouse_id, warehouse_price FROM pd_warehouse_spread_configs "
-            "WHERE warehouse_price IS NOT NULL"
+            """
+            SELECT warehouse_id, price_per_ton
+            FROM warehouse_category_receipt_prices
+            WHERE category_id = %s AND price_per_ton IS NOT NULL
+            """,
+            (int(cat_id),),
         )
         out: Dict[int, Decimal] = {}
         for wid, price in cur.fetchall():
@@ -7927,12 +7965,23 @@ class TLService:
                 out[int(wid)] = Decimal(str(price))
         return out
 
+    def _maybe_recompute_link_spreads_for_receipt_category(
+        self,
+        cur,
+        category_id: int,
+        warehouse_ids: Optional[Iterable[int]] = None,
+    ) -> None:
+        ev_cat = self._resolve_ev_battery_category_id(cur)
+        if ev_cat is None or int(category_id) != int(ev_cat):
+            return
+        self._recompute_link_realtime_spreads(cur, warehouse_ids)
+
     def _recompute_link_realtime_spreads(
         self, cur, warehouse_ids: Optional[Iterable[int]] = None
     ) -> int:
         """
-        源库房与出边绑定对标库房均存在库房定价时：实时价差 = 源定价 - 对标定价。
-        多条出边时取 link id 最小且对标库房有定价的一条。
+        源库房与出边绑定对标库房均有电动车电瓶收货价时：实时价差 = 源收货价 - 对标收货价。
+        多条出边时取 link id 最小且对标库房有收货价的一条。
         """
         price_map = self._load_warehouse_price_map(cur)
         if not price_map:
@@ -8718,11 +8767,10 @@ class TLService:
     ) -> Dict[str, Any]:
         if warehouse_id < 1 or category_id < 1:
             raise ValueError("库房或品类 id 无效")
-        inv_day = (
-            date.fromisoformat(str(inventory_date).strip())
-            if inventory_date and str(inventory_date).strip()
-            else self._pricing_calendar_date()
-        )
+        if inventory_date is not None and str(inventory_date).strip():
+            inv_day = self._parse_calendar_date_str(inventory_date)
+        else:
+            inv_day = self._pricing_calendar_date()
         with get_conn() as conn:
             conn.autocommit(False)
             try:
@@ -8788,7 +8836,7 @@ class TLService:
     ) -> Dict[str, Any]:
         if warehouse_id < 1:
             raise ValueError("库房 id 无效")
-        inv_day = date.fromisoformat(str(inventory_date).strip())
+        inv_day = self._parse_calendar_date_str(inventory_date)
         with get_conn() as conn:
             conn.autocommit(False)
             try:
@@ -9238,6 +9286,9 @@ class TLService:
                     )
                     row = cur.fetchone()
                     rec_id = int(row[0]) if row else 0
+                    self._maybe_recompute_link_spreads_for_receipt_category(
+                        cur, int(category_id), [int(warehouse_id)]
+                    )
                 conn.commit()
             except Exception:
                 conn.rollback()
@@ -9303,6 +9354,9 @@ class TLService:
                         source="manual",
                     )
                     self._sync_warehouse_receipt_price_from_history(cur, wh_id, cat_id)
+                    self._maybe_recompute_link_spreads_for_receipt_category(
+                        cur, cat_id, [wh_id]
+                    )
                 conn.commit()
             except Exception:
                 conn.rollback()
@@ -9317,13 +9371,31 @@ class TLService:
         if price_id < 1:
             raise ValueError("id 无效")
         with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "DELETE FROM warehouse_category_receipt_prices WHERE id = %s",
-                    (int(price_id),),
-                )
-                if cur.rowcount == 0:
-                    raise ValueError("记录不存在")
+            conn.autocommit(False)
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT warehouse_id, category_id
+                        FROM warehouse_category_receipt_prices WHERE id = %s
+                        """,
+                        (int(price_id),),
+                    )
+                    row = cur.fetchone()
+                    if not row:
+                        raise ValueError("记录不存在")
+                    wh_id, cat_id = int(row[0]), int(row[1])
+                    cur.execute(
+                        "DELETE FROM warehouse_category_receipt_prices WHERE id = %s",
+                        (int(price_id),),
+                    )
+                    self._maybe_recompute_link_spreads_for_receipt_category(
+                        cur, cat_id, [wh_id]
+                    )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
         return {"code": 200, "msg": "已删除收货价格"}
 
     def import_warehouse_receipt_prices_excel(self, content: bytes) -> Dict[str, Any]:
@@ -9336,6 +9408,7 @@ class TLService:
         success_list: List[Dict[str, Any]] = []
         failed_list: List[Dict[str, Any]] = []
         default_day = self._pricing_calendar_date()
+        receipt_wh_for_spread: Set[int] = set()
 
         with get_conn() as conn:
             conn.autocommit(False)
@@ -9343,6 +9416,7 @@ class TLService:
                 with conn.cursor() as cur:
                     exact, canon, _provinces = self._load_warehouse_match_indexes(cur)
                     fuzzy_wh = self._load_warehouse_fuzzy_candidates(cur)
+                    ev_cat_id = self._resolve_ev_battery_category_id(cur)
                     for row in parsed_rows:
                         try:
                             wh_id, match_kind = self._match_warehouse_id_for_import(
@@ -9381,6 +9455,8 @@ class TLService:
                             found = cur.fetchone()
                             rec_id = int(found[0]) if found else 0
                             stats["success"] += 1
+                            if ev_cat_id is not None and int(cat_id) == int(ev_cat_id):
+                                receipt_wh_for_spread.add(int(wh_id))
                             success_list.append(
                                 {
                                     "Excel行": row.excel_row,
@@ -9406,6 +9482,10 @@ class TLService:
                                     "失败原因": str(e),
                                 }
                             )
+                    if receipt_wh_for_spread and ev_cat_id is not None:
+                        self._maybe_recompute_link_spreads_for_receipt_category(
+                            cur, int(ev_cat_id), receipt_wh_for_spread
+                        )
                 conn.commit()
             except Exception:
                 conn.rollback()

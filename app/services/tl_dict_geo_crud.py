@@ -21,6 +21,22 @@ from app.services.tianditu_geocoder import GeocoderError, maybe_geocode
 
 logger = logging.getLogger(__name__)
 
+_EV_BATTERY_CATEGORY_NAMES: Tuple[str, ...] = ("电动车电瓶", "电动电瓶")
+
+
+def resolve_ev_battery_category_id(cur) -> Optional[int]:
+    """解析电动车电瓶品类 id（用于实时价差=收货价之差）。"""
+    for name in _EV_BATTERY_CATEGORY_NAMES:
+        cur.execute(
+            "SELECT category_id FROM dict_categories WHERE name = %s AND is_active = 1 LIMIT 1",
+            (name,),
+        )
+        row = cur.fetchone()
+        if row:
+            return int(row[0])
+    return None
+
+
 CODE_OK = 0
 CODE_VALIDATION = 1001
 CODE_NOT_FOUND = 1002
@@ -1184,24 +1200,28 @@ def warehouse_links_realtime_spread_list(
     has_realtime_spread: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """
-    库房关联实时价差列表：每条有向边返回源/对标库房定价及实时价差（源定价−对标定价）。
-    定价来自 pd_warehouse_spread_configs.warehouse_price。
+    库房关联实时价差列表：每条有向边返回源/对标库房电动车电瓶收货价及实时价差（源−对标）。
+    价格来自 warehouse_category_receipt_prices（品类=电动车电瓶）。
     """
     try:
         page = max(1, page)
         size = min(200, max(1, size))
         offset = (page - 1) * size
 
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                ev_cat_id = resolve_ev_battery_category_id(cur)
+
         conds: List[str] = ["1=1"]
         params: List[Any] = []
 
         if has_realtime_spread is True:
             conds.append(
-                "wsc_f.warehouse_price IS NOT NULL AND wsc_t.warehouse_price IS NOT NULL"
+                "wcrp_f.price_per_ton IS NOT NULL AND wcrp_t.price_per_ton IS NOT NULL"
             )
         elif has_realtime_spread is False:
             conds.append(
-                "(wsc_f.warehouse_price IS NULL OR wsc_t.warehouse_price IS NULL)"
+                "(wcrp_f.price_per_ton IS NULL OR wcrp_t.price_per_ton IS NULL)"
             )
 
         if warehouse_id is not None and int(warehouse_id) >= 1:
@@ -1223,14 +1243,28 @@ def warehouse_links_realtime_spread_list(
             params.extend([k, k])
 
         where_sql = " AND ".join(conds)
+        receipt_join = ""
+        if ev_cat_id is not None:
+            receipt_join = (
+                "LEFT JOIN warehouse_category_receipt_prices wcrp_f "
+                "ON wcrp_f.warehouse_id = l.from_warehouse_id "
+                f"AND wcrp_f.category_id = {int(ev_cat_id)} "
+                "LEFT JOIN warehouse_category_receipt_prices wcrp_t "
+                "ON wcrp_t.warehouse_id = l.to_warehouse_id "
+                f"AND wcrp_t.category_id = {int(ev_cat_id)} "
+            )
+        else:
+            receipt_join = (
+                "LEFT JOIN warehouse_category_receipt_prices wcrp_f "
+                "ON 1=0 LEFT JOIN warehouse_category_receipt_prices wcrp_t ON 1=0 "
+            )
         base_from = (
             "FROM dict_warehouse_links l "
             "INNER JOIN dict_warehouses wf ON wf.id = l.from_warehouse_id "
             "INNER JOIN dict_warehouses wt ON wt.id = l.to_warehouse_id "
             "LEFT JOIN dict_warehouse_types wfs ON wf.warehouse_type_id = wfs.id "
             "LEFT JOIN dict_warehouse_types wts ON wt.warehouse_type_id = wts.id "
-            "LEFT JOIN pd_warehouse_spread_configs wsc_f ON wsc_f.warehouse_id = l.from_warehouse_id "
-            "LEFT JOIN pd_warehouse_spread_configs wsc_t ON wsc_t.warehouse_id = l.to_warehouse_id "
+            f"{receipt_join}"
             f"WHERE {where_sql}"
         )
 
@@ -1243,8 +1277,8 @@ def warehouse_links_realtime_spread_list(
                     "SELECT l.id AS link_id, l.created_at AS link_created_at, "
                     "l.tier_price_spread AS tier_price_spread, "
                     "l.from_warehouse_id, l.to_warehouse_id, "
-                    "wsc_f.warehouse_price AS from_warehouse_price, "
-                    "wsc_t.warehouse_price AS to_warehouse_price, "
+                    "wcrp_f.price_per_ton AS from_warehouse_price, "
+                    "wcrp_t.price_per_ton AS to_warehouse_price, "
                     "wf.id AS sf_id, wf.name AS sf_name, wf.province AS sf_province, "
                     "wf.city AS sf_city, wf.district AS sf_district, wf.address AS sf_address, "
                     "wf.warehouse_type_id AS sf_warehouse_type_id, wf.color_config AS sf_color_config, "

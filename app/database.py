@@ -546,7 +546,7 @@ TABLE_STATEMENTS = [
         gross_margin_config DECIMAL(18, 4) DEFAULT NULL COMMENT '毛利（配置版）',
         warehouse_price DECIMAL(18, 4) DEFAULT NULL COMMENT '库房定价（Excel定价列等人工录入）',
         link_warehouse_id INT DEFAULT NULL COMMENT '用于计算实时价差的绑定对标库房ID',
-        link_realtime_spread DECIMAL(18, 4) DEFAULT NULL COMMENT '实时价差=本库房定价-绑定库房定价',
+        link_realtime_spread DECIMAL(18, 4) DEFAULT NULL COMMENT '实时价差=本库房电动车电瓶收货价-绑定库房同品类收货价',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         CONSTRAINT fk_wsc_wh FOREIGN KEY (warehouse_id) REFERENCES dict_warehouses (id)
@@ -1350,7 +1350,7 @@ def ensure_pd_pricing_benchmark_tables() -> None:
                     gross_margin_config DECIMAL(18, 4) DEFAULT NULL COMMENT '毛利（配置版）',
                     warehouse_price DECIMAL(18, 4) DEFAULT NULL COMMENT '库房定价',
                     link_warehouse_id INT DEFAULT NULL COMMENT '绑定对标库房ID',
-                    link_realtime_spread DECIMAL(18, 4) DEFAULT NULL COMMENT '实时价差',
+                    link_realtime_spread DECIMAL(18, 4) DEFAULT NULL COMMENT '实时价差=电动车电瓶收货价之差',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                     CONSTRAINT fk_wsc_wh FOREIGN KEY (warehouse_id) REFERENCES dict_warehouses (id)
@@ -1735,7 +1735,7 @@ def _ensure_pd_warehouse_spread_config_columns(cursor) -> None:
         (
             "link_realtime_spread",
             "ALTER TABLE pd_warehouse_spread_configs ADD COLUMN link_realtime_spread "
-            "DECIMAL(18, 4) DEFAULT NULL COMMENT '实时价差=本库房定价-绑定库房定价' AFTER link_warehouse_id",
+            "DECIMAL(18, 4) DEFAULT NULL COMMENT '实时价差=本库房电动车电瓶收货价-绑定库房同品类收货价' AFTER link_warehouse_id",
         ),
     ]
     for col, ddl in alters:
