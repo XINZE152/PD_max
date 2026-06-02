@@ -1501,6 +1501,10 @@ def create_tables() -> None:
         ensure_warehouse_inventory_and_receipt_price_tables()
     except Exception:
         logger.exception("检查/创建库房库存快照与按品种收货价格表失败")
+    try:
+        ensure_pd_ip_prediction_results_v2_columns()
+    except Exception:
+        logger.exception("检查/添加 pd_ip_prediction_results v2 综合预测列失败")
 
 
 def ensure_warehouse_inventory_and_receipt_price_tables() -> None:
@@ -1873,6 +1877,50 @@ def ensure_dict_warehouse_links_table() -> None:
             )
         connection.commit()
         logger.info("dict_warehouse_links 表已就绪")
+    finally:
+        connection.close()
+
+
+def ensure_pd_ip_prediction_results_v2_columns() -> None:
+    """已有库升级：为 pd_ip_prediction_results 新增综合预测（v2）字段。"""
+    config_dict = get_mysql_config()
+    connection = pymysql.connect(**config_dict)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SHOW TABLES LIKE 'pd_ip_prediction_results'")
+            if cursor.fetchone() is None:
+                return
+
+            def _has_col(col: str) -> bool:
+                cursor.execute(
+                    "SELECT COUNT(*) FROM information_schema.columns "
+                    "WHERE table_schema = DATABASE() AND table_name = 'pd_ip_prediction_results' "
+                    "AND column_name = %s",
+                    (col,),
+                )
+                return cursor.fetchone()[0] > 0
+
+            columns = [
+                ("ship_probability", "VARCHAR(32) DEFAULT NULL COMMENT '发货概率: high/medium/low'"),
+                ("expected_ship_date", "DATE DEFAULT NULL COMMENT '预计发货时间'"),
+                ("expected_shipment", "DECIMAL(18,4) DEFAULT NULL COMMENT '预计发货量'"),
+                ("confidence_level", "VARCHAR(32) DEFAULT NULL COMMENT '预测置信度'"),
+                ("main_factors", "TEXT DEFAULT NULL COMMENT '主要原因'"),
+                ("history_analysis", "TEXT DEFAULT NULL COMMENT '历史发货规律分析'"),
+                ("price_sensitivity_analysis", "TEXT DEFAULT NULL COMMENT '价格敏感度分析'"),
+                ("price_competitiveness_analysis", "TEXT DEFAULT NULL COMMENT '价格竞争力分析'"),
+                ("holiday_analysis", "TEXT DEFAULT NULL COMMENT '节假日影响分析'"),
+                ("weather_analysis", "TEXT DEFAULT NULL COMMENT '天气物流影响分析'"),
+                ("comprehensive_analysis", "TEXT DEFAULT NULL COMMENT '综合判断（完整报告）'"),
+            ]
+            for col_name, col_def in columns:
+                if not _has_col(col_name):
+                    cursor.execute(
+                        f"ALTER TABLE pd_ip_prediction_results ADD COLUMN {col_name} {col_def} "
+                        f"AFTER raw_response_excerpt"
+                    )
+                    logger.info("已为 pd_ip_prediction_results 添加 %s 列", col_name)
+        connection.commit()
     finally:
         connection.close()
 

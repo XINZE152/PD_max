@@ -229,6 +229,18 @@ class StoredPredictionResultItem(BaseModel):
     latency_ms: Optional[float] = None
     cost_usd: Optional[float] = None
     raw_response_excerpt: Optional[str] = None
+    # 综合预测（v2）字段
+    ship_probability: Optional[str] = None
+    expected_ship_date: Optional[date] = None
+    expected_shipment: Optional[Decimal] = None
+    confidence_level: Optional[str] = None
+    main_factors: Optional[str] = None
+    history_analysis: Optional[str] = None
+    price_sensitivity_analysis: Optional[str] = None
+    price_competitiveness_analysis: Optional[str] = None
+    holiday_analysis: Optional[str] = None
+    weather_analysis: Optional[str] = None
+    comprehensive_analysis: Optional[str] = None
     created_at: datetime
 
     @field_validator("warnings", mode="before")
@@ -255,3 +267,105 @@ class StoredPredictionResultListResponse(BaseModel):
     page: int
     page_size: int
     items: list[StoredPredictionResultItem]
+
+
+# ---------------------------------------------------------------------------
+# 综合预测（v2）Schemas
+# ---------------------------------------------------------------------------
+
+
+class ShipProbability(str, Enum):
+    """发货概率枚举。"""
+
+    HIGH = "高"
+    MEDIUM = "中"
+    LOW = "低"
+
+
+class ConfidenceLevelV2(str, Enum):
+    """综合预测置信度枚举。"""
+
+    HIGH = "高"
+    MEDIUM = "中"
+    LOW = "低"
+
+
+class ComprehensivePredictionItem(BaseModel):
+    """综合预测单条结果：含六大维度分析与综合判断。"""
+
+    model_config = ConfigDict(
+        from_attributes=True,
+        populate_by_name=True,
+        alias_generator=_snake_to_camel,
+    )
+
+    target_date: date = Field(..., description="预测目标日期")
+    ship_probability: ShipProbability = Field(..., description="发货概率：高/中/低")
+    expected_ship_date: Optional[date] = Field(default=None, description="预计发货时间")
+    expected_shipment: Decimal = Field(..., ge=0, description="预计发货量")
+    confidence_level: ConfidenceLevelV2 = Field(..., description="预测置信度：高/中/低")
+    main_factors: str = Field(..., description="影响判断的主要因素")
+
+    # 六大段分析
+    history_analysis: str = Field(..., description="历史发货规律分析")
+    price_sensitivity_analysis: str = Field(..., description="价格敏感度分析")
+    price_competitiveness_analysis: str = Field(..., description="目标冶炼厂价格竞争力分析")
+    holiday_analysis: str = Field(..., description="节假日影响")
+    weather_analysis: str = Field(..., description="天气物流影响")
+    comprehensive_analysis: str = Field(..., description="综合判断（完整报告）")
+
+    @field_validator("expected_shipment", mode="before")
+    @classmethod
+    def coerce_shipment(cls, v: Any) -> Any:
+        if v is None:
+            return Decimal("0")
+        return v
+
+    @field_validator("ship_probability", mode="before")
+    @classmethod
+    def normalize_ship_prob(cls, v: Any) -> str:
+        if v is None:
+            return ShipProbability.MEDIUM.value
+        s = str(v).strip().lower()
+        mapping = {
+            "高": "高", "high": "高", "h": "高",
+            "中": "中", "medium": "中", "m": "中",
+            "低": "低", "low": "低", "l": "低",
+        }
+        return mapping.get(s, s)
+
+    @field_validator("confidence_level", mode="before")
+    @classmethod
+    def normalize_confidence_v2(cls, v: Any) -> str:
+        if v is None:
+            return ConfidenceLevelV2.MEDIUM.value
+        s = str(v).strip().lower()
+        mapping = {
+            "高": "高", "high": "高", "h": "高",
+            "中": "中", "medium": "中", "m": "中",
+            "低": "低", "low": "低", "l": "低",
+        }
+        return mapping.get(s, s)
+
+
+class ComprehensivePredictionResult(BaseModel):
+    """综合预测响应包装。"""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    warehouse: str
+    product_variety: str
+    smelter: Optional[str] = Field(default=None, description="冶炼厂")
+    regional_manager: Optional[str] = None
+    items: list[ComprehensivePredictionItem]
+    provider_used: str = Field(default="unknown", description="实际使用的供应商")
+    latency_ms: float = Field(default=0.0, ge=0)
+    cost_usd: Optional[float] = Field(default=None, ge=0)
+    cache_hit: bool = False
+    parse_error: Optional[str] = Field(default=None, description="若 AI 返回非 JSON 的说明")
+
+
+class ComprehensiveBatchRequest(BatchPredictionRequest):
+    """综合预测批量请求（复用 BatchPredictionRequest 结构）。"""
+
+    pass

@@ -4,10 +4,20 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
-from app.intelligent_prediction.api.v1 import forecast, history, knowledge, lead_prices, predict
+from app.intelligent_prediction.api.v1 import (
+    comprehensive_predict,
+    forecast,
+    history,
+    knowledge,
+    lead_prices,
+    predict,
+)
 
 intelligent_prediction_router = APIRouter()
 intelligent_prediction_router.include_router(predict.router, prefix="/predict", tags=["智能预测"])
+intelligent_prediction_router.include_router(
+    comprehensive_predict.router, prefix="/predict", tags=["综合预测"],
+)
 intelligent_prediction_router.include_router(forecast.router, prefix="/forecast", tags=["规则预测"])
 intelligent_prediction_router.include_router(lead_prices.router, prefix="/lead-market-prices", tags=["铅价行情"])
 intelligent_prediction_router.include_router(history.router, prefix="/delivery-history", tags=["送货历史"])

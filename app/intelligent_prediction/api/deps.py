@@ -7,6 +7,11 @@ from fastapi import Depends
 from app.intelligent_prediction.db import get_prediction_db_session
 from app.intelligent_prediction.services.ai_client import AIModelClient, get_ai_client
 from app.intelligent_prediction.services.cache_manager import CacheManager, get_cache_manager
+from app.intelligent_prediction.services.comprehensive_prediction_service import (
+    ComprehensivePredictionService,
+    get_comprehensive_prediction_service,
+)
+from app.intelligent_prediction.services.comprehensive_prompt_builder import ComprehensivePromptBuilder
 from app.intelligent_prediction.services.history_service import HistoryService, get_history_service
 from app.intelligent_prediction.services.prediction_service import PredictionService, get_prediction_service
 from app.intelligent_prediction.services.prompt_builder import PromptBuilder
@@ -31,10 +36,18 @@ def get_prediction_service_dep(
     return get_prediction_service(ai, cache, PromptBuilder())
 
 
+def get_comprehensive_prediction_service_dep(
+    ai: AIModelClient = Depends(get_ai_client_dep),
+    cache: CacheManager = Depends(get_cache_manager_dep),
+) -> ComprehensivePredictionService:
+    return get_comprehensive_prediction_service(ai, cache, ComprehensivePromptBuilder())
+
+
 __all__ = [
     "get_prediction_db_session",
     "get_ai_client_dep",
     "get_cache_manager_dep",
     "get_history_service_dep",
     "get_prediction_service_dep",
+    "get_comprehensive_prediction_service_dep",
 ]

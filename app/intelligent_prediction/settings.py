@@ -154,6 +154,28 @@ class IntelligentPredictionSettings(BaseModel):
     weather_api_base_url: str = Field(default_factory=lambda: (os.getenv("WEATHER_API_BASE_URL") or "").strip())
     weather_api_key: str = Field(default_factory=lambda: (os.getenv("WEATHER_API_KEY") or "").strip())
 
+    # 综合预测（v2）权重配置：历史规律 > 价格竞争力 > 价格敏感度 > 节假日 > 天气物流
+    prediction_v2_history_weight: float = Field(
+        default_factory=lambda: _env_float("PREDICTION_V2_HISTORY_WEIGHT", 0.40),
+        description="综合预测中历史规律权重（默认 0.40）",
+    )
+    prediction_v2_price_weight: float = Field(
+        default_factory=lambda: _env_float("PREDICTION_V2_PRICE_WEIGHT", 0.30),
+        description="综合预测中价格竞争力权重（默认 0.30）",
+    )
+    prediction_v2_sensitivity_weight: float = Field(
+        default_factory=lambda: _env_float("PREDICTION_V2_SENSITIVITY_WEIGHT", 0.15),
+        description="综合预测中仓库价格敏感度权重（默认 0.15）",
+    )
+    prediction_v2_holiday_weight: float = Field(
+        default_factory=lambda: _env_float("PREDICTION_V2_HOLIDAY_WEIGHT", 0.10),
+        description="综合预测中节假日权重（默认 0.10）",
+    )
+    prediction_v2_weather_weight: float = Field(
+        default_factory=lambda: _env_float("PREDICTION_V2_WEATHER_WEIGHT", 0.05),
+        description="综合预测中天气物流权重（默认 0.05）",
+    )
+
 
 def load_intelligent_prediction_settings() -> IntelligentPredictionSettings:
     return IntelligentPredictionSettings()
