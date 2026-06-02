@@ -874,22 +874,33 @@ class TLService:
                             COALESCE(
                                 MAX(CASE WHEN dc.is_main = 1 THEN dc.name END),
                                 MAX(dc.name)
-                            ) AS cat_name
+                            ) AS cat_name,
+                            latest_price.price_date
                         FROM warehouse_category_receipt_prices wcrp
                         JOIN dict_categories dc ON dc.category_id = wcrp.category_id
                             AND dc.is_active = 1
+                        LEFT JOIN (
+                            SELECT warehouse_id, category_id, MAX(price_date) AS price_date
+                            FROM warehouse_category_receipt_price_history
+                            GROUP BY warehouse_id, category_id
+                        ) latest_price ON latest_price.warehouse_id = wcrp.warehouse_id
+                            AND latest_price.category_id = wcrp.category_id
                         WHERE wcrp.warehouse_id IN ({ph})
-                        GROUP BY wcrp.warehouse_id, wcrp.category_id, wcrp.price_per_ton
+                        GROUP BY wcrp.warehouse_id, wcrp.category_id, wcrp.price_per_ton,
+                                 latest_price.price_date
                         ORDER BY wcrp.warehouse_id, wcrp.category_id
                         """,
                         tuple(wh_ids),
                     )
-                    for wh_id, cat_id, price, cat_name in cur.fetchall():
+                    for wh_id, cat_id, price, cat_name, price_date in cur.fetchall():
                         prices_by_wh[int(wh_id)].append(
                             {
                                 "品类id": int(cat_id),
                                 "品类名": str(cat_name or ""),
                                 "价格": float(price),
+                                "价格日期": (
+                                    price_date.isoformat() if price_date else None
+                                ),
                             }
                         )
         except Exception as e:
