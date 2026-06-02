@@ -9269,6 +9269,20 @@ class TLService:
                     if not row:
                         raise ValueError("记录不存在")
                     wh_id, cat_id = int(row[0]), int(row[1])
+                    cur.execute(
+                        """
+                        DELETE FROM warehouse_category_receipt_price_history
+                        WHERE warehouse_id = %s AND category_id = %s
+                          AND price_date = (
+                              SELECT max_date FROM (
+                                  SELECT MAX(price_date) AS max_date
+                                  FROM warehouse_category_receipt_price_history
+                                  WHERE warehouse_id = %s AND category_id = %s
+                              ) t
+                          )
+                        """,
+                        (int(wh_id), int(cat_id), int(wh_id), int(cat_id)),
+                    )
                     history_id = self._upsert_warehouse_receipt_price_history(
                         cur,
                         warehouse_id=wh_id,
