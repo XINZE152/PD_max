@@ -315,6 +315,53 @@ def _jsonish(val: Any) -> Any:
     return val
 
 
+def get_feedback_status(task_id: str) -> Optional[str]:
+    """查询指定 task_id 的当前标注状态，返回 'correct' / 'wrong' / 'suspicious' 或 None（未标注）。"""
+    tid = str(task_id or "").strip()
+    if not tid:
+        return None
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT feedback_status FROM ai_detection_history "
+                "WHERE task_id=%s AND mode='async_v3' AND feedback_status IS NOT NULL "
+                "ORDER BY id DESC LIMIT 1",
+                (tid,),
+            )
+            row = cur.fetchone()
+    return row[0] if row and row[0] else None
+
+
+def mark_feedback_status(task_id: str, judgment: str) -> None:
+    """将指定 task_id 的标注状态写入数据库（供提交标注时调用）。"""
+    tid = str(task_id or "").strip()
+    if not tid:
+        return
+    judgment = str(judgment or "").strip().lower()
+    if judgment not in ("correct", "wrong", "suspicious"):
+        return
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE ai_detection_history SET feedback_status=%s WHERE task_id=%s AND mode='async_v3'",
+                (judgment, tid),
+            )
+
+
+def clear_feedback_status(task_id: str) -> bool:
+    """清除指定 task_id 的标注状态（恢复为未标注），供删除标注时调用。"""
+    tid = str(task_id or "").strip()
+    if not tid:
+        return False
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE ai_detection_history SET feedback_status=NULL WHERE task_id=%s AND mode='async_v3'",
+                (tid,),
+            )
+            return bool(cur.rowcount)
+
+
 def list_ai_detection_history(
     *,
     page: int = 1,
@@ -356,7 +403,7 @@ def list_ai_detection_history(
 
             cur.execute(
                 f"""
-                SELECT id, created_at, mode, task_id, original_filename, bbox, status, outcome_json, stored_image
+                SELECT id, created_at, mode, task_id, original_filename, bbox, status, outcome_json, stored_image, feedback_status
                 FROM ai_detection_history
                 WHERE created_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL %s DAY)
                 {mode_clause}

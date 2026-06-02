@@ -700,12 +700,12 @@ def get_link_realtime_spread_list(
     ),
     has_realtime_spread: Optional[bool] = Query(
         None,
-        description="true=源/对标库房均已配置库房定价并可计算价差；false=至少一方未配置定价；不传=全部",
+        description="true=源/对标库房均已配置电动车电瓶收货价并可计算价差；false=至少一方未配置；不传=全部",
     ),
     service: TLService = Depends(get_tl_service),
 ):
     """
-    分页返回各关联边上的源库房定价、对标库房定价及实时价差（源定价−对标定价）。
+    分页返回各关联边上的源/对标库房电动车电瓶收货价及实时价差（源收货价−对标收货价）。
     筛选条件与 get_warehouse_links_list / get_tier_price_spread_list 一致。
     """
     try:

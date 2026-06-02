@@ -397,8 +397,10 @@ TABLE_STATEMENTS = [
         status VARCHAR(32) NOT NULL COMMENT 'COMPLETED | FAILED',
         outcome_json JSON NOT NULL COMMENT '结果摘要：result / multi_results / error_msg',
         stored_image VARCHAR(255) NULL COMMENT '归档图文件名（置于 ai_detection_history_images/）',
+        feedback_status VARCHAR(20) NULL COMMENT '标注状态：correct | wrong | suspicious，NULL=未标注',
         INDEX idx_ai_hist_created (created_at),
-        INDEX idx_ai_hist_task (task_id)
+        INDEX idx_ai_hist_task (task_id),
+        INDEX idx_ai_hist_feedback (feedback_status)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='AI图片鉴伪历史记录';
     """,
     # 智能送货量预测（与 intelligent_prediction ORM 表名一致）
@@ -544,7 +546,7 @@ TABLE_STATEMENTS = [
         gross_margin_config DECIMAL(18, 4) DEFAULT NULL COMMENT '毛利（配置版）',
         warehouse_price DECIMAL(18, 4) DEFAULT NULL COMMENT '库房定价（Excel定价列等人工录入）',
         link_warehouse_id INT DEFAULT NULL COMMENT '用于计算实时价差的绑定对标库房ID',
-        link_realtime_spread DECIMAL(18, 4) DEFAULT NULL COMMENT '实时价差=本库房定价-绑定库房定价',
+        link_realtime_spread DECIMAL(18, 4) DEFAULT NULL COMMENT '实时价差=本库房电动车电瓶收货价-绑定库房同品类收货价',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         CONSTRAINT fk_wsc_wh FOREIGN KEY (warehouse_id) REFERENCES dict_warehouses (id)
@@ -1261,6 +1263,32 @@ def ensure_ai_detection_history_stored_image_column() -> None:
         connection.close()
 
 
+def ensure_ai_detection_history_feedback_status_column() -> None:
+    """已有库升级：为 ai_detection_history 增加 feedback_status（新建库已由 CREATE TABLE 包含）。"""
+    config_dict = get_mysql_config()
+    connection = pymysql.connect(**config_dict)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT COUNT(*) FROM information_schema.columns "
+                "WHERE table_schema = DATABASE() AND table_name = 'ai_detection_history' "
+                "AND column_name = 'feedback_status'"
+            )
+            if cursor.fetchone()[0] == 0:
+                cursor.execute(
+                    "ALTER TABLE ai_detection_history ADD COLUMN feedback_status VARCHAR(20) NULL "
+                    "COMMENT '标注状态：correct | wrong | suspicious，NULL=未标注' "
+                    "AFTER stored_image"
+                )
+                cursor.execute(
+                    "ALTER TABLE ai_detection_history ADD INDEX idx_ai_hist_feedback (feedback_status)"
+                )
+                logger.info("已为 ai_detection_history 添加 feedback_status 列及索引")
+        connection.commit()
+    finally:
+        connection.close()
+
+
 def ensure_pd_pricing_benchmark_tables() -> None:
     """旧库补建：对标定价 / 库房差额 / AI 分析快照等表（新建库已由 TABLE_STATEMENTS 创建）。"""
     config_dict = get_mysql_config()
@@ -1322,7 +1350,7 @@ def ensure_pd_pricing_benchmark_tables() -> None:
                     gross_margin_config DECIMAL(18, 4) DEFAULT NULL COMMENT '毛利（配置版）',
                     warehouse_price DECIMAL(18, 4) DEFAULT NULL COMMENT '库房定价',
                     link_warehouse_id INT DEFAULT NULL COMMENT '绑定对标库房ID',
-                    link_realtime_spread DECIMAL(18, 4) DEFAULT NULL COMMENT '实时价差',
+                    link_realtime_spread DECIMAL(18, 4) DEFAULT NULL COMMENT '实时价差=电动车电瓶收货价之差',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                     CONSTRAINT fk_wsc_wh FOREIGN KEY (warehouse_id) REFERENCES dict_warehouses (id)
@@ -1421,6 +1449,10 @@ def create_tables() -> None:
         ensure_ai_detection_history_stored_image_column()
     except Exception:
         logger.exception("检查/添加 ai_detection_history.stored_image 失败")
+    try:
+        ensure_ai_detection_history_feedback_status_column()
+    except Exception:
+        logger.exception("检查/添加 ai_detection_history.feedback_status 失败")
     try:
         ensure_pd_ip_delivery_records_smelter_column()
     except Exception:
@@ -1703,7 +1735,7 @@ def _ensure_pd_warehouse_spread_config_columns(cursor) -> None:
         (
             "link_realtime_spread",
             "ALTER TABLE pd_warehouse_spread_configs ADD COLUMN link_realtime_spread "
-            "DECIMAL(18, 4) DEFAULT NULL COMMENT '实时价差=本库房定价-绑定库房定价' AFTER link_warehouse_id",
+            "DECIMAL(18, 4) DEFAULT NULL COMMENT '实时价差=本库房电动车电瓶收货价-绑定库房同品类收货价' AFTER link_warehouse_id",
         ),
     ]
     for col, ddl in alters:

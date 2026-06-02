@@ -969,7 +969,11 @@ class WarehouseInventoryCreate(BaseModel):
     库房id: int = Field(..., ge=1)
     品类id: int = Field(..., ge=1, description="dict_categories.category_id")
     当前库存: float = Field(..., description="库存吨数")
-    库存日期: Optional[str] = Field(None, description="YYYY-MM-DD；缺省为当天")
+    库存日期: Optional[str] = Field(
+        None,
+        description="YYYY-MM-DD；缺省为当天",
+        validation_alias=AliasChoices("库存日期", "inventory_date", "inventoryDate"),
+    )
 
 
 class WarehouseInventoryDelete(BaseModel):
