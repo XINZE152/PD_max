@@ -2279,6 +2279,8 @@ def warehouse_inventories(
     warehouse_id: Optional[int] = Query(None, ge=1),
     category_id: Optional[int] = Query(None, ge=1),
     keyword: Optional[str] = Query(None, description="库房名称或品类名模糊"),
+    date_from: Optional[str] = Query(None, description="库存日期起 YYYY-MM-DD"),
+    date_to: Optional[str] = Query(None, description="库存日期止 YYYY-MM-DD"),
     service: TLService = Depends(get_tl_service),
 ):
     try:
@@ -2288,6 +2290,8 @@ def warehouse_inventories(
             warehouse_id=warehouse_id,
             category_id=category_id,
             keyword=keyword,
+            date_from=date_from,
+            date_to=date_to,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -2382,6 +2386,8 @@ def warehouse_receipt_prices(
     warehouse_id: Optional[int] = Query(None, ge=1),
     category_id: Optional[int] = Query(None, ge=1),
     keyword: Optional[str] = Query(None, description="库房名/品种名模糊"),
+    date_from: Optional[str] = Query(None, description="更新日期起 YYYY-MM-DD"),
+    date_to: Optional[str] = Query(None, description="更新日期止 YYYY-MM-DD"),
     service: TLService = Depends(get_tl_service),
 ):
     try:
@@ -2391,6 +2397,8 @@ def warehouse_receipt_prices(
             warehouse_id=warehouse_id,
             category_id=category_id,
             keyword=keyword,
+            date_from=date_from,
+            date_to=date_to,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -2427,7 +2435,7 @@ def warehouse_receipt_prices_update(
 ):
     try:
         return service.update_warehouse_receipt_price(
-            price_id, price_per_ton=body.价格
+            price_id, price_per_ton=body.价格, price_date=body.价格日期
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

@@ -3556,7 +3556,7 @@ class TLService:
         if pr is not None:
             src["price_reverse_invoice"] = SOURCE_ORIGINAL
 
-        return {
+        item = {
             "冶炼厂名": sm,
             "冶炼厂id": None,
             "品类名": cat,
@@ -3571,6 +3571,12 @@ class TLService:
             "反向发票价格": pr,
             "价格字段来源": src,
         }
+
+        quote_date = row_fields.get("quote_date")
+        if quote_date:
+            item["报价日期"] = str(quote_date).strip()[:10]
+
+        return item
 
     def _parse_quote_excel_workbook(self, content: bytes, filename: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any], Optional[str]]:
         """解析 xlsx 首工作表为 items + full_data；若「日期」列存在且全日相同则返回 suggested_quote_date。"""
@@ -4235,6 +4241,7 @@ class TLService:
         """按 id 更新 quote_details；本次请求中出现的价格字段作为锚点，按冶炼厂税率重算各档含税价。"""
         raw = body.model_dump(exclude_unset=True)
         detail_id = int(raw.pop("id"))
+        skip_tax_recalc = raw.pop("跳过税率换算", False)
         touched_cn: Set[str] = {k for k in raw if k in QUOTE_PRICE_ANCHOR_ORDER}
 
         try:
@@ -4302,7 +4309,7 @@ class TLService:
                                 break
 
                     tax_applied = False
-                    if touched_cn:
+                    if touched_cn and not skip_tax_recalc:
                         tax_applied = _apply_factory_tax_rates_to_quote_item(
                             item, tax_by_fid, touched_cn
                         )
@@ -4321,6 +4328,11 @@ class TLService:
                             merged_src["unit_price"] = SOURCE_ORIGINAL
                         else:
                             merged_src["unit_price"] = SOURCE_DERIVED
+                    elif skip_tax_recalc and touched_cn:
+                        for cn_key in touched_cn:
+                            db_key = API_KEY_TO_DB.get(cn_key, cn_key)
+                            if db_key:
+                                merged_src[db_key] = SOURCE_ORIGINAL
                     src_json = (
                         json.dumps(merged_src, ensure_ascii=False) if merged_src else None
                     )
@@ -8568,6 +8580,8 @@ class TLService:
         warehouse_id: Optional[int] = None,
         category_id: Optional[int] = None,
         keyword: Optional[str] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
     ) -> Dict[str, Any]:
         if page < 1:
             raise ValueError("page 必须 >= 1")
@@ -8585,6 +8599,12 @@ class TLService:
         if kw:
             conditions.append("(dw.name LIKE %s OR dc.name LIKE %s)")
             params.extend([f"%{kw}%", f"%{kw}%"])
+        if date_from and str(date_from).strip():
+            conditions.append("wis.inventory_date >= %s")
+            params.append(str(date_from).strip())
+        if date_to and str(date_to).strip():
+            conditions.append("wis.inventory_date <= %s")
+            params.append(str(date_to).strip())
         where_sql = " AND ".join(conditions)
         latest_join = """
             INNER JOIN (
@@ -9068,6 +9088,8 @@ class TLService:
         warehouse_id: Optional[int] = None,
         category_id: Optional[int] = None,
         keyword: Optional[str] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
     ) -> Dict[str, Any]:
         if page < 1:
             raise ValueError("page 必须 >= 1")
@@ -9085,6 +9107,12 @@ class TLService:
         if kw:
             conditions.append("(dw.name LIKE %s OR dc.name LIKE %s)")
             params.extend([f"%{kw}%", f"%{kw}%"])
+        if date_from and str(date_from).strip():
+            conditions.append("wcrp.updated_at >= %s")
+            params.append(str(date_from).strip())
+        if date_to and str(date_to).strip():
+            conditions.append("wcrp.updated_at <= %s")
+            params.append(str(date_to).strip() + " 23:59:59")
         where_sql = " AND ".join(conditions)
         with get_conn() as conn:
             with conn.cursor() as cur:
@@ -9208,11 +9236,15 @@ class TLService:
         }
 
     def update_warehouse_receipt_price(
-        self, price_id: int, *, price_per_ton: float
+        self, price_id: int, *, price_per_ton: float, price_date: Optional[str] = None
     ) -> Dict[str, Any]:
         if price_id < 1:
             raise ValueError("id 无效")
-        pd_day = self._pricing_calendar_date()
+        pd_day = (
+            date.fromisoformat(str(price_date).strip())
+            if price_date and str(price_date).strip()
+            else self._pricing_calendar_date()
+        )
         with get_conn() as conn:
             conn.autocommit(False)
             try:
