@@ -8721,7 +8721,6 @@ class TLService:
                 for r in cur.fetchall():
                     items.append(
                         {
-                            "id": int(r[0]),
                             "库房id": int(r[1]),
                             "库房名称": r[2],
                             "品类id": int(r[3]),
