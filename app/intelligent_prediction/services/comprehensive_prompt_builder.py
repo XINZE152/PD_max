@@ -64,7 +64,7 @@ SYSTEM_PROMPT_V2: str = (
     "- 预计发货量范围：必须引用 expected_shipment 的实际数值\n"
     "- 发货天数统计：comprehensive_analysis 中列出的发货天数必须等于该仓库所有 items 中 expected_shipment > 0 的条数\n"
     "- 发货日期列表：comprehensive_analysis 中列出的日期必须等于 expected_shipment > 0 的 target_date\n"
-    "不允许出现分析文本说"30-48吨"但 expected_shipment 实际为 90-140 吨的情况。\n"
+    "不允许出现分析文本说'30-48吨'但 expected_shipment 实际为 90-140 吨的情况。\n"
 )
 
 
