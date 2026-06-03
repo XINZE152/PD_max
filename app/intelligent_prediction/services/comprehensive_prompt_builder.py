@@ -15,7 +15,7 @@ from app.intelligent_prediction.schemas.prediction import PredictionHistoryPoint
 from app.intelligent_prediction.settings import settings
 
 SYSTEM_PROMPT_V2: str = (
-    "你是生产计划与送货量预测专家。请根据以下六大维度分析仓库未来是否会向目标冶炼厂发货，"
+    "你是送货量预测专家。请根据以下六大维度分析仓库未来是否会向目标冶炼厂发货，"
     "并输出 JSON 格式的预测结果。\n\n"
     "## 核心原则\n"
     "仓库发货的本质逻辑是：\n"
