@@ -1,0 +1,353 @@
+"""15 天发货预测提示词构建器（豆包方案）。
+
+将仓库历史、冶炼厂价格、SMM 铅价三组原始数据拼装为
+System + User prompt，交给 LLM 完成六大维度分析与逐日预测。
+"""
+
+from __future__ import annotations
+
+import statistics
+from collections import Counter
+from datetime import date, timedelta
+from decimal import Decimal
+from typing import Any, Optional
+
+from app.intelligent_prediction.schemas.doubao_prediction import (
+    DoubaoHistoryItem,
+    DoubaoPredictionRequest,
+    SMMPricingItem,
+    SmelterPriceItem,
+)
+
+# ---------------------------------------------------------------------------
+# System Prompt
+# ---------------------------------------------------------------------------
+
+SYSTEM_PROMPT: str = """\
+你是专业的仓储品类发货预测专家。你的任务是根据提供的历史送货数据、冶炼厂价格和SMM铅价，预测指定仓库发往冶炼厂未来15天的逐日发货吨数。
+
+【核心原则 · 优先级从高到低】
+历史整月发货规律（最重要） > 品类发货周期 > 库存周转 > 品类价格 > 节假日 > 天气
+
+【重要规则 · 必须严格遵守】
+1. 仓库发货 **按品类区分**，冶炼厂收货价格 **按品类区分**。
+2. 价格优势评估 **只针对当前发货品类**，不混用其他品类。
+3. 分析历史发货规律时，**必须优先看整月总发货次数、整月总货量、月度整体发货频率**，不能只看短期连续两次的间隔。
+4. 如果一个月只发几次，即使短期间隔很近，也判定为 **月度低频仓库**，未来15天不会高频发货。
+5. 严禁连续3天以上 predicted_weight 完全相同；必须模拟历史波动特征。
+
+==================================================
+你必须按以下六个部分输出分析报告（纯文本），然后输出 JSON 格式的逐日预测。
+
+【第一部分：品类整月发货规律分析】
+必须分析：
+1. 整月总发货次数
+2. 整月总发货量
+3. 月度发货频率（高频 / 中频 / 低频）
+4. 单次平均发货量
+5. 历史最大、最小发货量
+6. 平均发货间隔（但必须结合整月次数判断是否为常态周期）
+7. 周期判断（依据整月表现）
+
+【第二部分：品类价格敏感度分析】
+根据历史发货与品类价格关系判断：
+- A 高敏感：价格差 → 停发
+- B 中敏感：价格差 → 减量
+- C 低敏感：价格几乎不影响发货
+必须写依据。
+
+【第三部分：目标冶炼厂品类价格竞争力】
+第一优先级：目标厂品类价格 vs 竞品同品类价格
+第二优先级：目标厂近3天、7天品类价格走势
+第三优先级：SMM铅价（仅辅助）
+等级：A 优势高 / B 优势中 / C 优势低 / D 劣势低 / E 劣势中 / F 劣势高
+
+【第四部分：节假日影响】
+分析预测期内是否有中国法定节假日，对发货的影响。
+
+【第五部分：天气物流因素】
+根据历史天气记录推断天气对发货的可能影响。
+
+【第六部分：综合预测结论】
+整体发货概率：高 / 中 / 低
+预计发货次数
+预计发货时间
+预计单次发货量
+预测置信度
+主要原因
+最终结论
+
+==================================================
+【输出格式 · 必须严格遵守】
+
+第一步：输出完整的六部分分析报告（纯文本，不要 JSON）。
+
+第二步：输出 JSON（不要 Markdown、不要代码块、不要 ```json 标记）：
+{
+    "analysis_report": "完整的六部分分析报告文本...",
+    "items": [
+        {"target_date": "YYYY-MM-DD", "predicted_weight": 0, "ship_probability": "低", "confidence_level": "低", "main_factors": ""},
+        ...
+    ]
+}
+
+其中：
+- items 必须包含从 day0 到 day15 共 16 条记录
+- predicted_weight 为发货吨数（不发货则为 0）
+- ship_probability 为发货概率（高/中/低）
+- confidence_level 为置信度（高/中/低）
+- main_factors 为该日预测的主要影响因素
+"""
+
+
+# ---------------------------------------------------------------------------
+# Prompt Builder
+# ---------------------------------------------------------------------------
+
+class DoubaoPromptBuilder:
+    """将三组原始数据拼装为 (system_prompt, user_prompt) 二元组。"""
+
+    # 数据量限制（防止超 token）
+    MAX_HISTORY_RECORDS = 200
+    MAX_SMELTER_PRICE_RECORDS = 30
+    MAX_SMM_PRICE_RECORDS = 30
+
+    def build_messages(
+        self,
+        req: DoubaoPredictionRequest,
+        forecast_dates: list[date],
+    ) -> tuple[str, str]:
+        """返回 (system_prompt, user_prompt)。"""
+        user_prompt = self._build_user_prompt(req, forecast_dates)
+        return SYSTEM_PROMPT, user_prompt
+
+    # ------------------------------------------------------------------
+    # 内部：拼装 User Prompt
+    # ------------------------------------------------------------------
+
+    def _build_user_prompt(
+        self,
+        req: DoubaoPredictionRequest,
+        forecast_dates: list[date],
+    ) -> str:
+        sections: list[str] = []
+
+        # 1. 基础信息
+        sections.append(self._section_basic(req, forecast_dates))
+
+        # 2. 历史发货数据
+        sections.append(self._section_history(req))
+
+        # 3. 冶炼厂价格
+        sections.append(self._section_smelter_prices(req))
+
+        # 4. SMM 铅价
+        sections.append(self._section_smm_prices(req))
+
+        # 5. 预测目标日期
+        sections.append(self._section_forecast_dates(forecast_dates))
+
+        return "\n\n".join(sections)
+
+    # ------------------------------------------------------------------
+    # 各段落构建
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _section_basic(req: DoubaoPredictionRequest, forecast_dates: list[date]) -> str:
+        lines = [
+            "==================================================",
+            "【基础信息】",
+            f"仓库名称：{req.warehouse}",
+        ]
+        if req.product_variety:
+            lines.append(f"目标品类：{req.product_variety}")
+        if forecast_dates:
+            lines.append(f"预测起始日：{forecast_dates[0].isoformat()}")
+            lines.append(f"预测结束日：{forecast_dates[-1].isoformat()}")
+            lines.append(f"预测天数：{len(forecast_dates)} 天")
+        lines.append("==================================================")
+        return "\n".join(lines)
+
+    def _section_history(self, req: DoubaoPredictionRequest) -> str:
+        history = req.history
+        lines = [
+            "==================================================",
+            "【仓库品类历史发货数据分析】",
+        ]
+
+        if not history:
+            lines.append("（无历史送货数据）")
+            lines.append("==================================================")
+            return "\n".join(lines)
+
+        # 按品类筛选
+        filtered = history
+        if req.product_variety:
+            filtered = [h for h in history if h.品类 == req.product_variety]
+            if not filtered:
+                filtered = history  # 没有匹配则用全部
+                lines.append(f"注意：未找到品类「{req.product_variety}」的历史数据，使用全部品类数据。")
+
+        # 按日期排序
+        filtered = sorted(filtered, key=lambda x: x.送货日期)
+
+        # 统计摘要
+        weights = [float(h.重量吨) for h in filtered]
+        delivery_dates = [h.送货日期 for h in filtered]
+        total_days = len(filtered)
+        total_weight = sum(weights)
+        avg_weight = statistics.mean(weights) if weights else 0
+        std_weight = statistics.stdev(weights) if len(weights) > 1 else 0
+        max_weight = max(weights) if weights else 0
+        min_weight = min(weights) if weights else 0
+
+        # 月度频率
+        if delivery_dates:
+            date_range_days = (delivery_dates[-1] - delivery_dates[0]).days + 1
+            months = max(date_range_days / 30, 1)
+            monthly_freq = total_days / months
+        else:
+            monthly_freq = 0
+
+        # 发货间隔
+        intervals = []
+        for i in range(1, len(delivery_dates)):
+            delta = (delivery_dates[i] - delivery_dates[i - 1]).days
+            intervals.append(delta)
+        avg_interval = statistics.mean(intervals) if intervals else 0
+
+        # 星期分布
+        weekday_counter = Counter(d.weekday() for d in delivery_dates)
+        weekday_names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+        weekday_dist = " / ".join(
+            f"{weekday_names[w]}:{c}次" for w, c in sorted(weekday_counter.items())
+        )
+
+        lines.append(f"历史记录总数：{total_days} 条")
+        lines.append(f"整月总发货量：{total_weight:.2f} 吨")
+        lines.append(f"单次平均发货量：{avg_weight:.2f} 吨")
+        lines.append(f"历史最大发货量：{max_weight:.2f} 吨")
+        lines.append(f"历史最小发货量：{min_weight:.2f} 吨")
+        lines.append(f"发货量标准差：{std_weight:.2f}")
+        lines.append(f"月度发货频率：约 {monthly_freq:.1f} 次/月")
+        if avg_interval:
+            lines.append(f"平均发货间隔：{avg_interval:.1f} 天")
+        lines.append(f"星期分布：{weekday_dist}")
+
+        # 月度频率判定
+        if monthly_freq >= 8:
+            freq_label = "高频（≥8次/月）"
+        elif monthly_freq >= 3:
+            freq_label = "中频（3~7次/月）"
+        else:
+            freq_label = "低频（<3次/月）"
+        lines.append(f"月度频率判定：{freq_label}")
+
+        # 原始记录（最近 50 条）
+        recent = filtered[-50:]
+        lines.append("")
+        lines.append("近期送货记录（日期 | 品类 | 冶炼厂 | 天气 | 重量吨）：")
+        for h in recent:
+            weather = h.天气 or "未知"
+            smelter = h.冶炼厂 or "未知"
+            lines.append(f"  {h.送货日期.isoformat()} | {h.品类} | {smelter} | {weather} | {h.重量吨}")
+
+        # 截断提示
+        if len(filtered) > self.MAX_HISTORY_RECORDS:
+            lines.append(f"\n（仅展示最近 {self.MAX_HISTORY_RECORDS} 条，共 {total_days} 条）")
+
+        lines.append("==================================================")
+        return "\n".join(lines)
+
+    def _section_smelter_prices(self, req: DoubaoPredictionRequest) -> str:
+        prices = req.smelter_prices
+        lines = [
+            "==================================================",
+            "【冶炼厂品类收货价格（含竞品）】",
+        ]
+
+        if not prices:
+            lines.append("（无冶炼厂价格数据）")
+            lines.append("==================================================")
+            return "\n".join(lines)
+
+        # 按日期排序，取最近 N 条
+        prices = sorted(prices, key=lambda x: x.日期, reverse=True)
+        recent = prices[: self.MAX_SMELTER_PRICE_RECORDS]
+        recent = list(reversed(recent))  # 恢复正序
+
+        lines.append(f"共 {len(prices)} 条价格记录，展示最近 {len(recent)} 条：")
+        lines.append("日期 | 冶炼厂 | 品种 | 基准价")
+        for p in recent:
+            lines.append(f"  {p.日期.isoformat()} | {p.冶炼厂} | {p.品种} | {p.基准价}")
+
+        # 趋势摘要
+        if len(recent) >= 2:
+            first_price = float(recent[0].基准价)
+            last_price = float(recent[-1].基准价)
+            avg_price = statistics.mean(float(p.基准价) for p in recent)
+            change_pct = ((last_price - first_price) / first_price * 100) if first_price else 0
+            trend = "上涨" if change_pct > 0.5 else ("下跌" if change_pct < -0.5 else "持平")
+            lines.append("")
+            lines.append(f"价格趋势：{trend}（{change_pct:+.2f}%）")
+            lines.append(f"近期均价：{avg_price:.0f}")
+            lines.append(f"最新价：{last_price:.0f}")
+
+        lines.append("==================================================")
+        return "\n".join(lines)
+
+    def _section_smm_prices(self, req: DoubaoPredictionRequest) -> str:
+        prices = req.smm_prices
+        lines = [
+            "==================================================",
+            "【SMM 1# 铅锭价格走势】",
+        ]
+
+        if not prices:
+            lines.append("（无 SMM 铅价数据）")
+            lines.append("==================================================")
+            return "\n".join(lines)
+
+        prices = sorted(prices, key=lambda x: x.定价日期, reverse=True)
+        recent = prices[: self.MAX_SMM_PRICE_RECORDS]
+        recent = list(reversed(recent))
+
+        lines.append(f"共 {len(prices)} 条铅价记录，展示最近 {len(recent)} 条：")
+        lines.append("定价日期 | 最低价 | 最高价 | 均价")
+        for p in recent:
+            lines.append(f"  {p.定价日期.isoformat()} | {p.最低价} | {p.最高价} | {p.均价}")
+
+        # 趋势摘要
+        if len(recent) >= 2:
+            first_avg = float(recent[0].均价)
+            last_avg = float(recent[-1].均价)
+            overall_avg = statistics.mean(float(p.均价) for p in recent)
+            change_pct = ((last_avg - first_avg) / first_avg * 100) if first_avg else 0
+            trend = "上涨" if change_pct > 0.5 else ("下跌" if change_pct < -0.5 else "持平")
+            lines.append("")
+            lines.append(f"铅价趋势：{trend}（{change_pct:+.2f}%）")
+            lines.append(f"近期均价：{overall_avg:.0f}")
+            lines.append(f"最新均价：{last_avg:.0f}")
+
+        lines.append("==================================================")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _section_forecast_dates(forecast_dates: list[date]) -> str:
+        lines = [
+            "==================================================",
+            "【预测目标日期】",
+            f"请预测以下 {len(forecast_dates)} 天的逐日发货吨数：",
+        ]
+        for i, d in enumerate(forecast_dates):
+            lines.append(f"  day{i}: {d.isoformat()} ({_weekday_name(d)})")
+        lines.append("")
+        lines.append("请严格按照上述日期输出 items 数组，不要遗漏任何一天。")
+        lines.append("==================================================")
+        return "\n".join(lines)
+
+
+def _weekday_name(d: date) -> str:
+    names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+    return names[d.weekday()]
