@@ -10,25 +10,33 @@
 import argparse
 import asyncio
 import json
+import os
 import sys
+from pathlib import Path
 from datetime import date
 from decimal import Decimal
 
 import httpx
 import pymysql
+from dotenv import load_dotenv
 
 
-# ── 配置 ──────────────────────────────────────────────────────────────
+# ── 自动加载 .env 配置 ──────────────────────────────────────────────────
+_env_path = Path(__file__).resolve().parent.parent / ".env"
+load_dotenv(_env_path)
+
 MYSQL_CONFIG = {
-    "host": "127.0.0.1",
-    "port": 3306,
-    "user": "root",
-    "password": "Aa1968535800",
-    "database": "pd_max_db",
+    "host": os.getenv("MYSQL_HOST", "127.0.0.1"),
+    "port": int(os.getenv("MYSQL_PORT", "3306")),
+    "user": os.getenv("MYSQL_USER", "root"),
+    "password": os.getenv("MYSQL_PASSWORD", ""),
+    "database": os.getenv("MYSQL_DATABASE", "pd_max_db"),
     "charset": "utf8mb4",
 }
 
-BASE_URL = "http://127.0.0.1:8002"
+# 读取端口配置
+APP_PORT = os.getenv("PORT", "8002")
+BASE_URL = f"http://127.0.0.1:{APP_PORT}"
 
 # 测试数据
 TEST_WAREHOUSE = "陕西龙盛金属物资回收有限公司"
