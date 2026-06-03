@@ -3586,13 +3586,15 @@ class TLService:
         }
 
         quote_date = row_fields.get("quote_date")
-        if quote_date:
-            item["报价日期"] = str(quote_date).strip()[:10]
+        if not quote_date or not str(quote_date).strip():
+            raise ValueError("行缺少报价日期")
+        parsed = TLService._parse_calendar_date_str(str(quote_date).strip())
+        item["报价日期"] = parsed.isoformat()
 
         return item
 
-    def _parse_quote_excel_workbook(self, content: bytes, filename: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any], Optional[str]]:
-        """解析 xlsx 首工作表为 items + full_data；若「日期」列存在且全日相同则返回 suggested_quote_date。"""
+    def _parse_quote_excel_workbook(self, content: bytes, filename: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """解析 xlsx 首工作表为 items + full_data；每行须含报价日期。"""
         if not content:
             raise ValueError("文件内容为空")
         try:
@@ -3620,9 +3622,10 @@ class TLService:
             raise ValueError("表头须包含「冶炼厂」或同义列（如冶炼厂名）")
         if "category" not in logical_to_col:
             raise ValueError("表头须包含「品种」或「品类名」等同义列")
+        if "quote_date" not in logical_to_col:
+            raise ValueError("表头须包含「日期」或「报价日期」列")
 
         items: List[Dict[str, Any]] = []
-        date_samples: List[str] = []
         preview_rows: List[Dict[str, Any]] = []
 
         for idx, row in df.iterrows():
@@ -3635,7 +3638,7 @@ class TLService:
                     if hasattr(val, "strftime"):
                         fields[logical] = val.strftime("%Y-%m-%d")
                     else:
-                        fields[logical] = str(val).strip()[:10]
+                        fields[logical] = str(val).strip()
                 else:
                     fields[logical] = val
 
@@ -3646,13 +3649,13 @@ class TLService:
             ).strip():
                 continue
 
-            if fields.get("quote_date"):
-                date_samples.append(str(fields["quote_date"]))
+            if "quote_date" not in fields:
+                raise ValueError(f"第 {int(idx) + 2} 行缺少报价日期")
 
             try:
                 item = self._excel_row_dict_to_confirm_item(fields)
-            except ValueError:
-                continue
+            except ValueError as e:
+                raise ValueError(f"第 {int(idx) + 2} 行：{e}") from e
             if not any(
                 item.get(k) is not None
                 for k in (
@@ -3669,6 +3672,7 @@ class TLService:
             preview_rows.append(
                 {
                     "row_index": int(idx) + 2,
+                    "报价日期": item["报价日期"],
                     "冶炼厂": item["冶炼厂名"],
                     "品类": item["品类名"],
                 }
@@ -3676,21 +3680,15 @@ class TLService:
 
         if not items:
             raise ValueError(
-                "未解析到有效数据行：请确认每行同时有冶炼厂、品种，且至少填写一项价格列"
+                "未解析到有效数据行：请确认每行同时有日期、冶炼厂、品种，且至少填写一项价格列"
             )
-
-        suggested: Optional[str] = None
-        if date_samples:
-            uniq = {d[:10] for d in date_samples if d}
-            if len(uniq) == 1:
-                suggested = next(iter(uniq))
 
         full_data: Dict[str, Any] = {
             "source_image": filename,
             "file_name": filename,
             "company_name": "",
             "doc_title": "Excel报价列表",
-            "quote_date": suggested or "",
+            "quote_date": "",
             "execution_date": "",
             "valid_period": "",
             "price_unit": "元/吨",
@@ -3703,7 +3701,7 @@ class TLService:
             "raw_full_text": "",
             "elapsed_time": 0.0,
         }
-        return items, full_data, suggested
+        return items, full_data
 
     def build_quote_list_import_template_excel(self) -> bytes:
         """
@@ -3750,7 +3748,7 @@ class TLService:
         hints = [
             "1. 首行表头请勿修改；数据从第 2 行填写。填好后使用 POST /tl/upload_price_table_excel 上传本表。",
             "2. 「冶炼厂」须与系统「冶炼厂」字典中的名称完全一致；「品种」为品类名称（可新建）。",
-            "3. 「日期」格式 YYYY-MM-DD；若多行日期相同，上传接口可返回 suggested_quote_date 供确认写入时选用。",
+            "3. 「日期」格式 YYYY-MM-DD（也支持 2026/6/1 等）；每行单独填写，确认写入时以行级日期为准。",
             "4. 至少填写一项价格列（如基准价或 3%/13% 含税价）。",
             "5. 「价格口径」用于说明你填写的数字是含税还是不含税：",
             "   - ex_vat：不含税基准价（税前价，默认）",
@@ -3779,7 +3777,7 @@ class TLService:
             name = upload_file.filename or "upload.xlsx"
             try:
                 content = upload_file.file.read()
-                items, full_data, suggested = self._parse_quote_excel_workbook(
+                items, full_data = self._parse_quote_excel_workbook(
                     content, name
                 )
                 entry: Dict[str, Any] = {
@@ -3788,8 +3786,6 @@ class TLService:
                     "full_data": full_data,
                     "items": items,
                 }
-                if suggested:
-                    entry["suggested_quote_date"] = suggested
                 details.append(entry)
             except ValueError as e:
                 details.append({"file": name, "success": False, "error": str(e)})
@@ -3893,6 +3889,7 @@ class TLService:
             item_factory = row_factory or doc_factory
 
             items.append({
+                "报价日期": (result.quote_date or "").strip()[:10] or "",
                 "冶炼厂名": item_factory,
                 "冶炼厂id": None,
                 "品类名": row.category,
@@ -3926,7 +3923,6 @@ class TLService:
 
     def confirm_price_table(
         self,
-        quote_date_str: str,
         items: List[Dict[str, Any]],
         full_data: Optional[Dict[str, Any]] = None,
         replace_factory_quotes_on_date: bool = False,
@@ -3934,12 +3930,17 @@ class TLService:
         if not items:
             raise ValueError("报价数据不能为空")
 
-        try:
-            quote_dt = date.fromisoformat(quote_date_str)
-        except (ValueError, TypeError):
-            raise ValueError(f"日期格式不正确: {quote_date_str}，应为 YYYY-MM-DD")
-
         for idx, item in enumerate(items):
+            raw_date = item.get("报价日期")
+            if not raw_date or not str(raw_date).strip():
+                raise ValueError(f"第 {idx + 1} 条缺少报价日期")
+            try:
+                quote_dt = self._parse_calendar_date_str(str(raw_date).strip())
+            except ValueError as e:
+                raise ValueError(f"第 {idx + 1} 条报价日期无效: {e}") from e
+            item["_quote_dt"] = quote_dt
+            item["报价日期"] = quote_dt.isoformat()
+
             if not self._quote_item_has_any_price(item):
                 raise ValueError(
                     f"第 {idx + 1} 条报价缺少任意价格列（须至少填写：基准价、某一档含税价、普票或反向发票价之一）"
@@ -4009,75 +4010,82 @@ class TLService:
                     # 2b. 同日同厂+品种去重：后者覆盖前者（避免同批重复写入）
                     deduped: "OrderedDict[tuple, Dict[str, Any]]" = OrderedDict()
                     for item in items:
-                        key = (int(item["冶炼厂id"]), str(item["品类名"]).strip(), quote_dt)
+                        key = (
+                            int(item["冶炼厂id"]),
+                            str(item["品类名"]).strip(),
+                            item["_quote_dt"],
+                        )
                         deduped[key] = item
                     items = list(deduped.values())
 
                     if replace_factory_quotes_on_date:
-                        fids = sorted({int(i["冶炼厂id"]) for i in items})
-                        if fids:
-                            ph = ",".join(["%s"] * len(fids))
+                        for fid, qd in sorted(
+                            {(int(i["冶炼厂id"]), i["_quote_dt"]) for i in items}
+                        ):
                             cur.execute(
-                                f"DELETE FROM quote_details WHERE quote_date = %s "
-                                f"AND factory_id IN ({ph})",
-                                (quote_dt, *fids),
+                                "DELETE FROM quote_details WHERE quote_date = %s "
+                                "AND factory_id = %s",
+                                (qd, fid),
                             )
 
-                    # 3. 存储全量元数据（如果有 full_data）
-                    metadata_id = None
-                    if full_data:
-                        # 取第一条 item 的冶炼厂id作为元数据的 factory_id
-                        factory_id_for_meta = items[0].get("冶炼厂id") if items else None
-                        if factory_id_for_meta:
+                    metadata_cache: Dict[tuple, Optional[int]] = {}
+
+                    def _metadata_id_for(factory_id: int, qd: date) -> Optional[int]:
+                        if not full_data:
+                            return None
+                        cache_key = (int(factory_id), qd)
+                        if cache_key in metadata_cache:
+                            return metadata_cache[cache_key]
+                        cur.execute(
+                            """
+                            INSERT INTO quote_table_metadata
+                            (factory_id, quote_date, execution_date, doc_title, subtitle,
+                             valid_period, price_unit, headers, footer_notes, footer_notes_raw,
+                             brand_specifications, policies, raw_full_text, source_image)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            ON DUPLICATE KEY UPDATE
+                                execution_date = VALUES(execution_date),
+                                doc_title = VALUES(doc_title),
+                                subtitle = VALUES(subtitle),
+                                valid_period = VALUES(valid_period),
+                                price_unit = VALUES(price_unit),
+                                headers = VALUES(headers),
+                                footer_notes = VALUES(footer_notes),
+                                footer_notes_raw = VALUES(footer_notes_raw),
+                                brand_specifications = VALUES(brand_specifications),
+                                policies = VALUES(policies),
+                                raw_full_text = VALUES(raw_full_text),
+                                source_image = VALUES(source_image),
+                                updated_at = CURRENT_TIMESTAMP
+                            """,
+                            (
+                                factory_id,
+                                qd,
+                                full_data.get("execution_date", ""),
+                                full_data.get("doc_title", ""),
+                                full_data.get("subtitle", ""),
+                                full_data.get("valid_period", ""),
+                                full_data.get("price_unit", "元/吨"),
+                                json.dumps(full_data.get("headers", []), ensure_ascii=False),
+                                json.dumps(full_data.get("footer_notes", []), ensure_ascii=False),
+                                full_data.get("footer_notes_raw", ""),
+                                full_data.get("brand_specifications", ""),
+                                json.dumps(full_data.get("policies", {}), ensure_ascii=False),
+                                full_data.get("raw_full_text", ""),
+                                full_data.get("source_image", full_data.get("file_name", "")),
+                            ),
+                        )
+                        if cur.lastrowid:
+                            mid = cur.lastrowid
+                        else:
                             cur.execute(
-                                """
-                                INSERT INTO quote_table_metadata
-                                (factory_id, quote_date, execution_date, doc_title, subtitle,
-                                 valid_period, price_unit, headers, footer_notes, footer_notes_raw,
-                                 brand_specifications, policies, raw_full_text, source_image)
-                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                                ON DUPLICATE KEY UPDATE
-                                    execution_date = VALUES(execution_date),
-                                    doc_title = VALUES(doc_title),
-                                    subtitle = VALUES(subtitle),
-                                    valid_period = VALUES(valid_period),
-                                    price_unit = VALUES(price_unit),
-                                    headers = VALUES(headers),
-                                    footer_notes = VALUES(footer_notes),
-                                    footer_notes_raw = VALUES(footer_notes_raw),
-                                    brand_specifications = VALUES(brand_specifications),
-                                    policies = VALUES(policies),
-                                    raw_full_text = VALUES(raw_full_text),
-                                    source_image = VALUES(source_image),
-                                    updated_at = CURRENT_TIMESTAMP
-                                """,
-                                (
-                                    factory_id_for_meta,
-                                    quote_dt,
-                                    full_data.get("execution_date", ""),
-                                    full_data.get("doc_title", ""),
-                                    full_data.get("subtitle", ""),
-                                    full_data.get("valid_period", ""),
-                                    full_data.get("price_unit", "元/吨"),
-                                    json.dumps(full_data.get("headers", []), ensure_ascii=False),
-                                    json.dumps(full_data.get("footer_notes", []), ensure_ascii=False),
-                                    full_data.get("footer_notes_raw", ""),
-                                    full_data.get("brand_specifications", ""),
-                                    json.dumps(full_data.get("policies", {}), ensure_ascii=False),
-                                    full_data.get("raw_full_text", ""),
-                                    full_data.get("source_image", full_data.get("file_name", "")),
-                                ),
+                                "SELECT id FROM quote_table_metadata WHERE factory_id=%s AND quote_date=%s",
+                                (factory_id, qd),
                             )
-                            # 取 metadata_id（INSERT 或 已存在的）
-                            if cur.lastrowid:
-                                metadata_id = cur.lastrowid
-                            else:
-                                cur.execute(
-                                    "SELECT id FROM quote_table_metadata WHERE factory_id=%s AND quote_date=%s",
-                                    (factory_id_for_meta, quote_dt),
-                                )
-                                row = cur.fetchone()
-                                metadata_id = row[0] if row else None
+                            row = cur.fetchone()
+                            mid = row[0] if row else None
+                        metadata_cache[cache_key] = mid
+                        return mid
 
                     # 3b. 按冶炼厂 factory_tax_rates（与默认合并）统一计算「价格」与含1%/3%/13%价（覆盖上传预览推算）
                     factory_ids = list({item["冶炼厂id"] for item in items})
@@ -4117,6 +4125,8 @@ class TLService:
                     # 4. 写入明细，相同(日期+冶炼厂+品类名)则更新价格
                     written_sources: List[Dict[str, Any]] = []
                     for item, final_src in zip(items, final_sources_list):
+                        item_qd = item["_quote_dt"]
+                        metadata_id = _metadata_id_for(int(item["冶炼厂id"]), item_qd)
                         src_json = json.dumps(final_src, ensure_ascii=False) if final_src else None
                         cur.execute(
                             """
@@ -4137,7 +4147,7 @@ class TLService:
                                 updated_at = CURRENT_TIMESTAMP
                             """,
                             (
-                                quote_dt,
+                                item_qd,
                                 item["冶炼厂id"],
                                 item["品类名"],
                                 metadata_id,
@@ -4156,6 +4166,7 @@ class TLService:
                             updated += 1
                         written_sources.append(
                             {
+                                "报价日期": item["报价日期"],
                                 "冶炼厂id": item["冶炼厂id"],
                                 "品类名": item["品类名"],
                                 "品类id": item.get("品类id"),
@@ -4164,9 +4175,10 @@ class TLService:
                             }
                         )
 
+            quote_dates = sorted({i["_quote_dt"].isoformat() for i in items})
             log_finance_event(
                 "报价确认写入 | 报价日期=%s | 新增=%s | 更新=%s | 条目数=%s | 冶炼厂ids=%s",
-                quote_date_str,
+                ",".join(quote_dates),
                 inserted,
                 updated,
                 len(items),
@@ -4186,14 +4198,12 @@ class TLService:
 
     def manual_quote_entry(
         self,
-        quote_date_str: str,
         items: List[Dict[str, Any]],
         full_data: Optional[Dict[str, Any]] = None,
         replace_factory_quotes_on_date: bool = False,
     ) -> Dict[str, Any]:
         """手写/表格录入报价，逻辑与 confirm_price_table 相同（可不传 full_data）。"""
         return self.confirm_price_table(
-            quote_date_str,
             items,
             full_data,
             replace_factory_quotes_on_date=replace_factory_quotes_on_date,
@@ -6551,6 +6561,14 @@ class TLService:
                 return datetime.strptime(head, fmt).date()
             except ValueError:
                 continue
+        normalized = s.replace(".", "/").replace("-", "/")
+        parts = normalized.split("/")
+        if len(parts) == 3:
+            try:
+                y, m, d = int(parts[0]), int(parts[1]), int(parts[2])
+                return date(y, m, d)
+            except ValueError:
+                pass
         raise ValueError(f"日期格式无效: {value!r}，请使用 YYYY-MM-DD")
 
     _JINLI_FACTORY_NAMES: Tuple[str, ...] = (

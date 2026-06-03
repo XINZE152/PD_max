@@ -1258,8 +1258,8 @@ def upload_price_table_excel(
 ):
     """
     解析为与 OCR 上传类似的 ``data.details``：每项 ``success``、``items``、``full_data``；
-    成功项用 ``file`` 表示文件名；若「日期」列全日相同则附带 ``suggested_quote_date``。
-    前端确认时仍调用 ``POST /tl/confirm_price_table``，传入 ``报价日期`` 与 ``items``（及可选 ``full_data``）。
+    成功项用 ``file`` 表示文件名；``items`` 每行已含 ``报价日期``。
+    前端确认时调用 ``POST /tl/confirm_price_table``，原样回传 ``items``（及可选 ``full_data``）。
     """
     for f in file:
         fn = (f.filename or "").lower()
@@ -1285,7 +1285,6 @@ def confirm_price_table(
         items = [item.model_dump() for item in body.数据]
         full_data = body.full_data.model_dump() if body.full_data else None
         return service.confirm_price_table(
-            quote_date_str=body.报价日期,
             items=items,
             full_data=full_data,
             replace_factory_quotes_on_date=body.同冶炼厂当日整表覆盖,
@@ -1306,7 +1305,6 @@ def manual_quote(
         items = [item.model_dump() for item in body.数据]
         full_data = body.full_data.model_dump() if body.full_data else None
         return service.manual_quote_entry(
-            quote_date_str=body.报价日期,
             items=items,
             full_data=full_data,
             replace_factory_quotes_on_date=body.同冶炼厂当日整表覆盖,

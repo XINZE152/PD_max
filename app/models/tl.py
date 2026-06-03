@@ -653,13 +653,34 @@ class VlmFullData(BaseModel):
 
 class ConfirmPriceTableItem(BaseModel):
     """确认价格表 - 单条明细"""
-    冶炼厂名: str = Field(..., description="冶炼厂名称（OCR识别或前端修改后）")
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    报价日期: str = Field(
+        ...,
+        validation_alias=AliasChoices("报价日期", "日期", "quote_date"),
+        description="该行报价日期，YYYY-MM-DD",
+    )
+    冶炼厂名: str = Field(
+        ...,
+        validation_alias=AliasChoices("冶炼厂名", "冶炼厂", "factory_name", "name"),
+        description="冶炼厂名称（OCR识别或前端修改后）",
+    )
     冶炼厂id: Optional[int] = Field(
         None,
+        validation_alias=AliasChoices("冶炼厂id", "factory_id", "id"),
         description="冶炼厂ID；为 null 时按「冶炼厂名」与字典精确匹配解析 id，不存在或已停用则报错（不在此接口自动新建冶炼厂）",
     )
-    品类名: str = Field(..., description="品类名称（OCR识别或前端修改后）")
-    品类id: Optional[int] = Field(None, description="品类分组ID，null则自动新建")
+    品类名: str = Field(
+        ...,
+        validation_alias=AliasChoices("品类名", "品类", "category_name", "品名", "名称"),
+        description="品类名称（OCR识别或前端修改后）",
+    )
+    品类id: Optional[int] = Field(
+        None,
+        validation_alias=AliasChoices("品类id", "category_id", "品类Id"),
+        description="品类分组ID，null则自动新建",
+    )
     价格: Optional[float] = Field(None, description="不含税基准价（元/吨）")
     价格口径: Optional[str] = Field(
         None,
@@ -683,13 +704,12 @@ class ConfirmPriceTableItem(BaseModel):
 
 class ConfirmPriceTableRequest(BaseModel):
     """接口5b 请求体 - 确认写入报价数据"""
-    报价日期: str = Field(..., description="报价日期，格式 YYYY-MM-DD")
     full_data: Optional[VlmFullData] = Field(None, description="VLM提取的完整原始数据，存入元数据表")
-    数据: List[ConfirmPriceTableItem] = Field(..., description="报价明细列表（前端确认/修改后）")
+    数据: List[ConfirmPriceTableItem] = Field(..., description="报价明细列表（前端确认/修改后，每条须含报价日期）")
     同冶炼厂当日整表覆盖: bool = Field(
         False,
         description=(
-            "为 true 时，在写入前删除「本次请求中出现的冶炼厂」在该报价日期下的全部 quote_details，"
+            "为 true 时，在写入前删除「本次请求中出现的 (冶炼厂, 报价日期) 组合」下的全部 quote_details，"
             "再写入当前明细，避免同日同厂残留旧品种或别称重复行；整单上传/Excel 确认建议传 true。"
             "为 false（默认）时仅按 (厂+品种+日期) 逐条插入或更新，不删除未出现在本批中的品种。"
         ),
@@ -712,6 +732,9 @@ class ManualQuoteRequest(ConfirmPriceTableRequest):
             "反向发票价格",
         )
         for idx, row in enumerate(self.数据):
+            qd = str(row.报价日期 or "").strip()
+            if not qd:
+                raise ValueError(f"第 {idx + 1} 条：报价日期不能为空")
             sm = str(row.冶炼厂名 or "").strip()
             cat = str(row.品类名 or "").strip()
             if len(sm) < 2:
