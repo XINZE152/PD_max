@@ -109,6 +109,16 @@ class ComprehensivePromptBuilder:
         lines.append("\n## 第一部分：仓库历史发货规律分析")
         lines.append(history_analysis.get("analysis_text", "无历史数据"))
 
+        # 附：原始送货日期列表与间隔明细（便于识别周期性模式）
+        if req.history:
+            dates_str = ", ".join(
+                f"{h.delivery_date.isoformat()}({h.weight}t)" for h in sorted(req.history, key=lambda x: x.delivery_date)
+            )
+            intervals = history_analysis.get("pattern", {}).get("intervals", [])
+            intervals_str = ", ".join(str(x) for x in intervals[:30]) if intervals else "无"
+            lines.append(f"\n历史送货明细（日期-重量）: {dates_str}")
+            lines.append(f"相邻送货间隔（天）: {intervals_str}")
+
         # 第二部分：价格敏感度分析
         lines.append("\n## 第二部分：仓库价格敏感度分析")
         lines.append(price_sensitivity_info.get("analysis_text", "无敏感度数据"))
