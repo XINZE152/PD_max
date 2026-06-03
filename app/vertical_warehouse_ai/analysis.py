@@ -615,9 +615,9 @@ def run_llm_analysis(context: Dict[str, Any]) -> Dict[str, Any]:
             "未配置文本大模型密钥。请设置 LLM_API_KEY，或与报价图识别共用 VLM_API_KEY。"
         )
 
-    from openai import OpenAI
+    from app.services.llm_client import chat_completions_create, create_llm_client
 
-    client = OpenAI(api_key=app_config.LLM_API_KEY, base_url=app_config.LLM_BASE_URL)
+    client = create_llm_client()
     id_name_map = _build_id_name_map(context)
     llm_context = _strip_internal_ids_for_llm(context)
     data_str = json.dumps(llm_context, ensure_ascii=False, indent=2)
@@ -661,7 +661,8 @@ def run_llm_analysis(context: Dict[str, Any]) -> Dict[str, Any]:
 }}"""
 
     try:
-        resp = client.chat.completions.create(
+        resp = chat_completions_create(
+            client,
             model=app_config.LLM_MODEL,
             max_tokens=4096,
             temperature=0.2,

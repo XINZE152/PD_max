@@ -76,6 +76,51 @@ def resolve_bailian_base_url(api_key: str, explicit_base_url: str = "") -> str:
 resolve_dashscope_base_url = resolve_bailian_base_url
 
 
+# DeepSeek OpenAI 兼容端点
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+DEEPSEEK_DEFAULT_MODEL = "deepseek-v4-pro"
+
+
+def _is_deepseek_model(model: str) -> bool:
+    return "deepseek" in (model or "").strip().lower()
+
+
+def resolve_llm_base_url(api_key: str, explicit_base_url: str = "", model: str = "") -> str:
+    """按显式 base_url、模型名、API Key 选择 LLM 兼容端点。"""
+    explicit = (explicit_base_url or "").strip()
+    if explicit:
+        return explicit
+    model_l = (model or "").strip().lower()
+    provider = (os.getenv("LLM_PROVIDER", "") or "").strip().lower()
+    if _is_deepseek_model(model) or provider == "deepseek":
+        return DEEPSEEK_BASE_URL
+    key = (api_key or "").strip()
+    if key.startswith("sk-sp-"):
+        return resolve_bailian_base_url(key, "")
+    return DASHSCOPE_COMPATIBLE_BASE_URL
+
+
+def resolve_llm_model(explicit_model: str = "", *, has_explicit_key: bool = False) -> str:
+    """解析默认 LLM 模型名。"""
+    model = (explicit_model or "").strip()
+    if model:
+        return model
+    provider = (os.getenv("LLM_PROVIDER", "") or "").strip().lower()
+    if provider == "deepseek":
+        return DEEPSEEK_DEFAULT_MODEL
+    if has_explicit_key:
+        return "qwen-plus"
+    return "qwen-plus"
+
+
+def is_deepseek_llm() -> bool:
+    """当前 LLM 配置是否指向 DeepSeek。"""
+    if _is_deepseek_model(LLM_MODEL):
+        return True
+    base = (LLM_BASE_URL or "").strip().lower()
+    return "deepseek.com" in base
+
+
 # LLM API 配置（采购建议等文本接口，OpenAI 兼容协议）
 # 未单独配置 LLM_API_KEY 时，按顺序复用 DASHSCOPE_API_KEY / QWEN_API_KEY / VLM_API_KEY（与报价图识别同源 key 时可少配一项）
 _explicit_llm_key = os.getenv("LLM_API_KEY", "").strip()
@@ -86,21 +131,13 @@ LLM_API_KEY = (
     or os.getenv("VLM_API_KEY", "").strip()
 )
 _llm_base_env = os.getenv("LLM_BASE_URL", "").strip()
-if _llm_base_env:
-    LLM_BASE_URL = _llm_base_env
-elif (LLM_API_KEY or "").strip().startswith("sk-sp-"):
-    LLM_BASE_URL = resolve_bailian_base_url(LLM_API_KEY, "")
-elif _explicit_llm_key:
-    LLM_BASE_URL = "https://api.anthropic.com"
-else:
-    LLM_BASE_URL = DASHSCOPE_COMPATIBLE_BASE_URL
 _llm_model_env = os.getenv("LLM_MODEL", "").strip()
-if _llm_model_env:
-    LLM_MODEL = _llm_model_env
-elif _explicit_llm_key:
-    LLM_MODEL = "claude-sonnet-4-6"
-else:
-    LLM_MODEL = "qwen-plus"
+LLM_BASE_URL = resolve_llm_base_url(LLM_API_KEY, _llm_base_env, _llm_model_env)
+LLM_MODEL = resolve_llm_model(_llm_model_env, has_explicit_key=bool(_explicit_llm_key))
+
+_llm_thinking_raw = os.getenv("LLM_THINKING_ENABLED", "1").strip().lower()
+LLM_THINKING_ENABLED = _llm_thinking_raw in ("1", "true", "yes", "on")
+LLM_REASONING_EFFORT = (os.getenv("LLM_REASONING_EFFORT", "high") or "high").strip() or "high"
 
 # VLM API 配置
 VLM_API_KEY = os.getenv("VLM_API_KEY", "")
@@ -124,6 +161,12 @@ try:
     MAP_GEOCODER_TIMEOUT = max(3.0, min(120.0, _map_geo_t))
 except ValueError:
     MAP_GEOCODER_TIMEOUT = 20.0
+
+try:
+    _map_kw_max = int(os.getenv("MAP_GEOCODER_KEYWORD_MAX_LEN", "50").strip() or "50")
+    MAP_GEOCODER_KEYWORD_MAX_LEN = max(10, min(200, _map_kw_max))
+except ValueError:
+    MAP_GEOCODER_KEYWORD_MAX_LEN = 50
 
 
 def _optional_positive_int(name: str) -> Optional[int]:

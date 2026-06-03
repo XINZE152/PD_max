@@ -6479,8 +6479,8 @@ class TLService:
 
         # 构造 prompt，调用大模型（OpenAI 兼容协议）
         import json
-        from openai import OpenAI
         from app import config as app_config
+        from app.services.llm_client import chat_completions_create, create_llm_client
 
         if not (app_config.LLM_API_KEY or "").strip():
             raise ValueError(
@@ -6489,7 +6489,7 @@ class TLService:
                 "此时默认使用百炼兼容端点与 qwen-plus。其它厂商请显式配置 LLM_API_KEY、LLM_BASE_URL、LLM_MODEL。"
             )
 
-        client = OpenAI(api_key=app_config.LLM_API_KEY, base_url=app_config.LLM_BASE_URL)
+        client = create_llm_client()
         data_str = json.dumps(demand_rows, ensure_ascii=False, indent=2)
         prompt = f"""以下是各需求的报价及各仓库运费数据：
 
@@ -6503,7 +6503,8 @@ class TLService:
 5. 纯文本，简洁"""
 
         try:
-            resp = client.chat.completions.create(
+            resp = chat_completions_create(
+                client,
                 model=app_config.LLM_MODEL,
                 max_tokens=2048,
                 messages=[{"role": "user", "content": prompt}],
