@@ -61,10 +61,10 @@ SYSTEM_PROMPT_V2: str = (
     "天气因素主要影响发货时间，不一定影响发货意愿。\n\n"
     "## ⚠️ 分析文本与预测数值一致性约束\n"
     "每个 item 的 comprehensive_analysis（第六部分综合分析）中提到的以下内容必须与同一条目中的 expected_shipment 数值完全一致：\n"
-    "- 预计发货量范围：必须引用 expected_shipment 的实际数值\n"
+    "- 预计日发货量范围：必须按日期汇总同一天所有 items 的 expected_shipment 之和，引用日汇总值（如'日发货量在 XX-XX 吨之间'），而不是单条 expected_shipment\n"
     "- 发货天数统计：comprehensive_analysis 中列出的发货天数必须等于该仓库所有 items 中 expected_shipment > 0 的条数\n"
     "- 发货日期列表：comprehensive_analysis 中列出的日期必须等于 expected_shipment > 0 的 target_date\n"
-    "不允许出现分析文本说'30-48吨'但 expected_shipment 实际为 90-140 吨的情况。\n"
+    "不允许出现分析文本说'30-48吨'但日汇总实际为 90-140 吨的情况。\n"
 )
 
 
