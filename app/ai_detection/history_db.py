@@ -333,7 +333,7 @@ def get_feedback_status(task_id: str) -> Optional[str]:
 
 
 def mark_feedback_status(task_id: str, judgment: str) -> None:
-    """将指定 task_id 的标注状态写入数据库（供提交标注时调用）。"""
+    """将指定 task_id 的标注状态写入数据库，同时记录标注时间（供提交标注时调用）。"""
     tid = str(task_id or "").strip()
     if not tid:
         return
@@ -343,20 +343,20 @@ def mark_feedback_status(task_id: str, judgment: str) -> None:
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "UPDATE ai_detection_history SET feedback_status=%s WHERE task_id=%s AND mode='async_v3'",
+                "UPDATE ai_detection_history SET feedback_status=%s, feedback_marked_at=NOW() WHERE task_id=%s AND mode='async_v3'",
                 (judgment, tid),
             )
 
 
 def clear_feedback_status(task_id: str) -> bool:
-    """清除指定 task_id 的标注状态（恢复为未标注），供删除标注时调用。"""
+    """清除指定 task_id 的标注状态及标注时间（恢复为未标注），供删除标注时调用。"""
     tid = str(task_id or "").strip()
     if not tid:
         return False
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "UPDATE ai_detection_history SET feedback_status=NULL WHERE task_id=%s AND mode='async_v3'",
+                "UPDATE ai_detection_history SET feedback_status=NULL, feedback_marked_at=NULL WHERE task_id=%s AND mode='async_v3'",
                 (tid,),
             )
             return bool(cur.rowcount)
@@ -403,7 +403,7 @@ def list_ai_detection_history(
 
             cur.execute(
                 f"""
-                SELECT id, created_at, mode, task_id, original_filename, bbox, status, outcome_json, stored_image, feedback_status
+                SELECT id, created_at, mode, task_id, original_filename, bbox, status, outcome_json, stored_image, feedback_status, feedback_marked_at
                 FROM ai_detection_history
                 WHERE created_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL %s DAY)
                 {mode_clause}
@@ -419,6 +419,9 @@ def list_ai_detection_history(
                 created = item.get("created_at")
                 if created is not None and hasattr(created, "isoformat"):
                     item["created_at"] = created.isoformat(sep=" ", timespec="seconds")
+                marked_at = item.get("feedback_marked_at")
+                if marked_at is not None and hasattr(marked_at, "isoformat"):
+                    item["feedback_marked_at"] = marked_at.isoformat(sep=" ", timespec="seconds")
                 bbox_v = item.get("bbox")
                 if isinstance(bbox_v, str):
                     try:
