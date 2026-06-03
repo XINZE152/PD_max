@@ -38,6 +38,54 @@ def _build_keyword(
     return "".join(p.strip() for p in parts if p and str(p).strip())
 
 
+def _fit_keyword(
+    province: str,
+    city: str,
+    district: str,
+    address: str,
+    *,
+    max_len: int,
+) -> str:
+    """将省市区+详址压至天地图 keyWord 长度上限（默认 50 字）。
+
+    按优先级尝试缩短；均超长时对完整串做尾部截断以保留门牌号信息。
+    """
+    full = _build_keyword(province, city, district, address)
+    if not full:
+        return full
+    if len(full) <= max_len:
+        return full
+
+    candidates = [
+        full,
+        _build_keyword("", city, district, address),
+        _build_keyword("", "", district, address),
+        _build_keyword("", "", "", address),
+    ]
+    for kw in candidates:
+        kw = (kw or "").strip()
+        if kw and len(kw) <= max_len:
+            if kw != full:
+                logger.info(
+                    "天地图 keyWord 已缩短: 原长=%d 现长=%d 原=%r 现=%r",
+                    len(full),
+                    len(kw),
+                    full[:80],
+                    kw,
+                )
+            return kw
+
+    truncated = full[-max_len:]
+    logger.info(
+        "天地图 keyWord 已截断: 原长=%d 现长=%d 原=%r 现=%r",
+        len(full),
+        len(truncated),
+        full[:80],
+        truncated,
+    )
+    return truncated
+
+
 def geocode_region_address(
     province: str,
     city: str,
@@ -57,7 +105,10 @@ def geocode_region_address(
     if not key:
         raise GeocoderError("未配置 MAP_API_KEY，无法调用天地图")
 
-    key_word = _build_keyword(province, city, district, address)
+    max_kw_len = int(getattr(config, "MAP_GEOCODER_KEYWORD_MAX_LEN", 50) or 50)
+    key_word = _fit_keyword(
+        province, city, district, address, max_len=max(1, max_kw_len)
+    )
     if not key_word.strip():
         raise GeocoderError("地址关键词为空，无法地理编码")
 
@@ -83,13 +134,27 @@ def geocode_region_address(
         with urllib.request.urlopen(req, timeout=effective_timeout) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as e:
-        logger.warning("天地图 HTTP 错误: %s", e)
+        err_body = ""
+        try:
+            err_body = e.read().decode("utf-8", errors="replace")[:500]
+        except Exception:
+            pass
+        logger.warning(
+            "天地图 HTTP 错误: %s keyWord_len=%d keyWord=%r response=%s",
+            e,
+            len(key_word),
+            key_word[:80],
+            err_body,
+        )
         hint = "天地图服务返回 HTTP 错误"
-        if getattr(e, "code", None) == 403:
+        code = getattr(e, "code", None)
+        if code == 403:
             hint += (
                 "（403：多为 tk 与应用类型不匹配——后台须使用天地图控制台申请的「服务端」应用密钥，"
                 "浏览器端密钥用于前端脚本，服务端直连常返回 403；也可能是密钥停用或配额用尽）"
             )
+        elif code == 400 and err_body:
+            hint += f"（{err_body[:200]}）"
         raise GeocoderError(hint) from e
     except urllib.error.URLError as e:
         logger.warning("天地图网络错误: %s", e)

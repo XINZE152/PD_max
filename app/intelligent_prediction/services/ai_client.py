@@ -14,6 +14,7 @@ import aiohttp
 from app.intelligent_prediction.settings import settings
 from app.intelligent_prediction.logging_utils import get_logger
 from app.intelligent_prediction.utils.json_extract import extract_json_object
+from app.services.llm_client import build_openai_compatible_body
 
 logger = get_logger(__name__)
 
@@ -77,16 +78,18 @@ class AIModelClient:
     ) -> tuple[dict[str, Any] | None, str, float, float | None, str, str]:
         """调用 OpenAI 兼容 Chat Completions。"""
         t0 = time.perf_counter()
-        body: dict[str, Any] = {
-            "model": model,
-            "messages": [
+        extra: dict[str, Any] = {"temperature": 0.2}
+        if force_json:
+            extra["response_format"] = {"type": "json_object"}
+        body = build_openai_compatible_body(
+            model,
+            [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            "temperature": 0.2,
-        }
-        if force_json:
-            body["response_format"] = {"type": "json_object"}
+            disable_thinking=force_json,
+            **extra,
+        )
         status, data = await self._post_json(session, url, headers, body)
         latency_ms = (time.perf_counter() - t0) * 1000.0
         if status == 0:
