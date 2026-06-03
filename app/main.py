@@ -133,23 +133,23 @@ async def on_startup():
             from apscheduler.triggers.cron import CronTrigger
 
             from app.intelligent_prediction.services.scheduled_prediction import (
-                run_scheduled_intelligent_prediction_sync,
+                run_scheduled_comprehensive_prediction_sync,
             )
 
             sched = BackgroundScheduler(timezone="Asia/Shanghai")
             sched.add_job(
-                func=run_scheduled_intelligent_prediction_sync,
+                func=run_scheduled_comprehensive_prediction_sync,
                 trigger=CronTrigger(
                     hour=ip_settings.intelligent_prediction_schedule_cron_hour,
                     minute=ip_settings.intelligent_prediction_schedule_cron_minute,
                 ),
-                id="intelligent_prediction_schedule",
+                id="comprehensive_prediction_schedule",
                 replace_existing=True,
             )
             sched.start()
             app.state.ip_prediction_scheduler = sched
             logger.info(
-                "智能预测定时任务已启用：cron %s:%s",
+                "综合预测定时任务已启用（v2）：cron %s:%s",
                 ip_settings.intelligent_prediction_schedule_cron_hour,
                 ip_settings.intelligent_prediction_schedule_cron_minute,
             )
