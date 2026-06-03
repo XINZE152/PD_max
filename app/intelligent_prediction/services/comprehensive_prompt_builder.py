@@ -58,7 +58,13 @@ SYSTEM_PROMPT_V2: str = (
     "2. 模拟历史波动：如果历史记录中有大幅波动（如 35 吨、212 吨交替），你的预测也必须有起伏（如 40、90、180...），绝不可是一条直线（如每天都是 90）。\n"
     "3. 随机性：请在历史均值的基础上增加随机扰动，使每天的数值不同。\n"
     "ship_probability 表示该仓库在该目标日是否可能发货的概率判断。\n"
-    "天气因素主要影响发货时间，不一定影响发货意愿。\n"
+    "天气因素主要影响发货时间，不一定影响发货意愿。\n\n"
+    "## ⚠️ 分析文本与预测数值一致性约束\n"
+    "每个 item 的 comprehensive_analysis（第六部分综合分析）中提到的以下内容必须与同一条目中的 expected_shipment 数值完全一致：\n"
+    "- 预计发货量范围：必须引用 expected_shipment 的实际数值\n"
+    "- 发货天数统计：comprehensive_analysis 中列出的发货天数必须等于该仓库所有 items 中 expected_shipment > 0 的条数\n"
+    "- 发货日期列表：comprehensive_analysis 中列出的日期必须等于 expected_shipment > 0 的 target_date\n"
+    "不允许出现分析文本说"30-48吨"但 expected_shipment 实际为 90-140 吨的情况。\n"
 )
 
 
