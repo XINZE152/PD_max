@@ -108,10 +108,11 @@ async def call_predict_api() -> dict:
                 "product_variety": TEST_VARIETY,
                 "smelter": TEST_SMELTER,
                 "horizon_days": 15,
+                "use_cache": False,
             }
         ]
     }
-    async with httpx.AsyncClient(timeout=120.0) as client:
+    async with httpx.AsyncClient(timeout=300.0) as client:
         resp = await client.post(f"{BASE_URL}/predict", json=payload)
         resp.raise_for_status()
         return resp.json()
