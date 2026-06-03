@@ -83,7 +83,10 @@ class ComprehensivePredictionService:
         smelter: Optional[str] = None,
         limit: int = 120,
     ) -> list[PredictionHistoryPoint]:
-        """从数据库加载最近历史记录。"""
+        """从数据库加载最近历史记录。
+
+        若指定品种无数据，自动推断该仓库（+冶炼厂）出现次数最多的品种。
+        """
         conds = [
             DeliveryRecord.warehouse == warehouse,
             DeliveryRecord.product_variety == variety,
@@ -98,6 +101,41 @@ class ComprehensivePredictionService:
         )
         res = await session.execute(stmt)
         rows = list(res.scalars().all())
+
+        # 指定品种无数据时，自动推断最常见品种
+        if not rows:
+            variety_conds = [DeliveryRecord.warehouse == warehouse]
+            if smelter:
+                variety_conds.append(DeliveryRecord.smelter == smelter)
+            variety_stmt = (
+                select(DeliveryRecord.product_variety, func.count().label("cnt"))
+                .where(and_(*variety_conds))
+                .group_by(DeliveryRecord.product_variety)
+                .order_by(func.count().desc())
+                .limit(1)
+            )
+            vrow = (await session.execute(variety_stmt)).first()
+            if vrow and vrow[0]:
+                inferred_variety = str(vrow[0]).strip()
+                logger.info(
+                    "infer product_variety for warehouse=%s smelter=%s: %r -> %r",
+                    warehouse, smelter, variety, inferred_variety,
+                )
+                conds = [
+                    DeliveryRecord.warehouse == warehouse,
+                    DeliveryRecord.product_variety == inferred_variety,
+                ]
+                if smelter:
+                    conds.append(DeliveryRecord.smelter == smelter)
+                stmt = (
+                    select(DeliveryRecord)
+                    .where(and_(*conds))
+                    .order_by(DeliveryRecord.delivery_date.desc())
+                    .limit(limit)
+                )
+                res = await session.execute(stmt)
+                rows = list(res.scalars().all())
+
         rows.reverse()
         return [
             PredictionHistoryPoint(
