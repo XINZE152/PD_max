@@ -653,13 +653,29 @@ class VlmFullData(BaseModel):
 
 class ConfirmPriceTableItem(BaseModel):
     """确认价格表 - 单条明细"""
-    冶炼厂名: str = Field(..., description="冶炼厂名称（OCR识别或前端修改后）")
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    冶炼厂名: str = Field(
+        ...,
+        validation_alias=AliasChoices("冶炼厂名", "冶炼厂", "factory_name", "name"),
+        description="冶炼厂名称（OCR识别或前端修改后）",
+    )
     冶炼厂id: Optional[int] = Field(
         None,
+        validation_alias=AliasChoices("冶炼厂id", "factory_id", "id"),
         description="冶炼厂ID；为 null 时按「冶炼厂名」与字典精确匹配解析 id，不存在或已停用则报错（不在此接口自动新建冶炼厂）",
     )
-    品类名: str = Field(..., description="品类名称（OCR识别或前端修改后）")
-    品类id: Optional[int] = Field(None, description="品类分组ID，null则自动新建")
+    品类名: str = Field(
+        ...,
+        validation_alias=AliasChoices("品类名", "品类", "category_name", "品名", "名称"),
+        description="品类名称（OCR识别或前端修改后）",
+    )
+    品类id: Optional[int] = Field(
+        None,
+        validation_alias=AliasChoices("品类id", "category_id", "品类Id"),
+        description="品类分组ID，null则自动新建",
+    )
     价格: Optional[float] = Field(None, description="不含税基准价（元/吨）")
     价格口径: Optional[str] = Field(
         None,
