@@ -8,9 +8,9 @@ class TestConfirmPriceTableAliases(unittest.TestCase):
     def test_frontend_alias_field_names(self):
         body = ConfirmPriceTableRequest.model_validate(
             {
-                "报价日期": "2026-06-03",
                 "数据": [
                     {
+                        "报价日期": "2026-06-03",
                         "冶炼厂": "某某冶炼厂",
                         "冶炼厂id": 123,
                         "品类": "铜",
@@ -28,6 +28,7 @@ class TestConfirmPriceTableAliases(unittest.TestCase):
         )
         item = body.数据[0]
         dumped = item.model_dump()
+        self.assertEqual(dumped["报价日期"], "2026-06-03")
         self.assertEqual(dumped["冶炼厂名"], "某某冶炼厂")
         self.assertEqual(dumped["冶炼厂id"], 123)
         self.assertEqual(dumped["品类名"], "铜")
@@ -35,12 +36,23 @@ class TestConfirmPriceTableAliases(unittest.TestCase):
         self.assertEqual(dumped["价格"], 70000)
         self.assertEqual(dumped["价格口径"], "ex_vat")
 
+    def test_date_alias_on_item(self):
+        item = ConfirmPriceTableItem.model_validate(
+            {
+                "日期": "2026-06-01",
+                "冶炼厂": "厂A",
+                "品类": "铜",
+                "价格": 1000,
+            }
+        )
+        self.assertEqual(item.报价日期, "2026-06-01")
+
     def test_canonical_field_names_from_ocr(self):
         body = ConfirmPriceTableRequest.model_validate(
             {
-                "报价日期": "2026-03-24",
                 "数据": [
                     {
+                        "报价日期": "2026-03-24",
                         "冶炼厂名": "山西亿晨环保科技有限公司",
                         "冶炼厂id": 1,
                         "品类名": "电动车电池",
@@ -52,12 +64,14 @@ class TestConfirmPriceTableAliases(unittest.TestCase):
             }
         )
         item = body.数据[0]
+        self.assertEqual(item.报价日期, "2026-03-24")
         self.assertEqual(item.冶炼厂名, "山西亿晨环保科技有限公司")
         self.assertEqual(item.品类名, "电动车电池")
 
     def test_english_alias_field_names(self):
         item = ConfirmPriceTableItem.model_validate(
             {
+                "quote_date": "2026-05-01",
                 "factory_name": "Test Smelter",
                 "factory_id": 99,
                 "category_name": "Aluminum",
@@ -66,6 +80,7 @@ class TestConfirmPriceTableAliases(unittest.TestCase):
             }
         )
         dumped = item.model_dump()
+        self.assertEqual(dumped["报价日期"], "2026-05-01")
         self.assertEqual(dumped["冶炼厂名"], "Test Smelter")
         self.assertEqual(dumped["冶炼厂id"], 99)
         self.assertEqual(dumped["品类名"], "Aluminum")
@@ -74,6 +89,7 @@ class TestConfirmPriceTableAliases(unittest.TestCase):
     def test_factory_id_from_id_alias(self):
         item = ConfirmPriceTableItem.model_validate(
             {
+                "报价日期": "2026-06-01",
                 "冶炼厂": "Test Smelter",
                 "id": 42,
                 "品类": "铜",
@@ -85,17 +101,27 @@ class TestConfirmPriceTableAliases(unittest.TestCase):
     def test_replace_factory_quotes_defaults_false(self):
         body = ConfirmPriceTableRequest.model_validate(
             {
-                "报价日期": "2026-06-03",
                 "数据": [
-                    {"冶炼厂": "厂A", "品类": "铜", "价格": 1000},
+                    {"报价日期": "2026-06-03", "冶炼厂": "厂A", "品类": "铜", "价格": 1000},
                 ],
             }
         )
         self.assertFalse(body.同冶炼厂当日整表覆盖)
 
+    def test_missing_row_date_rejected(self):
+        with self.assertRaises(Exception):
+            ConfirmPriceTableRequest.model_validate(
+                {
+                    "数据": [
+                        {"冶炼厂": "厂A", "品类": "铜", "价格": 1000},
+                    ],
+                }
+            )
+
     def test_extra_fields_ignored_on_item(self):
         item = ConfirmPriceTableItem.model_validate(
             {
+                "报价日期": "2026-06-01",
                 "冶炼厂": "厂A",
                 "品类": "铜",
                 "价格": 1000,
