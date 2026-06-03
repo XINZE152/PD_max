@@ -39,7 +39,7 @@ SYSTEM_PROMPT_V2: str = (
     '      "target_date": "YYYY-MM-DD",\n'
     '      "ship_probability": "高|中|低",\n'
     '      "expected_ship_date": "YYYY-MM-DD|null",\n'
-    '      "expected_shipment": 数字,\n'
+    '      "expected_shipment": 数字（体现每日波动，不可所有日期相同）,\n'
     '      "confidence_level": "高|中|低",\n'
     '      "main_factors": "影响判断的主要原因",\n'
     '      "history_analysis": "第一部分：历史发货规律分析文本",\n'
@@ -53,6 +53,7 @@ SYSTEM_PROMPT_V2: str = (
     '}\n\n'
     "每个预测日的 target_date 必须与输入的目标日期列表一致。\n"
     "expected_shipment 必须为大于 0 的正数。\n"
+    "【重要】不要连续多天输出相同的预测值。请根据历史数据的最大值、最小值和标准差，为每一天生成不同的预测值（例如围绕均值波动）。\n"
     "ship_probability 表示该仓库在该目标日是否可能发货的概率判断。\n"
     "天气因素主要影响发货时间，不一定影响发货意愿。\n"
 )
