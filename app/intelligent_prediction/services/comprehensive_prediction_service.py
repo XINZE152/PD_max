@@ -367,7 +367,7 @@ class ComprehensivePredictionService:
         if parse_note:
             for it in items:
                 it = ComprehensivePredictionItem(
-                    **{**it.model_dump(), "main_factors": f"{it.main_factors}（解析备注：{parse_note}）"}
+                    **{**it.model_dump(mode="json"), "main_factors": f"{it.main_factors}（解析备注：{parse_note}）"}
                 )
 
         result = ComprehensivePredictionResult(
