@@ -38,10 +38,21 @@ async def list_dimensions_from_delivery_history(session: AsyncSession) -> Dimens
 
 
 async def list_dimensions_from_prediction_results(session: AsyncSession) -> DimensionListsResponse:
-    """数据来自 ``pd_ip_prediction_results``（已落库的智能预测明细）。"""
+    """数据来自 ``pd_ip_prediction_results``（已落库的智能预测明细）。
+
+    若预测结果为空（尚未执行过 v2 预测），回退到从送货历史 ``pd_ip_delivery_records``
+    读取维度，确保前端下拉框始终有候选值。
+    """
     rms = await _distinct_ordered(session, PredictionResultRow.regional_manager)
     whs = await _distinct_ordered(session, PredictionResultRow.warehouse)
     sms = await _distinct_ordered(session, PredictionResultRow.smelter)
+
+    # 回退：预测结果无数据时，使用送货历史同源维度
+    if not rms and not whs and not sms:
+        rms = await _distinct_ordered(session, DeliveryRecord.regional_manager)
+        whs = await _distinct_ordered(session, DeliveryRecord.warehouse)
+        sms = await _distinct_ordered(session, DeliveryRecord.smelter)
+
     return DimensionListsResponse(
         regional_managers=rms,
         warehouses=whs,
