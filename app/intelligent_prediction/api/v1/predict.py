@@ -1,4 +1,4 @@
-"""预测 HTTP 接口（综合预测 v2）。"""
+"""预测 HTTP 接口（15 天发货预测 · 豆包方案）。"""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from app.intelligent_prediction.exceptions import (
     ServiceUnavailableBusinessException,
 )
 from app.intelligent_prediction.logging_utils import get_logger
-from app.intelligent_prediction.api.deps import get_prediction_db_session, get_comprehensive_prediction_service_dep
+from app.intelligent_prediction.api.deps import get_prediction_db_session, get_doubao_prediction_service_dep
 from app.intelligent_prediction.models import PredictionBatch
 from app.intelligent_prediction.models import PredictionResult as PredictionResultRow
 from app.intelligent_prediction.schemas.audit import OperationAuditItem, OperationAuditListResponse
@@ -25,18 +25,19 @@ from app.intelligent_prediction.schemas.dict_addresses import (
     WarehouseSmelterAddressLookupResponse,
 )
 from app.intelligent_prediction.schemas.dimensions import DimensionListsResponse
+from app.intelligent_prediction.schemas.doubao_prediction import (
+    DoubaoBatchRequest,
+    DoubaoPredictionResult,
+)
 from app.intelligent_prediction.schemas.prediction import (
     AsyncPredictionAccepted,
-    BatchPredictionRequest,
     BatchStatusResponse,
-    ComprehensiveBatchRequest,
-    ComprehensivePredictionResult,
     StoredPredictionResultItem,
     StoredPredictionResultListResponse,
 )
 from app.intelligent_prediction.services.audit_service import list_audit_events
-from app.intelligent_prediction.services.comprehensive_prediction_service import (
-    ComprehensivePredictionService,
+from app.intelligent_prediction.services.doubao_prediction_service import (
+    DoubaoPredictionService,
 )
 from app.intelligent_prediction.services.dimension_options_service import (
     list_dimensions_from_prediction_results,
@@ -106,22 +107,38 @@ async def list_operation_audit(
 
 @router.post(
     "",
-    response_model=list[ComprehensivePredictionResult],
-    summary="同步批量预测（v2 综合预测）",
+    response_model=list[DoubaoPredictionResult],
+    summary="同步批量15天发货预测",
     description=(
-        "调用大模型对多笔请求做综合预测（历史规律40%、价格30%、敏感度15%、"
-        "节假日10%、天气5%），并将结果写入数据库。"
+        "接收仓库历史送货数据、冶炼厂价格、SMM铅价三组数据，"
+        "调用大模型输出六维度分析报告 + 15天逐日发货吨数预测，并写入数据库。"
     ),
 )
 async def predict_sync(
-    body: ComprehensiveBatchRequest,
+    body: DoubaoBatchRequest,
     session: AsyncSession = Depends(get_prediction_db_session),
-    svc: ComprehensivePredictionService = Depends(get_comprehensive_prediction_service_dep),
-) -> list[ComprehensivePredictionResult]:
-    """同步批量综合预测并写库。"""
+    svc: DoubaoPredictionService = Depends(get_doubao_prediction_service_dep),
+) -> list[DoubaoPredictionResult]:
+    """同步批量15天发货预测并写库。"""
     try:
+        # 构建 history_map 用于 persist 时推断 regional_manager 和 smelter
+        history_map: dict[str, list] = {}
+        for item in body.items:
+            if item.history:
+                history_map[item.warehouse] = item.history
+
         results = await svc.predict_batch(body)
-        await svc.persist_sync_results(session, results, batch_id=None)
+
+        # 对于 history 为空的请求，从 DB 补充 history_map
+        for item in body.items:
+            if item.warehouse not in history_map:
+                loaded = await svc._load_history_from_db(
+                    session, item.warehouse, item.product_variety,
+                )
+                if loaded:
+                    history_map[item.warehouse] = loaded
+
+        await svc.persist_sync_results(session, results, batch_id=None, history_map=history_map)
         return results
     except BusinessException:
         raise
@@ -133,11 +150,11 @@ async def predict_sync(
 @router.post(
     "/async",
     response_model=AsyncPredictionAccepted,
-    summary="异步批量预测（v2 综合预测）",
+    summary="异步批量15天发货预测",
     description="创建预测批次并入队 Celery，返回任务编号与批次编号。",
 )
 async def predict_async(
-    body: ComprehensiveBatchRequest,
+    body: DoubaoBatchRequest,
     session: AsyncSession = Depends(get_prediction_db_session),
 ) -> AsyncPredictionAccepted:
     """异步预测：入队 Celery。"""

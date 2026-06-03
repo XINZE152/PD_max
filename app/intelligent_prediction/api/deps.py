@@ -12,6 +12,11 @@ from app.intelligent_prediction.services.comprehensive_prediction_service import
     get_comprehensive_prediction_service,
 )
 from app.intelligent_prediction.services.comprehensive_prompt_builder import ComprehensivePromptBuilder
+from app.intelligent_prediction.services.doubao_prediction_service import (
+    DoubaoPredictionService,
+    get_doubao_prediction_service,
+)
+from app.intelligent_prediction.services.doubao_prompt_builder import DoubaoPromptBuilder
 from app.intelligent_prediction.services.history_service import HistoryService, get_history_service
 from app.intelligent_prediction.services.prediction_service import PredictionService, get_prediction_service
 from app.intelligent_prediction.services.prompt_builder import PromptBuilder
@@ -43,6 +48,14 @@ def get_comprehensive_prediction_service_dep(
     return get_comprehensive_prediction_service(ai, cache, ComprehensivePromptBuilder())
 
 
+def get_doubao_prediction_service_dep(
+    ai: AIModelClient = Depends(get_ai_client_dep),
+    cache: CacheManager = Depends(get_cache_manager_dep),
+) -> DoubaoPredictionService:
+    """15 天发货预测服务依赖。"""
+    return get_doubao_prediction_service(ai, cache, DoubaoPromptBuilder())
+
+
 __all__ = [
     "get_prediction_db_session",
     "get_ai_client_dep",
@@ -50,4 +63,5 @@ __all__ = [
     "get_history_service_dep",
     "get_prediction_service_dep",
     "get_comprehensive_prediction_service_dep",
+    "get_doubao_prediction_service_dep",
 ]

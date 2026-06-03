@@ -1,4 +1,4 @@
-"""Celery：批量预测与 Excel 导出（综合预测 v2）。"""
+"""Celery：批量预测与 Excel 导出（15 天发货预测 · 豆包方案）。"""
 
 from __future__ import annotations
 
@@ -12,14 +12,14 @@ import pandas as pd
 from app.intelligent_prediction.logging_utils import get_logger
 from app.intelligent_prediction.db import get_prediction_session_factory
 from app.intelligent_prediction.models import PredictionBatch
-from app.intelligent_prediction.schemas.prediction import ComprehensiveBatchRequest
+from app.intelligent_prediction.schemas.doubao_prediction import DoubaoBatchRequest
 from app.intelligent_prediction.services.ai_client import get_ai_client
 from app.intelligent_prediction.services.cache_manager import get_cache_manager
-from app.intelligent_prediction.services.comprehensive_prediction_service import (
-    ComprehensivePredictionService,
-    get_comprehensive_prediction_service,
+from app.intelligent_prediction.services.doubao_prediction_service import (
+    DoubaoPredictionService,
+    get_doubao_prediction_service,
 )
-from app.intelligent_prediction.services.comprehensive_prompt_builder import ComprehensivePromptBuilder
+from app.intelligent_prediction.services.doubao_prompt_builder import DoubaoPromptBuilder
 from app.intelligent_prediction.tasks.celery_app import celery_app
 
 logger = get_logger(__name__)
@@ -38,9 +38,9 @@ async def _run_batch_async(batch_id: str) -> None:
         await session.refresh(batch)
         try:
             meta = batch.meta or {}
-            req = ComprehensiveBatchRequest.model_validate(meta)
-            svc: ComprehensivePredictionService = get_comprehensive_prediction_service(
-                get_ai_client(), get_cache_manager(), ComprehensivePromptBuilder()
+            req = DoubaoBatchRequest.model_validate(meta)
+            svc: DoubaoPredictionService = get_doubao_prediction_service(
+                get_ai_client(), get_cache_manager(), DoubaoPromptBuilder()
             )
             results = await svc.predict_batch(req)
             await svc.persist_sync_results(session, results, batch_id=batch_id)
@@ -49,17 +49,14 @@ async def _run_batch_async(batch_id: str) -> None:
                 for it in pr.items:
                     rows.append(
                         {
-                            "warehouse": pr.warehouse,
-                            "product_variety": pr.product_variety,
-                            "smelter": pr.smelter or "",
-                            "regional_manager": pr.regional_manager or "",
-                            "target_date": it.target_date.isoformat(),
-                            "ship_probability": it.ship_probability,
-                            "expected_ship_date": it.expected_ship_date.isoformat() if it.expected_ship_date else "",
-                            "expected_shipment": float(it.expected_shipment),
-                            "confidence_level": it.confidence_level,
-                            "main_factors": it.main_factors,
-                            "comprehensive_analysis": it.comprehensive_analysis,
+                            "仓库": pr.warehouse,
+                            "品类": pr.product_variety or "",
+                            "目标日期": it.target_date.isoformat(),
+                            "预测发货吨数": float(it.predicted_weight),
+                            "发货概率": it.ship_probability,
+                            "置信度": it.confidence_level,
+                            "主要因素": it.main_factors,
+                            "分析报告": pr.analysis_report[:500] if pr.analysis_report else "",
                         }
                     )
             df = pd.DataFrame(rows)
