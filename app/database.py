@@ -1953,12 +1953,10 @@ def ensure_pd_ip_prediction_results_v2_columns() -> None:
 
             def _has_col(col: str) -> bool:
                 cursor.execute(
-                    "SELECT COUNT(*) FROM information_schema.columns "
-                    "WHERE table_schema = DATABASE() AND table_name = 'pd_ip_prediction_results' "
-                    "AND column_name = %s",
+                    "SHOW COLUMNS FROM pd_ip_prediction_results LIKE %s",
                     (col,),
                 )
-                return cursor.fetchone()[0] > 0
+                return cursor.fetchone() is not None
 
             columns = [
                 ("ship_probability", "VARCHAR(32) DEFAULT NULL COMMENT '发货概率: high/medium/low'"),
