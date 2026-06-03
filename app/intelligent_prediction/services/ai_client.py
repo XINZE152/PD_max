@@ -116,6 +116,9 @@ class AIModelClient:
         if choices:
             msg = (choices[0] or {}).get("message") or {}
             content = str(msg.get("content", "") or "")
+            # DeepSeek 推理模型把内容放在 reasoning_content 里
+            if not content.strip():
+                content = str(msg.get("reasoning_content", "") or "")
         usage = data.get("usage") if isinstance(data.get("usage"), dict) else None
         cost = self._estimate_openai_cost(usage)
         logger.info(
