@@ -84,11 +84,10 @@ SYSTEM_PROMPT: str = """\
 ==================================================
 【输出格式 · 必须严格遵守】
 
-第一步：输出完整的六部分分析报告（纯文本，不要 JSON）。
-
-第二步：输出 JSON（不要 Markdown、不要代码块、不要 ```json 标记）：
+只输出一个 JSON 对象（不要 Markdown、不要代码块、不要纯文本前言）。
+JSON 结构如下：
 {
-    "analysis_report": "完整的六部分分析报告文本...",
+    "analysis_report": "完整的六部分分析报告文本（包含第一到第六部分的所有分析内容）",
     "items": [
         {"target_date": "YYYY-MM-DD", "predicted_weight": 0, "ship_probability": "低", "confidence_level": "低", "main_factors": ""},
         ...
@@ -96,6 +95,7 @@ SYSTEM_PROMPT: str = """\
 }
 
 其中：
+- analysis_report 必须包含完整的六部分分析报告（第一到第六部分），这是给用户阅读的分析文本
 - items 必须包含从 day0 到 day15 共 16 条记录
 - predicted_weight 为发货吨数（不发货则为 0）
 - ship_probability 为发货概率（高/中/低）
