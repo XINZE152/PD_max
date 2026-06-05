@@ -614,6 +614,23 @@ TABLE_STATEMENTS = [
         INDEX idx_vwais_created (created_at)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='垂直库房AI定价分析快照';
     """,
+    # 库房送货统计缓存（T+1 定时汇总，供电子地图展示当月发货量/年度累计发货量）
+    """
+    CREATE TABLE IF NOT EXISTS pd_warehouse_delivery_stats (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '主键',
+        warehouse VARCHAR(255) NOT NULL COMMENT '库房名称（关联 pd_ip_delivery_records.warehouse）',
+        stat_year SMALLINT NOT NULL COMMENT '统计年份',
+        stat_month TINYINT NOT NULL COMMENT '统计月份',
+        monthly_delivery_ton DECIMAL(18,4) NOT NULL DEFAULT 0 COMMENT '当月发货量（吨）',
+        yearly_delivery_ton DECIMAL(18,4) NOT NULL DEFAULT 0 COMMENT '年度累计发货量（吨）',
+        stat_date DATE NOT NULL COMMENT '统计截止日期',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        UNIQUE KEY uk_warehouse_year_month (warehouse, stat_year, stat_month),
+        INDEX idx_stat_year (stat_year),
+        INDEX idx_stat_year_month (stat_year, stat_month)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='库房送货统计缓存（T+1 定时汇总）';
+    """,
 ]
 
 
@@ -1565,6 +1582,10 @@ def create_tables() -> None:
         ensure_pd_ip_prediction_results_v2_columns()
     except Exception:
         logger.exception("检查/添加 pd_ip_prediction_results v2 综合预测列失败")
+    try:
+        ensure_pd_warehouse_delivery_stats()
+    except Exception:
+        logger.exception("检查/创建 pd_warehouse_delivery_stats 库房送货统计缓存表失败")
 
 
 def ensure_warehouse_inventory_and_receipt_price_tables() -> None:
@@ -1978,6 +1999,39 @@ def ensure_pd_ip_prediction_results_v2_columns() -> None:
                         f"AFTER raw_response_excerpt"
                     )
                     logger.info("已为 pd_ip_prediction_results 添加 %s 列", col_name)
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def ensure_pd_warehouse_delivery_stats() -> None:
+    """已有库升级：创建库房送货统计缓存表 pd_warehouse_delivery_stats。"""
+    config_dict = get_mysql_config()
+    connection = pymysql.connect(**config_dict)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SHOW TABLES LIKE 'pd_warehouse_delivery_stats'")
+            if cursor.fetchone() is not None:
+                return
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pd_warehouse_delivery_stats (
+                    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '主键',
+                    warehouse VARCHAR(255) NOT NULL COMMENT '库房名称（关联 pd_ip_delivery_records.warehouse）',
+                    stat_year SMALLINT NOT NULL COMMENT '统计年份',
+                    stat_month TINYINT NOT NULL COMMENT '统计月份',
+                    monthly_delivery_ton DECIMAL(18,4) NOT NULL DEFAULT 0 COMMENT '当月发货量（吨）',
+                    yearly_delivery_ton DECIMAL(18,4) NOT NULL DEFAULT 0 COMMENT '年度累计发货量（吨）',
+                    stat_date DATE NOT NULL COMMENT '统计截止日期',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    UNIQUE KEY uk_warehouse_year_month (warehouse, stat_year, stat_month),
+                    INDEX idx_stat_year (stat_year),
+                    INDEX idx_stat_year_month (stat_year, stat_month)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='库房送货统计缓存（T+1 定时汇总）'
+                """
+            )
+            logger.info("已创建 pd_warehouse_delivery_stats 库房送货统计缓存表")
         connection.commit()
     finally:
         connection.close()

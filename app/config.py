@@ -233,6 +233,23 @@ try:
 except ValueError:
     SMM_LEAD_PRICE_SCHEDULE_MINUTE = 35
 
+# 库房送货统计定时聚合（T+1，每日凌晨汇总当月/年度发货量缓存，供电子地图展示）
+WAREHOUSE_DELIVERY_STATS_SCHEDULE_ENABLED = _env_enabled(
+    "WAREHOUSE_DELIVERY_STATS_SCHEDULE_ENABLED", default=True
+)
+try:
+    WAREHOUSE_DELIVERY_STATS_SCHEDULE_HOUR = int(
+        os.getenv("WAREHOUSE_DELIVERY_STATS_SCHEDULE_HOUR", "2")
+    )
+except ValueError:
+    WAREHOUSE_DELIVERY_STATS_SCHEDULE_HOUR = 2
+try:
+    WAREHOUSE_DELIVERY_STATS_SCHEDULE_MINUTE = int(
+        os.getenv("WAREHOUSE_DELIVERY_STATS_SCHEDULE_MINUTE", "0")
+    )
+except ValueError:
+    WAREHOUSE_DELIVERY_STATS_SCHEDULE_MINUTE = 0
+
 # 启用「循融宝发货」的冶炼厂在比价/采购建议中货物单价加价（元/吨）；默认 80，可用环境变量覆盖
 try:
     _xrb = (os.getenv("XUNRONGBAO_SHIPPING_PREMIUM_PER_TON", "") or "80").strip() or "80"

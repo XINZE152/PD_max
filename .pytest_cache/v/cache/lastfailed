@@ -1,6 +1,0 @@
-{
-  "tests/test_ai_detection_amount_candidates.py": true,
-  "tests/test_ai_detection_bbox_overlap.py": true,
-  "tests/test_comprehensive_history_analysis.py": true,
-  "tests/test_comprehensive_prediction.py": true
-}
