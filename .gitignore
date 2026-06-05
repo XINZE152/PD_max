@@ -28,3 +28,4 @@ uploads/
 *.xlsx
 *.txt
 CLAUDE.md
+.pytest_cache

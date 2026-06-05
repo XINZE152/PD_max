@@ -193,6 +193,43 @@ async def on_startup():
         app.state.smm_lead_scheduler = None
         logger.info("SMM 1#铅锭参考价定时抓取已关闭（SMM_LEAD_PRICE_SCHEDULE_ENABLED=0）")
 
+    if app_config.WAREHOUSE_DELIVERY_STATS_SCHEDULE_ENABLED:
+        from apscheduler.schedulers.background import BackgroundScheduler
+        from apscheduler.triggers.cron import CronTrigger
+
+        from app.services.warehouse_delivery_stats_service import (
+            run_scheduled_delivery_stats_aggregation,
+        )
+
+        wds_sched = BackgroundScheduler(timezone="Asia/Shanghai")
+        wds_sched.add_job(
+            func=run_scheduled_delivery_stats_aggregation,
+            trigger=CronTrigger(
+                hour=app_config.WAREHOUSE_DELIVERY_STATS_SCHEDULE_HOUR,
+                minute=app_config.WAREHOUSE_DELIVERY_STATS_SCHEDULE_MINUTE,
+            ),
+            id="warehouse_delivery_stats_aggregation",
+            replace_existing=True,
+        )
+        wds_sched.start()
+        app.state.warehouse_delivery_stats_scheduler = wds_sched
+        logger.info(
+            "库房送货统计定时聚合已启用：cron %02d:%02d",
+            app_config.WAREHOUSE_DELIVERY_STATS_SCHEDULE_HOUR,
+            app_config.WAREHOUSE_DELIVERY_STATS_SCHEDULE_MINUTE,
+        )
+        # 启动时立即执行一次，确保已有历史数据入库后即有缓存
+        import threading
+
+        threading.Thread(
+            target=run_scheduled_delivery_stats_aggregation, daemon=True
+        ).start()
+    else:
+        app.state.warehouse_delivery_stats_scheduler = None
+        logger.info(
+            "库房送货统计定时聚合已关闭（WAREHOUSE_DELIVERY_STATS_SCHEDULE_ENABLED=0）"
+        )
+
 
 @app.on_event("shutdown")
 async def on_shutdown():
@@ -203,6 +240,9 @@ async def on_shutdown():
     smm_sched = getattr(app.state, "smm_lead_scheduler", None)
     if smm_sched is not None:
         smm_sched.shutdown(wait=False)
+    wds_sched = getattr(app.state, "warehouse_delivery_stats_scheduler", None)
+    if wds_sched is not None:
+        wds_sched.shutdown(wait=False)
     if app_config.INTELLIGENT_PREDICTION_ENABLED:
         sched = getattr(app.state, "ip_prediction_scheduler", None)
         if sched is not None:

@@ -736,6 +736,8 @@ class TLService:
             "电话": item.get("contactPhone") or "",
             "危废经营许可数量": item.get("hazardousWasteLicenseQty"),
             "月均收货": item.get("monthlyAvgReceiptTon"),
+            "当月发货量": None,
+            "年度累计发货量": None,
             "当前库存": item.get("currentInventoryTon"),
             "库存日期": item.get("inventoryDate"),
             "收货价格": item.get("receiptPricePerTon"),
@@ -928,6 +930,54 @@ class TLService:
             rec["库房到冶炼厂运费"] = freight_map.get(wid, [])
         return rows
 
+    def _enrich_warehouse_rows_with_delivery_stats(
+        self, rows: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """为库房列表补充当月发货量、年度累计发货量（来自 pd_warehouse_delivery_stats 缓存表）。"""
+        if not rows:
+            return rows
+        wh_names = list(
+            dict.fromkeys(
+                str(r["仓库名"]) for r in rows if r.get("仓库名")
+            )
+        )
+        if not wh_names:
+            return rows
+        stats_map: Dict[str, Dict[str, Any]] = {}
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    ph = ",".join(["%s"] * len(wh_names))
+                    cur.execute(
+                        f"""
+                        SELECT warehouse, monthly_delivery_ton, yearly_delivery_ton
+                        FROM pd_warehouse_delivery_stats
+                        WHERE warehouse IN ({ph})
+                          AND stat_year = YEAR(CURDATE())
+                          AND stat_month = MONTH(CURDATE())
+                        """,
+                        tuple(wh_names),
+                    )
+                    for wh, monthly, yearly in cur.fetchall():
+                        stats_map[str(wh)] = {
+                            "当月发货量": float(monthly) if monthly is not None else 0.0,
+                            "年度累计发货量": float(yearly) if yearly is not None else 0.0,
+                        }
+        except Exception:
+            logger.warning("加载库房送货统计缓存失败（表可能尚未初始化）")
+            return rows
+
+        for rec in rows:
+            wh_name = str(rec.get("仓库名") or "")
+            stats = stats_map.get(wh_name)
+            if stats:
+                rec["当月发货量"] = stats["当月发货量"]
+                rec["年度累计发货量"] = stats["年度累计发货量"]
+            else:
+                rec["当月发货量"] = rec.get("当月发货量", 0.0)
+                rec["年度累计发货量"] = rec.get("年度累计发货量", 0.0)
+        return rows
+
     def get_warehouses(
         self,
         keyword: Optional[str] = None,
@@ -970,8 +1020,10 @@ class TLService:
                     row["库房类型颜色配置"] = t_cc
                     row["颜色配置"] = t_cc
                     out_rows.append(row)
-                out_rows = self._enrich_warehouse_rows_with_freight(
-                    self._enrich_warehouse_rows_inventory_and_prices(out_rows)
+                out_rows = self._enrich_warehouse_rows_with_delivery_stats(
+                    self._enrich_warehouse_rows_with_freight(
+                        self._enrich_warehouse_rows_inventory_and_prices(out_rows)
+                    )
                 )
                 return {
                     "list": out_rows,
@@ -1040,8 +1092,10 @@ class TLService:
                         rec["仓库颜色配置"] = wh_cc
                         rec["颜色配置"] = type_cc
                         out.append(rec)
-                    return self._enrich_warehouse_rows_with_freight(
-                        self._enrich_warehouse_rows_inventory_and_prices(out)
+                    return self._enrich_warehouse_rows_with_delivery_stats(
+                        self._enrich_warehouse_rows_with_freight(
+                            self._enrich_warehouse_rows_inventory_and_prices(out)
+                        )
                     )
         except Exception as e:
             logger.error(f"获取仓库列表失败: {e}")
