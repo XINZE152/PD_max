@@ -7,7 +7,7 @@ System + User prompt，交给 LLM 完成六大维度分析与逐日预测。
 from __future__ import annotations
 
 import statistics
-from collections import Counter
+from collections import Counter, defaultdict
 from datetime import date, timedelta
 from decimal import Decimal
 from typing import Any, Optional
@@ -35,6 +35,12 @@ SYSTEM_PROMPT: str = """\
 3. 分析历史发货规律时，**必须优先看整月总发货次数、整月总货量、月度整体发货频率**，不能只看短期连续两次的间隔。
 4. 如果一个月只发几次，即使短期间隔很近，也判定为 **月度低频仓库**，未来15天不会高频发货。
 5. 严禁连续3天以上 predicted_weight 完全相同；必须模拟历史波动特征。
+
+【时间锚定规则 · 必须严格遵守】
+※ User Prompt 末尾的【时间锚点】表定义了本次预测的全部目标日期（day0 ~ day15），这是所有日期引用的唯一标准。
+※ 分析文本中提到任意发货日期时，必须同时写出其 day 索引，格式为"dayN（YYYY-MM-DD 周X）"。禁止只写裸日期：如"6月9日发货"是错误的，必须写为"day3（6月9日 周一）发货"。
+※ 第六部分的「预测发货汇总表」中，每行的索引列和日期列必须取自【时间锚点】表，禁止自编日期。
+※ JSON items 中每条 target_date 必须等于【时间锚点】中对应 day 索引的日期值。
 
 【发货重量规则 · 必须严格遵守】
 货车是仓库发货的唯一运输方式，以下规则至关重要：
@@ -85,11 +91,11 @@ SYSTEM_PROMPT: str = """\
 	⚠️ 必须先输出「预测发货汇总表」，再写分析文本。表格是后续所有结论和 JSON 的唯一数据来源。
 
 	--- 预测发货汇总表（必须严格按此格式输出）---
-	| 序号 | 预测日期 | 日发货量(吨) |
-	|------|----------|-------------|
-	| 1 | YYYY-MM-DD | XXX |
-	| 2 | YYYY-MM-DD | XXX |
-	（只列出 predicted_weight > 0 的日期，按日期升序排列）
+	| 序号 | 索引 | 日期 | 日发货量(吨) |
+	|------|------|------|-------------|
+	| 1 | dayX | YYYY-MM-DD | XXX |
+	| 2 | dayY | YYYY-MM-DD | XXX |
+	（只列出 predicted_weight > 0 的日期，按日期升序排列；索引列和日期列必须取自 User Prompt 末尾的【时间锚点】表）
 	--- 汇总表结束 ---
 
 	然后基于上表输出以下分析：
@@ -103,12 +109,13 @@ SYSTEM_PROMPT: str = """\
 
 	⚠️ 重要约束：
 	1.「预测发货汇总表」是唯一的权威数据源。第六部分的分析数字和 JSON items 都必须**严格从上表读取**，不允许出现表中没有的数据。
-	2. 日发货量按日期汇总：同一天可能有多品种/多车次，日发货量 = 该日所有记录的重量之和。
-	3. JSON items 与汇总表的对应规则：
+	2. 汇总表中的日期和索引必须与 User Prompt 末尾【时间锚点】表中的对应值完全一致，禁止自编不在锚点表中的日期。
+	3. 日发货量按日期汇总：同一天可能有多品种/多车次，日发货量 = 该日所有记录的重量之和。
+	4. JSON items 与汇总表的对应规则：
 	   - 汇总表中有 N 行 → items 中恰好有 N 条 predicted_weight > 0 的记录
 	   - 每条 items 的 target_date 和 predicted_weight 必须与汇总表完全一致
 	   - 汇总表中未列出的日期 → items 中 predicted_weight 必须为 0
-	4. 不允许分析文本与 JSON 数据不一致。例如分析说"70-130吨"但 JSON 中出现 140 吨即为错误。
+	5. 不允许分析文本与 JSON 数据不一致。例如分析说"70-130吨"但 JSON 中出现 140 吨即为错误。
 
 ==================================================
 【输出格式 · 必须严格遵守】
@@ -125,10 +132,11 @@ JSON 结构如下：
 
 其中：
 - analysis_report 必须包含完整的六部分分析报告（第一到第六部分），这是给用户阅读的分析文本
-- items 必须包含从 day0 到 day15 共 16 条记录
+- items 必须包含从 day0 到 day15 共 16 条记录，target_date 分别对应 User Prompt【时间锚点】表中的日期
 - predicted_weight 为发货吨数（不发货则为 0）
 - ship_probability 为发货概率（高/中/低）
 - confidence_level 为置信度（高/中/低）
+- 每条 target_date 必须与【时间锚点】中对应 day 索引的日期严格一致
 - main_factors 为该日预测的主要影响因素
 """
 
@@ -188,9 +196,23 @@ class DoubaoPromptBuilder:
 
     @staticmethod
     def _section_basic(req: DoubaoPredictionRequest, forecast_dates: list[date]) -> str:
+        from datetime import date as _date
+
+        today = _date.today()
+        # 计算上个月和本月（用于后续分析中的相对时间参照）
+        if today.month == 1:
+            last_month = _date(today.year - 1, 12, 1)
+        else:
+            last_month = _date(today.year, today.month - 1, 1)
+        this_month = _date(today.year, today.month, 1)
+
         lines = [
             "==================================================",
-            "【基础信息】",
+            "【基础信息 · 绝对时间锚点】",
+            f"当前日期（今天）：{today.isoformat()}（{_weekday_name(today)}）",
+            f"  → 后续分析中'上个月'指 {last_month.year}年{last_month.month}月",
+            f"  → 后续分析中'本月'指 {this_month.year}年{this_month.month}月",
+            f"  → '近3天'指 {today.isoformat()} 往前3天；'近7天'指往前7天",
             f"仓库名称：{req.warehouse}",
         ]
         if req.product_variety:
@@ -225,48 +247,44 @@ class DoubaoPromptBuilder:
         # 按日期排序
         filtered = sorted(filtered, key=lambda x: x.送货日期)
 
-        # 统计摘要
-        weights = [float(h.重量吨) for h in filtered]
-        delivery_dates = [h.送货日期 for h in filtered]
-        total_days = len(filtered)
-        total_weight = sum(weights)
-        avg_weight = statistics.mean(weights) if weights else 0
-        std_weight = statistics.stdev(weights) if len(weights) > 1 else 0
-        max_weight = max(weights) if weights else 0
-        min_weight = min(weights) if weights else 0
+        # ── 先按日期聚合，同日多条记录累加为日总发货量 ──
+        daily_aggregated: dict[date, float] = defaultdict(float)
+        daily_details: dict[date, list[str]] = defaultdict(list)  # 品类明细文字
+        for h in filtered:
+            daily_aggregated[h.送货日期] += float(h.重量吨)
+            daily_details[h.送货日期].append(f"{h.品类}{float(h.重量吨):.0f}t")
 
-        # 月度频率
-        if delivery_dates:
-            date_range_days = (delivery_dates[-1] - delivery_dates[0]).days + 1
+        distinct_dates = sorted(daily_aggregated.keys())
+        daily_weights = [daily_aggregated[d] for d in distinct_dates]
+        total_records = len(filtered)       # 原始明细条数
+        total_days = len(distinct_dates)    # 实际发货天数
+        total_weight = sum(daily_weights)   # 总发货量（与明细累加一致）
+        avg_weight = statistics.mean(daily_weights) if daily_weights else 0
+        std_weight = statistics.stdev(daily_weights) if len(daily_weights) > 1 else 0
+        max_weight = max(daily_weights) if daily_weights else 0
+        min_weight = min(daily_weights) if daily_weights else 0
+
+        # 月度频率（基于实际发货天数）
+        if distinct_dates:
+            date_range_days = (distinct_dates[-1] - distinct_dates[0]).days + 1
             months = max(date_range_days / 30, 1)
             monthly_freq = total_days / months
         else:
             monthly_freq = 0
 
-        # 发货间隔
+        # 发货间隔（基于去重后的日期序列）
         intervals = []
-        for i in range(1, len(delivery_dates)):
-            delta = (delivery_dates[i] - delivery_dates[i - 1]).days
+        for i in range(1, len(distinct_dates)):
+            delta = (distinct_dates[i] - distinct_dates[i - 1]).days
             intervals.append(delta)
         avg_interval = statistics.mean(intervals) if intervals else 0
 
-        # 星期分布
-        weekday_counter = Counter(d.weekday() for d in delivery_dates)
+        # 星期分布（基于去重日期）
+        weekday_counter = Counter(d.weekday() for d in distinct_dates)
         weekday_names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
         weekday_dist = " / ".join(
             f"{weekday_names[w]}:{c}次" for w, c in sorted(weekday_counter.items())
         )
-
-        lines.append(f"历史记录总数：{total_days} 条")
-        lines.append(f"整月总发货量：{total_weight:.2f} 吨")
-        lines.append(f"单次平均发货量：{avg_weight:.2f} 吨")
-        lines.append(f"历史最大发货量：{max_weight:.2f} 吨")
-        lines.append(f"历史最小发货量：{min_weight:.2f} 吨")
-        lines.append(f"发货量标准差：{std_weight:.2f}")
-        lines.append(f"月度发货频率：约 {monthly_freq:.1f} 次/月")
-        if avg_interval:
-            lines.append(f"平均发货间隔：{avg_interval:.1f} 天")
-        lines.append(f"星期分布：{weekday_dist}")
 
         # 月度频率判定
         if monthly_freq >= 8:
@@ -275,12 +293,33 @@ class DoubaoPromptBuilder:
             freq_label = "中频（3~7次/月）"
         else:
             freq_label = "低频（<3次/月）"
-        lines.append(f"月度频率判定：{freq_label}")
 
-        # 原始记录（最近 50 条）
+        # ── 输出：先输出按日汇总的统计，再输出原始明细 ──
+        lines.append(f"原始明细条数：{total_records} 条（同日多品种/多车次会拆分为多条明细）")
+        lines.append(f"实际发货天数：{total_days} 天（同一天的多条明细已合并为一个发货日）")
+        lines.append(f"历史总发货量：{total_weight:.2f} 吨")
+        lines.append(f"日均发货量（按发货日）：{avg_weight:.2f} 吨")
+        lines.append(f"日发货量最大值：{max_weight:.2f} 吨")
+        lines.append(f"日发货量最小值：{min_weight:.2f} 吨")
+        lines.append(f"日发货量标准差：{std_weight:.2f}")
+        lines.append(f"月度发货频率：约 {monthly_freq:.1f} 次/月")
+        lines.append(f"月度频率判定：{freq_label}")
+        if avg_interval:
+            lines.append(f"平均发货间隔：{avg_interval:.1f} 天（仅计不同日期）")
+        lines.append(f"星期分布：{weekday_dist}")
+
+        # 按日汇总表（最近 30 个发货日）
+        recent_dates = distinct_dates[-30:]
+        lines.append("")
+        lines.append("近期按日汇总（日期 | 日总发货量 | 当日品类明细）：")
+        for d in recent_dates:
+            detail_str = " + ".join(daily_details[d])
+            lines.append(f"  {d.isoformat()} | {daily_aggregated[d]:.0f}吨 | {detail_str}")
+
+        # 原始明细记录（最近 50 条，供参考）
         recent = filtered[-50:]
         lines.append("")
-        lines.append("近期送货记录（日期 | 品类 | 冶炼厂 | 天气 | 重量吨）：")
+        lines.append("原始明细记录（日期 | 品类 | 冶炼厂 | 天气 | 重量吨）【仅供参考，统计以上方按日汇总为准】：")
         for h in recent:
             weather = h.天气 or "未知"
             smelter = h.冶炼厂 or "未知"
@@ -288,7 +327,7 @@ class DoubaoPromptBuilder:
 
         # 截断提示
         if len(filtered) > self.MAX_HISTORY_RECORDS:
-            lines.append(f"\n（仅展示最近 {self.MAX_HISTORY_RECORDS} 条，共 {total_days} 条）")
+            lines.append(f"\n（仅展示最近 {self.MAX_HISTORY_RECORDS} 条明细，共 {total_records} 条）")
 
         lines.append("==================================================")
         return "\n".join(lines)
@@ -368,18 +407,33 @@ class DoubaoPromptBuilder:
 
     @staticmethod
     def _section_forecast_dates(forecast_dates: list[date]) -> str:
+        """构建时间锚点表 — 贯穿分析文本、汇总表和 JSON 的统一日期引用标准。"""
+        from datetime import date as _date
+
+        def _wk_type(d: _date) -> str:
+            return "周末" if d.weekday() >= 5 else "工作日"
+
         lines = [
             "==================================================",
-            "【预测目标日期】",
-            f"请预测以下 {len(forecast_dates)} 天的逐日发货吨数：",
+            "╔══════════════════════════════════════════════════╗",
+            "║  【时间锚点】本次预测全部目标日期（不可变）      ║",
+            "║  后续所有分析和输出中的日期必须严格取自本表，    ║",
+            "║  必须同时使用 day 索引 + 日期引用，禁止自编日期。 ║",
+            "╚══════════════════════════════════════════════════╝",
+            "",
+            "┌───────┬──────────────┬────────┬──────────┐",
+            "│ 索引  │ 日期         │ 星期   │ 类型     │",
+            "├───────┼──────────────┼────────┼──────────┤",
         ]
         for i, d in enumerate(forecast_dates):
-            lines.append(f"  day{i}: {d.isoformat()} ({_weekday_name(d)})")
+            wk = _weekday_name(d)
+            wt = _wk_type(d)
+            lines.append(f"│ day{i:<2} │ {d.isoformat()}   │ {wk}   │ {wt}    │")
+        lines.append("└───────┴──────────────┴────────┴──────────┘")
         lines.append("")
-        lines.append("请严格按照上述日期输出 items 数组，不要遗漏任何一天。")
+        lines.append(f"共 {len(forecast_dates)} 天。请在后续第六部分的汇总表和 JSON items 中严格使用上表中的索引和日期。")
         lines.append("==================================================")
         return "\n".join(lines)
-
 
 def _weekday_name(d: date) -> str:
     names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
