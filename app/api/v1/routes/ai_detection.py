@@ -722,6 +722,7 @@ class RuleCheckService:
                         image_shape=image_shape,
                         thresholds=engine.config.get("thresholds", {}),
                         business_rules=engine.config.get("business_rules", {}),
+                        image_bgr=img_cv2,
                     ),
                 )
             await RuleCheckService._persist_rule_check_history(
@@ -791,6 +792,7 @@ class RuleCheckService:
                     image_shape=image_shape,
                     thresholds=engine.config.get("thresholds", {}),
                     business_rules=engine.config.get("business_rules", {}),
+                    image_bgr=img_cv2,
                 ),
             )
         await RuleCheckService._persist_rule_check_history(
