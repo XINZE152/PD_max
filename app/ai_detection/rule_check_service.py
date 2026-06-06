@@ -195,11 +195,14 @@ def run_pixel_overlap_check(
     margin: int = 15,
     bbox_format: str = "xyxy",
     corroboration_signals: Optional[Dict[str, bool]] = None,
+    image_bgr: Optional[Any] = None,
 ) -> Dict[str, Any]:
-    """对指定 ROI 执行像素重叠规则检测。"""
+    """对指定 ROI 执行像素重叠规则检测。
+
+    若调用方已持有 ``image_bgr``（如从 OCR 步骤加载），传入可避免重复磁盘读取。"""
     thresh = thresholds or {}
 
-    img = safe_read_image(image_path)
+    img = image_bgr if image_bgr is not None else safe_read_image(image_path)
     if img is None:
         raise ValueError("无法读取图片或路径不存在")
 
@@ -376,8 +379,11 @@ def run_auto_high_risk_pixel_scans(
     margin: int,
     bbox_format: str,
     corroboration_signals: Dict[str, bool],
+    image_bgr: Optional[Any] = None,
 ) -> List[Dict[str, Any]]:
-    """对自动定位的高风险 ROI 逐个执行像素拼接检测。"""
+    """对自动定位的高风险 ROI 逐个执行像素拼接检测。
+
+    若调用方已持有 ``image_bgr``，传入可避免每个 ROI 重复从磁盘读取整张图片。"""
     results: List[Dict[str, Any]] = []
     for roi in rois:
         bbox = roi.get("bbox")
@@ -391,6 +397,7 @@ def run_auto_high_risk_pixel_scans(
             margin=margin,
             bbox_format=bbox_format,
             corroboration_signals=corroboration_signals,
+            image_bgr=image_bgr,
         )
         results.append(
             _annotate_pixel_overlap_scan(
@@ -414,8 +421,12 @@ def run_rule_checks(
     business_rules: Optional[Dict[str, Any]] = None,
     bbox_format: str = "xyxy",
     corroboration_signals: Optional[Dict[str, bool]] = None,
+    image_bgr: Optional[Any] = None,
 ) -> Dict[str, Any]:
-    """聚合规则检测：像素重叠（bbox 或 OCR 自动定位）+ 语义 + 时间戳。"""
+    """聚合规则检测：像素重叠（bbox 或 OCR 自动定位）+ 语义 + 时间戳。
+
+    若调用方已通过 ``run_full_image_ocr`` 加载图片，传入 ``image_bgr`` 可避免
+    像素重叠检测中重复从磁盘读取整张图片（自动扫描时为每 ROI 节省一次读取）。"""
     rules = business_rules or {}
     margin = int(rules.get("roi_expand_margin", 15))
     thresh = thresholds or {}
@@ -443,6 +454,7 @@ def run_rule_checks(
             margin=margin,
             bbox_format=bbox_format,
             corroboration_signals=merged_signals,
+            image_bgr=image_bgr,
         )
         pixel_overlap_source = "manual_bbox"
     elif (
@@ -467,6 +479,7 @@ def run_rule_checks(
                 margin=margin,
                 bbox_format=bbox_format,
                 corroboration_signals=merged_signals,
+                image_bgr=image_bgr,
             )
             if auto_scans:
                 pixel_overlap = merge_pixel_overlap_results(None, auto_scans)
@@ -487,6 +500,7 @@ def run_rule_checks(
                 margin=margin,
                 bbox_format=bbox_format,
                 corroboration_signals=merged_signals,
+                image_bgr=image_bgr,
             )
             pixel_overlap_source = "ocr_account_field"
             pixel_overlap["auto_detected"] = True
