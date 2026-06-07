@@ -178,13 +178,19 @@ class DoubaoPromptBuilder:
         req: DoubaoPredictionRequest,
         forecast_dates: list[date],
     ) -> str:
+        # 一次性计算时间参照（避免 _section_basic 和 _section_history 重复计算 date.today()）
+        time_refs = self._compute_time_refs()
+
+        # 一次性计算按日聚合数据（供多个子 section 共享，避免重复遍历历史数据）
+        daily_agg, daily_details, filtered, fell_back = self._compute_daily_aggregation(req)
+
         sections: list[str] = []
 
         # 1. 基础信息
-        sections.append(self._section_basic(req, forecast_dates))
+        sections.append(self._section_basic(req, forecast_dates, time_refs))
 
-        # 2. 历史发货数据
-        sections.append(self._section_history(req))
+        # 2. 历史发货数据（拆分为概览/月度统计/按日汇总表/原始明细四个子 section）
+        sections.append(self._section_history(req, filtered, daily_agg, daily_details, time_refs, fell_back))
 
         # 3. 冶炼厂价格
         sections.append(self._section_smelter_prices(req))
@@ -202,16 +208,10 @@ class DoubaoPromptBuilder:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _section_basic(req: DoubaoPredictionRequest, forecast_dates: list[date]) -> str:
-        from datetime import date as _date
-
-        today = _date.today()
-        # 计算上个月和本月（用于后续分析中的相对时间参照）
-        if today.month == 1:
-            last_month = _date(today.year - 1, 12, 1)
-        else:
-            last_month = _date(today.year, today.month - 1, 1)
-        this_month = _date(today.year, today.month, 1)
+    def _section_basic(req: DoubaoPredictionRequest, forecast_dates: list[date], time_refs: dict) -> str:
+        today = time_refs["today"]
+        last_month = time_refs["last_month_start"]
+        this_month = time_refs["this_month_start"]
 
         lines = [
             "==================================================",
@@ -242,47 +242,130 @@ class DoubaoPromptBuilder:
         lines.append("==================================================")
         return "\n".join(lines)
 
-    def _section_history(self, req: DoubaoPredictionRequest) -> str:
-        history = req.history
+    def _section_history(
+        self,
+        req: DoubaoPredictionRequest,
+        filtered: list[DoubaoHistoryItem],
+        daily_agg: dict[date, float],
+        daily_details: dict[date, list[str]],
+        time_refs: dict,
+        fell_back: bool,
+    ) -> str:
+        """编排历史数据输出：概览统计 → 月度拆分 → 按日汇总表 → 原始明细。"""
         lines = [
             "==================================================",
             "【仓库品类历史发货数据分析】",
         ]
 
-        if not history:
+        if not filtered:
             lines.append("（无历史送货数据）")
             lines.append("==================================================")
             return "\n".join(lines)
 
-        # 按品类筛选
+        if fell_back:
+            lines.append(f"注意：未找到品类「{req.product_variety}」的历史数据，使用全部品类数据。")
+
+        lines.append(f"原始明细条数：{len(filtered)} 条（同日多品种/多车次会拆分为多条明细）")
+        lines.append(f"实际发货天数：{len(daily_agg)} 天（同一天的多条明细已合并为一个发货日）")
+        lines.append(f"历史总发货量：{sum(daily_agg.values()):.2f} 吨")
+        lines.append("")
+
+        # 子 section 1：概览统计
+        lines.extend(self._section_history_overview(daily_agg))
+        lines.append("")
+
+        # 子 section 2：按月拆分统计
+        lines.extend(self._section_monthly_stats(daily_agg, daily_details, time_refs))
+        lines.append("")
+
+        # 子 section 3：近期按日汇总表
+        lines.extend(self._section_daily_aggregated_table(daily_agg, daily_details))
+        lines.append("")
+
+        # 子 section 4：原始明细记录
+        lines.extend(self._section_history_raw_records(filtered))
+
+        # 截断提示
+        if len(filtered) > self.MAX_HISTORY_RECORDS:
+            lines.append(f"\n（仅展示最近 {self.MAX_HISTORY_RECORDS} 条明细，共 {len(filtered)} 条）")
+
+        lines.append("==================================================")
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # 辅助：时间参照计算（一次性，避免多处重复调用 date.today()）
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _compute_time_refs() -> dict:
+        """计算当前日期、上个月起止、本月起始，一次性返回供所有 section 共用。"""
+        today = date.today()
+        if today.month == 1:
+            last_month_start = date(today.year - 1, 12, 1)
+            last_month_end = date(today.year - 1, 12, 31)
+        else:
+            last_month_start = date(today.year, today.month - 1, 1)
+            last_month_end = date(today.year, today.month, 1) - timedelta(days=1)
+        this_month_start = date(today.year, today.month, 1)
+        return {
+            "today": today,
+            "last_month_start": last_month_start,
+            "last_month_end": last_month_end,
+            "this_month_start": this_month_start,
+        }
+
+    # ------------------------------------------------------------------
+    # 辅助：按日聚合计算（一次性，避免多个 section 重复遍历历史数据）
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _compute_daily_aggregation(req: DoubaoPredictionRequest):
+        """按日聚合历史数据，返回 (daily_agg, daily_details, filtered, fell_back)。
+
+        - daily_agg: {date: 日总发货量}
+        - daily_details: {date: [品类明细字符串]}
+        - filtered: 筛选排序后的历史记录列表
+        - fell_back: 是否因品类无数据而回退到全部数据
+        """
+        history = req.history
+        fell_back = False
         filtered = history
+
         if req.product_variety:
             filtered = [h for h in history if h.品类 == req.product_variety]
             if not filtered:
-                filtered = history  # 没有匹配则用全部
-                lines.append(f"注意：未找到品类「{req.product_variety}」的历史数据，使用全部品类数据。")
+                filtered = history
+                fell_back = True
 
         # 按日期排序
         filtered = sorted(filtered, key=lambda x: x.送货日期)
 
-        # ── 先按日期聚合，同日多条记录累加为日总发货量 ──
-        daily_aggregated: dict[date, float] = defaultdict(float)
-        daily_details: dict[date, list[str]] = defaultdict(list)  # 品类明细文字
+        # 按日聚合
+        daily_agg: dict[date, float] = defaultdict(float)
+        daily_details: dict[date, list[str]] = defaultdict(list)
         for h in filtered:
-            daily_aggregated[h.送货日期] += float(h.重量吨)
+            daily_agg[h.送货日期] += float(h.重量吨)
             daily_details[h.送货日期].append(f"{h.品类}{float(h.重量吨):.0f}t")
 
-        distinct_dates = sorted(daily_aggregated.keys())
-        daily_weights = [daily_aggregated[d] for d in distinct_dates]
-        total_records = len(filtered)       # 原始明细条数
-        total_days = len(distinct_dates)    # 实际发货天数
-        total_weight = sum(daily_weights)   # 总发货量（与明细累加一致）
+        return daily_agg, daily_details, filtered, fell_back
+
+    # ------------------------------------------------------------------
+    # 子 section：历史概览统计
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _section_history_overview(daily_agg: dict[date, float]) -> list[str]:
+        """基于按日聚合数据计算并返回概览统计行。"""
+        distinct_dates = sorted(daily_agg.keys())
+        daily_weights = [daily_agg[d] for d in distinct_dates]
+        total_days = len(distinct_dates)
+
         avg_weight = statistics.mean(daily_weights) if daily_weights else 0
         std_weight = statistics.stdev(daily_weights) if len(daily_weights) > 1 else 0
         max_weight = max(daily_weights) if daily_weights else 0
         min_weight = min(daily_weights) if daily_weights else 0
 
-        # 月度频率（基于实际发货天数）
+        # 月度发货频率（基于实际发货天数）
         if distinct_dates:
             date_range_days = (distinct_dates[-1] - distinct_dates[0]).days + 1
             months = max(date_range_days / 30, 1)
@@ -297,7 +380,7 @@ class DoubaoPromptBuilder:
             intervals.append(delta)
         avg_interval = statistics.mean(intervals) if intervals else 0
 
-        # 星期分布（基于去重日期）
+        # 星期分布
         weekday_counter = Counter(d.weekday() for d in distinct_dates)
         weekday_names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
         weekday_dist = " / ".join(
@@ -312,86 +395,113 @@ class DoubaoPromptBuilder:
         else:
             freq_label = "低频（<3次/月）"
 
-        # ── 输出：先输出按日汇总的统计，再输出原始明细 ──
-        lines.append(f"原始明细条数：{total_records} 条（同日多品种/多车次会拆分为多条明细）")
-        lines.append(f"实际发货天数：{total_days} 天（同一天的多条明细已合并为一个发货日）")
-        lines.append(f"历史总发货量：{total_weight:.2f} 吨")
-        lines.append(f"日均发货量（按发货日）：{avg_weight:.2f} 吨")
-        lines.append(f"日发货量最大值：{max_weight:.2f} 吨")
-        lines.append(f"日发货量最小值：{min_weight:.2f} 吨")
-        lines.append(f"日发货量标准差：{std_weight:.2f}")
-        lines.append(f"月度发货频率：约 {monthly_freq:.1f} 次/月")
-        lines.append(f"月度频率判定：{freq_label}")
+        lines = [
+            f"日均发货量（按发货日）：{avg_weight:.2f} 吨",
+            f"日发货量最大值：{max_weight:.2f} 吨",
+            f"日发货量最小值：{min_weight:.2f} 吨",
+            f"日发货量标准差：{std_weight:.2f}",
+            f"月度发货频率：约 {monthly_freq:.1f} 次/月",
+            f"月度频率判定：{freq_label}",
+        ]
         if avg_interval:
             lines.append(f"平均发货间隔：{avg_interval:.1f} 天（仅计不同日期）")
         lines.append(f"星期分布：{weekday_dist}")
 
-        # ── 按月拆分统计（系统预计算，LLM 直接引用，禁止自行计算）──
-        from datetime import date as _date_section
-        _today = _date_section.today()
-        if _today.month == 1:
-            _last_month_start = _date_section(_today.year - 1, 12, 1)
-            _last_month_end = _date_section(_today.year - 1, 12, 31)
-        else:
-            _last_month_start = _date_section(_today.year, _today.month - 1, 1)
-            _last_month_end = _date_section(_today.year, _today.month, 1) - timedelta(days=1)
-        _this_month_start = _date_section(_today.year, _today.month, 1)
+        return lines
 
-        _last_month_dates = [d for d in distinct_dates if _last_month_start <= d <= _last_month_end]
-        _this_month_dates = [d for d in distinct_dates if d >= _this_month_start]
+    # ------------------------------------------------------------------
+    # 子 section：按月拆分统计
+    # ------------------------------------------------------------------
 
-        _last_month_days = len(_last_month_dates)
-        _last_month_weight = sum(daily_aggregated[d] for d in _last_month_dates)
-        _last_month_avg = (_last_month_weight / _last_month_days) if _last_month_days else 0
+    @staticmethod
+    def _section_monthly_stats(
+        daily_agg: dict[date, float],
+        daily_details: dict[date, list[str]],
+        time_refs: dict,
+    ) -> list[str]:
+        """基于按日聚合数据和时间参照，输出上个月/本月的发货统计。"""
+        last_month_start = time_refs["last_month_start"]
+        last_month_end = time_refs["last_month_end"]
+        this_month_start = time_refs["this_month_start"]
 
-        _this_month_days = len(_this_month_dates)
-        _this_month_weight = sum(daily_aggregated[d] for d in _this_month_dates)
+        distinct_dates = sorted(daily_agg.keys())
 
-        _this_month_varieties: set[str] = set()
-        for d in _this_month_dates:
+        last_month_dates = [d for d in distinct_dates if last_month_start <= d <= last_month_end]
+        this_month_dates = [d for d in distinct_dates if d >= this_month_start]
+
+        last_month_days = len(last_month_dates)
+        last_month_weight = sum(daily_agg[d] for d in last_month_dates)
+        last_month_avg = (last_month_weight / last_month_days) if last_month_days else 0
+
+        this_month_days = len(this_month_dates)
+        this_month_weight = sum(daily_agg[d] for d in this_month_dates)
+
+        # 本月已发货品类
+        this_month_varieties: set[str] = set()
+        for d in this_month_dates:
             for detail in daily_details[d]:
-                _this_month_varieties.add(detail.rstrip("0123456789.t"))
+                this_month_varieties.add(detail.rstrip("0123456789.t"))
 
-        lines.append("")
-        lines.append("──【按月拆分统计 · 系统预计算 · 直接引用】──")
-        lines.append(f"上个月（{_last_month_start.year}年{_last_month_start.month}月）：")
-        lines.append(f"  发货天数：{_last_month_days} 天")
-        lines.append(f"  总发货量：{_last_month_weight:.2f} 吨")
-        if _last_month_days > 0:
-            lines.append(f"  日均发货量：{_last_month_avg:.2f} 吨")
-            lines.append(f"  发货日期：{', '.join(d.isoformat() for d in _last_month_dates)}")
+        lines = [
+            "──【按月拆分统计 · 系统预计算 · 直接引用】──",
+            f"上个月（{last_month_start.year}年{last_month_start.month}月）：",
+            f"  发货天数：{last_month_days} 天",
+            f"  总发货量：{last_month_weight:.2f} 吨",
+        ]
+        if last_month_days > 0:
+            lines.append(f"  日均发货量：{last_month_avg:.2f} 吨")
+            lines.append(f"  发货日期：{', '.join(d.isoformat() for d in last_month_dates)}")
         else:
             lines.append(f"  上个月无发货记录")
-        lines.append(f"本月（{_this_month_start.year}年{_this_month_start.month}月，截至今天）：")
-        lines.append(f"  已发货天数：{_this_month_days} 天")
-        lines.append(f"  已发货总量：{_this_month_weight:.2f} 吨")
-        if _this_month_days > 0:
-            lines.append(f"  发货日期：{', '.join(d.isoformat() for d in _this_month_dates)}")
-        lines.append(f"  已发货品类：{', '.join(sorted(_this_month_varieties)) if _this_month_varieties else '无'}")
+        lines.append(f"本月（{this_month_start.year}年{this_month_start.month}月，截至今天）：")
+        lines.append(f"  已发货天数：{this_month_days} 天")
+        lines.append(f"  已发货总量：{this_month_weight:.2f} 吨")
+        if this_month_days > 0:
+            lines.append(f"  发货日期：{', '.join(d.isoformat() for d in this_month_dates)}")
+        lines.append(f"  已发货品类：{', '.join(sorted(this_month_varieties)) if this_month_varieties else '无'}")
 
-        # 按日汇总表（最近 30 个发货日）
+        return lines
+
+    # ------------------------------------------------------------------
+    # 子 section：近期按日汇总表
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _section_daily_aggregated_table(
+        daily_agg: dict[date, float],
+        daily_details: dict[date, list[str]],
+    ) -> list[str]:
+        """输出最近 30 个发货日的按日汇总表。"""
+        distinct_dates = sorted(daily_agg.keys())
         recent_dates = distinct_dates[-30:]
-        lines.append("")
-        lines.append("近期按日汇总（日期 | 日总发货量 | 当日品类明细）：")
+
+        lines = [
+            "近期按日汇总（日期 | 日总发货量 | 当日品类明细）：",
+        ]
         for d in recent_dates:
             detail_str = " + ".join(daily_details[d])
-            lines.append(f"  {d.isoformat()} | {daily_aggregated[d]:.0f}吨 | {detail_str}")
+            lines.append(f"  {d.isoformat()} | {daily_agg[d]:.0f}吨 | {detail_str}")
 
-        # 原始明细记录（最近 50 条，供参考）
+        return lines
+
+    # ------------------------------------------------------------------
+    # 子 section：原始明细记录（仅供参考）
+    # ------------------------------------------------------------------
+
+    def _section_history_raw_records(self, filtered: list[DoubaoHistoryItem]) -> list[str]:
+        """输出最近 50 条原始明细记录（仅供参考，统计以上方按日汇总为准）。"""
         recent = filtered[-50:]
-        lines.append("")
-        lines.append("原始明细记录（日期 | 品类 | 冶炼厂 | 天气 | 重量吨）【仅供参考，统计以上方按日汇总为准】：")
+
+        lines = [
+            "原始明细记录（日期 | 品类 | 冶炼厂 | 天气 | 重量吨）【仅供参考，统计以上方按日汇总为准】：",
+        ]
         for h in recent:
             weather = h.天气 or "未知"
             smelter = h.冶炼厂 or "未知"
             lines.append(f"  {h.送货日期.isoformat()} | {h.品类} | {smelter} | {weather} | {h.重量吨}")
 
-        # 截断提示
-        if len(filtered) > self.MAX_HISTORY_RECORDS:
-            lines.append(f"\n（仅展示最近 {self.MAX_HISTORY_RECORDS} 条明细，共 {total_records} 条）")
+        return lines
 
-        lines.append("==================================================")
-        return "\n".join(lines)
 
     def _section_smelter_prices(self, req: DoubaoPredictionRequest) -> str:
         prices = req.smelter_prices

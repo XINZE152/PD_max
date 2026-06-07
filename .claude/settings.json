@@ -2,7 +2,9 @@
   "permissions": {
     "allow": [
       "Bash(python -c ' *)",
-      "Bash(PYTHONPATH=\"e:/工作/PDmax/PD_max\" uv run python verify_p0p1.py)"
+      "Bash(PYTHONPATH=\"e:/工作/PDmax/PD_max\" uv run python verify_p0p1.py)",
+      "Bash(python scripts/refactor_prompt_builder.py)",
+      "Bash(python scripts/verify_refactor.py)"
     ]
   }
 }
