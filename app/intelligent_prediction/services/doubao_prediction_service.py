@@ -9,6 +9,7 @@ import asyncio
 import hashlib
 import json
 import time
+from collections import defaultdict
 from datetime import date, timedelta
 from decimal import Decimal
 from typing import Any, Optional
@@ -90,13 +91,17 @@ class DoubaoPredictionService:
         # 2. 构建 prompt
         system_prompt, user_prompt = self._prompt.build_messages(req, forecast_dates)
 
-        # 3. 调用 AI
+        # 3. 调用 AI（历史重量按日期聚合后传入，用于本地 fallback 的日发货量均值计算）
         t0 = time.monotonic()
+        daily_agg: dict[date, float] = defaultdict(float)
+        for h in (req.history or []):
+            daily_agg[h.送货日期] += float(h.重量吨)
+        history_weights = [Decimal(str(w)) for w in daily_agg.values()]
         parsed_json, provider, latency_ms, cost_usd, raw_excerpt, errors = (
             await self._ai.complete_with_fallback(
                 system_prompt,
                 user_prompt,
-                history_weights=None,
+                history_weights=history_weights,
                 horizon_days=HORIZON,
                 warehouse=req.warehouse,
                 product_variety=req.product_variety or "",
@@ -128,8 +133,8 @@ class DoubaoPredictionService:
             parse_error=parse_error or (raw_excerpt if errors else None),
         )
 
-        # 5. 写缓存
-        if req.use_cache:
+        # 5. 写缓存（本地规则推算的结果不缓存，避免污染）
+        if req.use_cache and provider != "local_rule":
             await self._cache.redis.set_json(
                 cache_key,
                 result.model_dump(mode="json"),

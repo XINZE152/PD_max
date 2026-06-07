@@ -201,26 +201,43 @@ class AIModelClient:
         variety: str,
         start_date: date,
     ) -> dict[str, Any]:
-        """本地规则后备。"""
-        _ = system, user, warehouse, variety
+        """本地规则后备 — 当所有远程 AI 供应商不可用时的兜底预测。"""
+        _ = system, user
+
+        # 计算历史日发货量均值（基于调用方传入的日聚合数据）
         if history_weights:
             avg = sum(float(w) for w in history_weights) / len(history_weights)
         else:
             avg = 0.0
+
         items: list[dict[str, Any]] = []
         for i in range(horizon_days):
+            # 简单加权：围绕均值做小幅波动，模拟周期性
             factor = 1.0 + 0.05 * ((i % 7) - 3) / 3.0
             w = max(0.0, round(avg * factor, 4))
             d = start_date + timedelta(days=i)
+            ship_prob = "低" if w < 10 else ("中" if w < 50 else "高")
             items.append(
                 {
                     "target_date": d.isoformat(),
                     "predicted_weight": w,
-                    "confidence": "low",
-                    "warnings": ["local_rule_fallback"],
+                    "ship_probability": ship_prob,
+                    "confidence_level": "低",
+                    "main_factors": "本地规则推算（所有AI供应商不可用，基于历史均值简单估算）",
                 }
             )
-        return {"items": items}
+
+        first_date = items[0]["target_date"] if items else "N/A"
+        last_date = items[-1]["target_date"] if items else "N/A"
+        report = (
+            f"【本地规则后备预测】\n"
+            f"所有远程 AI 供应商当前不可用，使用本地规则基于历史数据（{len(history_weights)} 条记录，"
+            f"日均发货 {avg:.1f} 吨）进行简单估算。\n"
+            f"预测范围：{first_date} 至 {last_date}，共 {horizon_days} 天。\n"
+            f"注意：本地规则仅做均值加权推算，不包含价格/节假日/天气等分析维度，"
+            f"预测结果仅供参考。建议稍后重试以获取完整 AI 分析。"
+        )
+        return {"analysis_report": report, "items": items}
 
     async def complete_with_fallback(
         self,
