@@ -56,16 +56,15 @@ SYSTEM_PROMPT: str = """\
 你必须按以下六个部分输出分析报告（纯文本），然后输出 JSON 格式的逐日预测。
 
 【第一部分：品类整月发货规律分析】
-必须分析：
-1. 上个月总发货天数
-2. 上个月总发货量:上个月发货量总和（吨）
-3. 月度发货频率（高频 / 中频 / 低频）
-4. 单次平均发货量
-5. 历史最大、最小发货量
-6. 平均发货间隔（但必须结合整月次数判断是否为常态周期）
-7. 周期判断（依据整月表现）
-8.本月已发货天数和总发货量（如果有），并分析是否与上个月规律一致。
-9.本月总发货品类
+以下统计数据已由系统预计算，**直接引用即可，禁止自行重新计算**。
+1. 上个月总发货天数 → 见 User Prompt【按月拆分统计】中的"上个月"
+2. 上个月总发货量 → 见 User Prompt【按月拆分统计】中的"上个月"
+3. 月度发货频率 → 见 User Prompt 整体统计中的"月度频率判定"
+4. 日发货量均值/最大/最小/标准差 → 见 User Prompt 整体统计
+5. 平均发货间隔 → 见 User Prompt 整体统计
+6. 周期判断 → 依据上述预计算统计数据和月度频率判定得出结论
+7. 本月已发货天数和总发货量 → 见 User Prompt【按月拆分统计】中的"本月"
+8. 对比上个月与本月规律是否一致，如有变化分析原因
 
 【第二部分：品类价格敏感度分析】
 根据历史发货与品类价格关系判断：
@@ -81,10 +80,18 @@ SYSTEM_PROMPT: str = """\
 等级：A 优势高 / B 优势中 / C 优势低 / D 劣势低 / E 劣势中 / F 劣势高
 
 【第四部分：节假日影响】
-分析预测期内是否有中国法定节假日，对发货的影响。
+⚠️ 以下数据中未提供法定节假日/调休信息，你**不得凭记忆臆测**哪天是节假日。
+分析范围仅限于时间锚点表中已标注的"周末/工作日"规律：
+- 周末（周六、周日）：部分仓库可能减少或不发货
+- 工作日（周一~周五）：正常发货
+若时间锚点表中未标注特殊节日，直接写明"预测期内未提供法定节假日数据，仅按周末/工作日规律分析"。
 
 【第五部分：天气物流因素】
-根据历史天气记录推断天气对发货的可能影响。
+⚠️ 预测期未来天气未知，你**不得编造**具体天气预报（如"预计6月8日有暴雨"）。
+仅能根据历史记录中同季节/同月份的经验规律做推断：
+- 历史记录中是否有因天气导致的发货中断或减量
+- 该仓库所在地的季节性天气特征（从历史数据中间接反映）
+若历史天气与发货无明显关联，直接写明"历史天气数据未显示对发货的显著影响，天气因素未纳入本次预测"，不得强行编造。
 
 【第六部分：综合预测结论】
 
@@ -221,6 +228,17 @@ class DoubaoPromptBuilder:
             lines.append(f"预测起始日：{forecast_dates[0].isoformat()}")
             lines.append(f"预测结束日：{forecast_dates[-1].isoformat()}")
             lines.append(f"预测天数：{len(forecast_dates)} 天")
+            # 跨月检测与说明
+            start_month = forecast_dates[0].month
+            end_month = forecast_dates[-1].month
+            if start_month != end_month:
+                split_day = None
+                for i, d in enumerate(forecast_dates):
+                    if d.month != start_month:
+                        split_day = i
+                        break
+                if split_day is not None:
+                    lines.append(f"⚠️ 预测期跨月：day0~day{split_day-1} 属于 {forecast_dates[0].year}年{start_month}月，day{split_day}~day{len(forecast_dates)-1} 属于 {forecast_dates[split_day].year}年{end_month}月。分析时请分段讨论。")
         lines.append("==================================================")
         return "\n".join(lines)
 
@@ -307,6 +325,49 @@ class DoubaoPromptBuilder:
         if avg_interval:
             lines.append(f"平均发货间隔：{avg_interval:.1f} 天（仅计不同日期）")
         lines.append(f"星期分布：{weekday_dist}")
+
+        # ── 按月拆分统计（系统预计算，LLM 直接引用，禁止自行计算）──
+        from datetime import date as _date_section
+        _today = _date_section.today()
+        if _today.month == 1:
+            _last_month_start = _date_section(_today.year - 1, 12, 1)
+            _last_month_end = _date_section(_today.year - 1, 12, 31)
+        else:
+            _last_month_start = _date_section(_today.year, _today.month - 1, 1)
+            _last_month_end = _date_section(_today.year, _today.month, 1) - timedelta(days=1)
+        _this_month_start = _date_section(_today.year, _today.month, 1)
+
+        _last_month_dates = [d for d in distinct_dates if _last_month_start <= d <= _last_month_end]
+        _this_month_dates = [d for d in distinct_dates if d >= _this_month_start]
+
+        _last_month_days = len(_last_month_dates)
+        _last_month_weight = sum(daily_aggregated[d] for d in _last_month_dates)
+        _last_month_avg = (_last_month_weight / _last_month_days) if _last_month_days else 0
+
+        _this_month_days = len(_this_month_dates)
+        _this_month_weight = sum(daily_aggregated[d] for d in _this_month_dates)
+
+        _this_month_varieties: set[str] = set()
+        for d in _this_month_dates:
+            for detail in daily_details[d]:
+                _this_month_varieties.add(detail.rstrip("0123456789.t"))
+
+        lines.append("")
+        lines.append("──【按月拆分统计 · 系统预计算 · 直接引用】──")
+        lines.append(f"上个月（{_last_month_start.year}年{_last_month_start.month}月）：")
+        lines.append(f"  发货天数：{_last_month_days} 天")
+        lines.append(f"  总发货量：{_last_month_weight:.2f} 吨")
+        if _last_month_days > 0:
+            lines.append(f"  日均发货量：{_last_month_avg:.2f} 吨")
+            lines.append(f"  发货日期：{', '.join(d.isoformat() for d in _last_month_dates)}")
+        else:
+            lines.append(f"  上个月无发货记录")
+        lines.append(f"本月（{_this_month_start.year}年{_this_month_start.month}月，截至今天）：")
+        lines.append(f"  已发货天数：{_this_month_days} 天")
+        lines.append(f"  已发货总量：{_this_month_weight:.2f} 吨")
+        if _this_month_days > 0:
+            lines.append(f"  发货日期：{', '.join(d.isoformat() for d in _this_month_dates)}")
+        lines.append(f"  已发货品类：{', '.join(sorted(_this_month_varieties)) if _this_month_varieties else '无'}")
 
         # 按日汇总表（最近 30 个发货日）
         recent_dates = distinct_dates[-30:]
@@ -422,13 +483,14 @@ class DoubaoPromptBuilder:
             "╚══════════════════════════════════════════════════╝",
             "",
             "┌───────┬──────────────┬────────┬──────────┐",
-            "│ 索引  │ 日期         │ 星期   │ 类型     │",
-            "├───────┼──────────────┼────────┼──────────┤",
+            "│ 索引  │ 日期         │ 星期   │ 类型   │ 所属月份 │",
+            "├───────┼──────────────┼────────┼────────┼──────────┤",
         ]
         for i, d in enumerate(forecast_dates):
             wk = _weekday_name(d)
             wt = _wk_type(d)
-            lines.append(f"│ day{i:<2} │ {d.isoformat()}   │ {wk}   │ {wt}    │")
+            month_label = f"{d.month}月"
+            lines.append(f"│ day{i:<2} │ {d.isoformat()}   │ {wk}   │ {wt}   │ {month_label}       │")
         lines.append("└───────┴──────────────┴────────┴──────────┘")
         lines.append("")
         lines.append(f"共 {len(forecast_dates)} 天。请在后续第六部分的汇总表和 JSON items 中严格使用上表中的索引和日期。")
