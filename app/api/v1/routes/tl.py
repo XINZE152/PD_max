@@ -62,6 +62,11 @@ TL比价模块路由
       GET /tl/ai_pricing_analysis — 实时聚合分析（公式：库房定价=对标城市定价+差额；毛利计算版=标定−运费−库房定价）
       GET/POST /tl/ai_pricing_snapshots、GET/PUT/DELETE /tl/ai_pricing_snapshots/{id} — 快照 CRUD
       PUT/DELETE /tl/ai_pricing_snapshots/{id}/items/{item_id} — 明细备注/删除
+      GET /tl/xunrongbao_price_premium/latest — 最新循融宝加价幅度
+      GET/POST/DELETE /tl/xunrongbao_price_premium — 循融宝加价历史查询/新增修改/删除
+      GET /tl/xunrongbao_price_audit — 循融宝加价操作审计日志
+      POST /tl/trigger_daily_ai_prediction — 触发今日AI预测后台任务
+      GET /tl/daily_ai_prediction_status/{batch_id} — 查询每日AI预测任务状态
 """
 import asyncio
 import io
@@ -71,9 +76,10 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
-from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import StreamingResponse
 
+from app.database import get_conn
 from app.models.tl import (
     AiPricingSnapshotCreate,
     AiPricingSnapshotItemRemarkBody,
@@ -118,6 +124,7 @@ from app.models.tl import (
     WarehouseInventoryDelete,
     WarehouseReceiptPriceCreate,
     WarehouseReceiptPriceUpdate,
+    XunrongbaoPricePremiumCreate,
 )
 from app.services.partner_warehouse_excel import (
     PartnerWarehouseExcelError,
@@ -2767,5 +2774,206 @@ def ai_pricing_snapshots_item_delete(
         return service.delete_ai_pricing_snapshot_item(snapshot_id, item_id)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== 循融宝价格基准维护 ====================
+
+
+@router.get(
+    "/xunrongbao_price_premium/latest",
+    summary="获取最新循融宝加价幅度",
+)
+def get_latest_xunrongbao_price_premium(
+    factory_id: Optional[int] = Query(None, description="冶炼厂ID；不传则返回金利"),
+    service: TLService = Depends(get_tl_service),
+):
+    """页面顶部展示最新循融宝加价金额与生效日期。"""
+    try:
+        fid = factory_id
+        if fid is None:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    for name in ("河南金利金铅集团有限公司", "金利"):
+                        cur.execute("SELECT id FROM dict_factories WHERE name = %s LIMIT 1", (name,))
+                        row = cur.fetchone()
+                        if row:
+                            fid = int(row[0])
+                            break
+                    if fid is None:
+                        raise HTTPException(status_code=404, detail="未找到金利冶炼厂")
+        result = service.list_xunrongbao_price_premiums(factory_id=fid)
+        return {"code": 200, "data": result}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get(
+    "/xunrongbao_price_premium",
+    summary="查询循融宝加价历史记录",
+)
+def list_xunrongbao_price_premiums(
+    factory_id: Optional[int] = Query(None, description="冶炼厂ID（可选）"),
+    date_from: Optional[str] = Query(None, description="生效日期起，YYYY-MM-DD"),
+    date_to: Optional[str] = Query(None, description="生效日期止，YYYY-MM-DD"),
+    service: TLService = Depends(get_tl_service),
+):
+    """按冶炼厂和日期范围查询循融宝加价历史记录。"""
+    try:
+        result = service.list_xunrongbao_price_premiums(
+            factory_id=factory_id,
+            date_from=date_from,
+            date_to=date_to,
+        )
+        return {"code": 200, "data": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post(
+    "/xunrongbao_price_premium",
+    summary="新增/修改循融宝加价配置",
+)
+def upsert_xunrongbao_price_premium(
+    body: XunrongbaoPricePremiumCreate,
+    request: Request,
+    service: TLService = Depends(get_tl_service),
+):
+    """同冶炼厂同日期则更新加价金额，否则新增记录。自动记录操作审计。"""
+    try:
+        client_ip = request.client.host if request.client else None
+        return service.upsert_xunrongbao_price_premium(
+            factory_id=body.冶炼厂id,
+            premium_per_ton=body.加价金额,
+            effective_date_str=body.生效日期,
+            remark=body.备注,
+            operator=body.操作人,
+            client_ip=client_ip,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete(
+    "/xunrongbao_price_premium/{record_id}",
+    summary="删除循融宝加价记录",
+)
+def delete_xunrongbao_price_premium(
+    record_id: int,
+    operator: Optional[str] = Query(None, description="操作人"),
+    client_ip: Optional[str] = Query(None, description="客户端IP（可选）"),
+    service: TLService = Depends(get_tl_service),
+):
+    """删除指定循融宝加价历史记录。自动记录操作审计。"""
+    try:
+        return service.delete_xunrongbao_price_premium(
+            record_id=record_id,
+            operator=operator,
+            client_ip=client_ip,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get(
+    "/xunrongbao_price_audit",
+    summary="查询循融宝加价操作审计日志",
+)
+def list_xunrongbao_price_audit(
+    factory_id: Optional[int] = Query(None, description="冶炼厂ID（可选）"),
+    page: int = Query(1, ge=1, description="页码"),
+    page_size: int = Query(20, ge=1, le=200, description="每页条数"),
+    service: TLService = Depends(get_tl_service),
+):
+    """分页查询循融宝加价操作审计日志（何人、何时、何事）。"""
+    try:
+        result = service.list_xunrongbao_price_audit(
+            factory_id=factory_id,
+            page=page,
+            page_size=page_size,
+        )
+        return {"code": 200, "data": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== AI预测每日刷新 ====================
+
+
+@router.post(
+    "/trigger_daily_ai_prediction",
+    summary="触发今日AI预测后台任务",
+)
+def trigger_daily_ai_prediction(
+    request: Request,
+    operator: Optional[str] = Query(None, description="操作人标识"),
+    service: TLService = Depends(get_tl_service),
+):
+    """点击按钮触发后台异步任务：垂直/战略库房全量预测，普通合作库房仅近30天有发货量。
+    任务在后台执行，前台无需等待；支持重复点击重跑覆盖缓存。
+    """
+    try:
+        client_ip = request.client.host if request.client else None
+        result = service.trigger_daily_ai_prediction(
+            operator=operator,
+            client_ip=client_ip,
+        )
+        return {"code": 200, "data": result}
+    except ImportError as e:
+        raise HTTPException(
+            status_code=503,
+            detail="异步预测服务不可用：Celery Worker 未启动",
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get(
+    "/daily_ai_prediction_status/{batch_id}",
+    summary="查询每日AI预测任务状态",
+)
+def get_daily_ai_prediction_status(
+    batch_id: str,
+    service: TLService = Depends(get_tl_service),
+):
+    """根据批次ID查询每日AI预测后台任务执行状态。"""
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, status, error_message, "
+                    "DATE_FORMAT(created_at, '%%Y-%%m-%%d %%H:%%i:%%s'), "
+                    "DATE_FORMAT(completed_at, '%%Y-%%m-%%d %%H:%%i:%%s') "
+                    "FROM pd_ip_prediction_batches WHERE id = %s",
+                    (batch_id,),
+                )
+                batch = cur.fetchone()
+                if not batch:
+                    raise HTTPException(status_code=404, detail="未找到该预测批次")
+                cur.execute(
+                    "SELECT COUNT(*) FROM pd_ip_prediction_results WHERE batch_id = %s",
+                    (batch_id,),
+                )
+                result_count = int(cur.fetchone()[0] or 0)
+                return {
+                    "code": 200,
+                    "data": {
+                        "batch_id": batch[0],
+                        "status": batch[1],
+                        "error_message": batch[2],
+                        "created_at": batch[3],
+                        "completed_at": batch[4],
+                        "result_count": result_count,
+                    },
+                }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

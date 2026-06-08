@@ -1992,6 +1992,64 @@ class TLService:
         row["is_active"] = bool(int(data.get("status", 1)))
         return row
 
+    @staticmethod
+    def _get_latest_xrb_premium_for_factory(factory_id: int, quote_date: Optional[str] = None) -> Optional[float]:
+        """从 pd_xunrongbao_price_premiums 读取不晚于业务日期的最新加价金额。
+
+        若未传 quote_date 则取当前日期。返回 None 表示该厂未配置加价。
+        """
+        ref_date = quote_date or date.today().isoformat()
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT premium_per_ton FROM pd_xunrongbao_price_premiums "
+                        "WHERE factory_id = %s AND effective_date <= %s "
+                        "ORDER BY effective_date DESC, id DESC LIMIT 1",
+                        (factory_id, ref_date),
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        return float(row[0])
+                    return None
+        except Exception:
+            logger.warning("读取循融宝加价失败 factory_id=%s", factory_id, exc_info=True)
+            return None
+
+    @staticmethod
+    def _get_xrb_premium_map(
+        factory_ids: Iterable[int],
+        quote_date: Optional[str] = None,
+    ) -> Dict[int, float]:
+        """批量查询多个冶炼厂的最新循融宝加价，返回 {factory_id: premium_per_ton}。
+
+        未配置加价的冶炼厂不出现在返回字典中。
+        """
+        ref_date = quote_date or date.today().isoformat()
+        result: Dict[int, float] = {}
+        if not factory_ids:
+            return result
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    placeholders = ",".join(["%s"] * len(factory_ids))
+                    # 每个厂取不晚于 ref_date 的最新生效日期；同日多条则取 id 最大
+                    cur.execute(
+                        f"SELECT t.factory_id, t.premium_per_ton "
+                        f"FROM pd_xunrongbao_price_premiums t "
+                        f"WHERE t.id = ("
+                        f"  SELECT t2.id FROM pd_xunrongbao_price_premiums t2 "
+                        f"  WHERE t2.factory_id = t.factory_id AND t2.effective_date <= %s "
+                        f"  ORDER BY t2.effective_date DESC, t2.id DESC LIMIT 1"
+                        f") AND t.factory_id IN ({placeholders})",
+                        (ref_date,) + tuple(factory_ids),
+                    )
+                    for row in cur.fetchall():
+                        result[int(row[0])] = float(row[1])
+        except Exception:
+            logger.warning("批量读取循融宝加价失败", exc_info=True)
+        return result
+
     def list_smelter_xunrongbao(
         self,
         include_inactive: bool = False,
@@ -2011,14 +2069,29 @@ class TLService:
                             "FROM dict_factories WHERE is_active = 1 ORDER BY id"
                         )
                     rows = cur.fetchall()
+            # 从 DB 读取各冶炼厂最新循融宝加价
+            factory_ids = [int(r[0]) for r in rows]
+            premium_map = self._get_xrb_premium_map(factory_ids)
+            # 取第一个启用了循融宝的冶炼厂的加价作为默认展示值，兜底为金利
+            first_xrb_premium: Optional[float] = None
+            for r in rows:
+                fid = int(r[0])
+                if int(r[2]) == 1 and fid in premium_map:
+                    first_xrb_premium = premium_map[fid]
+                    break
+            if first_xrb_premium is None:
+                first_xrb_premium = premium_map.get(
+                    next((int(r[0]) for r in rows if r[1] in ("河南金利金铅集团有限公司", "金利")), 0)
+                )
             return {
-                "加价元每吨": XUNRONGBAO_SHIPPING_PREMIUM_PER_TON,
+                "加价元每吨": first_xrb_premium or XUNRONGBAO_SHIPPING_PREMIUM_PER_TON,
                 "list": [
                     {
                         "冶炼厂id": int(r[0]),
                         "冶炼厂": r[1],
                         "循融宝发货": bool(int(r[2])),
                         "is_active": bool(int(r[3])),
+                        "加价元每吨": premium_map.get(int(r[0])),
                     }
                     for r in rows
                 ],
@@ -2882,16 +2955,23 @@ class TLService:
                     )
                     xrb_fids = {int(r[0]) for r in cur.fetchall() if int(r[1]) == 1}
                     # 循融宝厂：库内报价为「不含加价」；加价版单独建表，与 raw_price_map 并行取价
+                    # 从 DB 读取各冶炼厂最新加价金额（动态配置，不再使用固定常量）
+                    xrb_premium_map: Dict[int, float] = {}
+                    if xrb_fids:
+                        xrb_premium_map = self._get_xrb_premium_map(xrb_fids, quote_date_str)
+                    # 兜底：未配置的冶炼厂沿用默认值
+                    _default_premium = XUNRONGBAO_SHIPPING_PREMIUM_PER_TON
                     raw_price_map_xrb: Dict[tuple, Dict[str, Optional[float]]] = {}
                     for map_key, prow in raw_price_map.items():
                         fid_k, _cname = map_key
                         if fid_k not in xrb_fids:
                             continue
+                        premium = xrb_premium_map.get(fid_k, _default_premium)
                         merged_x = merge_factory_rates(tax_rate_map.get(fid_k, {}))
                         raw_price_map_xrb[map_key] = apply_per_ton_premium_to_quote_row(
                             dict(prow),
                             merged_x,
-                            XUNRONGBAO_SHIPPING_PREMIUM_PER_TON,
+                            premium,
                         )
 
             # 换算逻辑（纯 Python，连接已关闭）
@@ -3087,7 +3167,7 @@ class TLService:
                         **top,
                         "冶炼厂循融宝发货": 1 if xrb_on else 0,
                         "循融宝加价元每吨": (
-                            float(XUNRONGBAO_SHIPPING_PREMIUM_PER_TON)
+                            float(xrb_premium_map.get(fid, XUNRONGBAO_SHIPPING_PREMIUM_PER_TON))
                             if xrb_on
                             else None
                         ),
@@ -6427,15 +6507,21 @@ class TLService:
                     tuple(smelter_ids),
                 )
                 xrb_fids_ps = {int(r[0]) for r in cur.fetchall() if int(r[1]) == 1}
+                # 从 DB 读取各冶炼厂最新加价金额
+                xrb_ps_premium_map: Dict[int, float] = {}
+                if xrb_fids_ps:
+                    xrb_ps_premium_map = self._get_xrb_premium_map(xrb_fids_ps)
+                _default_ps_premium = XUNRONGBAO_SHIPPING_PREMIUM_PER_TON
                 for map_key in list(raw_price_map.keys()):
                     fid_k, _cn = map_key
                     if fid_k not in xrb_fids_ps:
                         continue
+                    premium = xrb_ps_premium_map.get(fid_k, _default_ps_premium)
                     merged = merge_factory_rates(tax_rate_map.get(fid_k, {}))
                     raw_price_map[map_key] = apply_per_ton_premium_to_quote_row(
                         raw_price_map[map_key],
                         merged,
-                        XUNRONGBAO_SHIPPING_PREMIUM_PER_TON,
+                        premium,
                     )
 
         # 价格反算逻辑
@@ -9758,6 +9844,307 @@ class TLService:
                 conn.rollback()
                 raise
         return {"code": 200, "msg": "已删除收货价格历史记录"}
+
+    # ==================== 循融宝价格基准维护 ====================
+
+    def list_xunrongbao_price_premiums(
+        self,
+        factory_id: Optional[int] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """查询循融宝加价历史记录，支持按冶炼厂和日期范围筛选。"""
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    conditions = []
+                    params: List[Any] = []
+                    if factory_id is not None:
+                        conditions.append("p.factory_id = %s")
+                        params.append(factory_id)
+                    if date_from and date_from.strip():
+                        conditions.append("p.effective_date >= %s")
+                        params.append(date_from.strip())
+                    if date_to and date_to.strip():
+                        conditions.append("p.effective_date <= %s")
+                        params.append(date_to.strip())
+                    where_clause = " AND ".join(conditions) if conditions else "1=1"
+                    cur.execute(
+                        f"SELECT p.id, p.factory_id, f.name, p.premium_per_ton, p.effective_date, "
+                        f"p.remark, p.created_by, p.updated_by, "
+                        f"DATE_FORMAT(p.created_at, '%%Y-%%m-%%d %%H:%%i:%%s'), "
+                        f"DATE_FORMAT(p.updated_at, '%%Y-%%m-%%d %%H:%%i:%%s') "
+                        f"FROM pd_xunrongbao_price_premiums p "
+                        f"LEFT JOIN dict_factories f ON p.factory_id = f.id "
+                        f"WHERE {where_clause} "
+                        f"ORDER BY p.effective_date DESC, p.id DESC",
+                        tuple(params),
+                    )
+                    rows = cur.fetchall()
+                    # 最新加价信息
+                    latest_premium: Optional[float] = None
+                    latest_date: Optional[str] = None
+                    if factory_id is not None:
+                        cur.execute(
+                            "SELECT premium_per_ton, effective_date FROM pd_xunrongbao_price_premiums "
+                            "WHERE factory_id = %s AND effective_date <= CURDATE() "
+                            "ORDER BY effective_date DESC, id DESC LIMIT 1",
+                            (factory_id,)
+                        )
+                        lr = cur.fetchone()
+                        if lr:
+                            latest_premium = float(lr[0])
+                            latest_date = str(lr[1])
+                    items = [
+                        {
+                            "记录id": int(r[0]),
+                            "冶炼厂id": int(r[1]),
+                            "冶炼厂名": r[2],
+                            "加价金额": float(r[3]),
+                            "生效日期": str(r[4]),
+                            "备注": r[5],
+                            "创建人": r[6],
+                            "修改人": r[7],
+                            "创建时间": r[8],
+                            "更新时间": r[9],
+                        }
+                        for r in rows
+                    ]
+                    return {
+                        "最新加价元每吨": latest_premium,
+                        "最新生效日期": latest_date,
+                        "记录列表": items,
+                        "总数": len(items),
+                    }
+        except Exception as e:
+            logger.error(f"查询循融宝加价记录失败: {e}")
+            raise
+
+    def upsert_xunrongbao_price_premium(
+        self,
+        factory_id: int,
+        premium_per_ton: float,
+        effective_date_str: str,
+        remark: Optional[str] = None,
+        operator: Optional[str] = None,
+        client_ip: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """新增/修改循融宝加价配置（同厂同日期则更新）。"""
+        try:
+            old_premium: Optional[float] = None
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    # 查询旧值用于审计
+                    cur.execute(
+                        "SELECT id, premium_per_ton FROM pd_xunrongbao_price_premiums "
+                        "WHERE factory_id = %s AND effective_date = %s LIMIT 1",
+                        (factory_id, effective_date_str),
+                    )
+                    existing = cur.fetchone()
+                    action = "update" if existing else "create"
+                    if existing:
+                        old_premium = float(existing[1])
+                        cur.execute(
+                            "UPDATE pd_xunrongbao_price_premiums "
+                            "SET premium_per_ton = %s, remark = %s, updated_by = %s "
+                            "WHERE id = %s",
+                            (premium_per_ton, remark, operator, int(existing[0])),
+                        )
+                        record_id = int(existing[0])
+                    else:
+                        cur.execute(
+                            "SELECT COALESCE(MAX(premium_per_ton), NULL) FROM pd_xunrongbao_price_premiums "
+                            "WHERE factory_id = %s AND effective_date <= %s "
+                            "ORDER BY effective_date DESC, id DESC LIMIT 1",
+                            (factory_id, effective_date_str),
+                        )
+                        prev = cur.fetchone()
+                        if prev and prev[0] is not None:
+                            old_premium = float(prev[0])
+                        cur.execute(
+                            "INSERT INTO pd_xunrongbao_price_premiums "
+                            "(factory_id, premium_per_ton, effective_date, remark, created_by, updated_by) "
+                            "VALUES (%s, %s, %s, %s, %s, %s)",
+                            (factory_id, premium_per_ton, effective_date_str, remark, operator, operator),
+                        )
+                        record_id = cur.lastrowid
+                    # 写入审计日志
+                    cur.execute(
+                        "INSERT INTO pd_xunrongbao_price_audit "
+                        "(factory_id, action, old_premium, new_premium, effective_date, remark, operator, client_ip) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                        (factory_id, action, old_premium, premium_per_ton, effective_date_str, remark, operator, client_ip),
+                    )
+                conn.commit()
+            return {"code": 200, "msg": f"已{'更新' if action == 'update' else '新增'}循融宝加价配置", "记录id": record_id}
+        except Exception as e:
+            logger.error(f"维护循融宝加价配置失败: {e}")
+            raise
+
+    def delete_xunrongbao_price_premium(
+        self,
+        record_id: int,
+        operator: Optional[str] = None,
+        client_ip: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """删除循融宝加价记录。"""
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT factory_id, premium_per_ton, effective_date, remark "
+                        "FROM pd_xunrongbao_price_premiums WHERE id = %s",
+                        (record_id,),
+                    )
+                    row = cur.fetchone()
+                    if not row:
+                        raise ValueError(f"循融宝加价记录不存在: id={record_id}")
+                    factory_id = int(row[0])
+                    old_premium = float(row[1])
+                    effective_date = str(row[2])
+                    remark = row[3]
+                    cur.execute("DELETE FROM pd_xunrongbao_price_premiums WHERE id = %s", (record_id,))
+                    cur.execute(
+                        "INSERT INTO pd_xunrongbao_price_audit "
+                        "(factory_id, action, old_premium, new_premium, effective_date, remark, operator, client_ip) "
+                        "VALUES (%s, 'delete', %s, NULL, %s, %s, %s, %s)",
+                        (factory_id, old_premium, effective_date, remark, operator, client_ip),
+                    )
+                conn.commit()
+            return {"code": 200, "msg": "已删除循融宝加价记录"}
+        except ValueError:
+            raise
+        except Exception as e:
+            logger.error(f"删除循融宝加价记录失败: {e}")
+            raise
+
+    def list_xunrongbao_price_audit(
+        self,
+        factory_id: Optional[int] = None,
+        page: int = 1,
+        page_size: int = 20,
+    ) -> Dict[str, Any]:
+        """分页查询循融宝加价操作审计日志。"""
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    conditions = []
+                    params: List[Any] = []
+                    if factory_id is not None:
+                        conditions.append("factory_id = %s")
+                        params.append(factory_id)
+                    where_clause = " AND ".join(conditions) if conditions else "1=1"
+                    cur.execute(
+                        f"SELECT COUNT(*) FROM pd_xunrongbao_price_audit WHERE {where_clause}",
+                        tuple(params),
+                    )
+                    total = int(cur.fetchone()[0] or 0)
+                    offset = (page - 1) * page_size
+                    cur.execute(
+                        f"SELECT id, factory_id, action, old_premium, new_premium, effective_date, "
+                        f"remark, operator, client_ip, "
+                        f"DATE_FORMAT(created_at, '%%Y-%%m-%%d %%H:%%i:%%s') "
+                        f"FROM pd_xunrongbao_price_audit "
+                        f"WHERE {where_clause} "
+                        f"ORDER BY created_at DESC "
+                        f"LIMIT %s OFFSET %s",
+                        tuple(params) + (page_size, offset),
+                    )
+                    rows = cur.fetchall()
+                    items = [
+                        {
+                            "记录id": int(r[0]),
+                            "冶炼厂id": int(r[1]),
+                            "操作类型": r[2],
+                            "变更前加价": float(r[3]) if r[3] is not None else None,
+                            "变更后加价": float(r[4]) if r[4] is not None else None,
+                            "生效日期": str(r[5]) if r[5] else None,
+                            "备注": r[6],
+                            "操作人": r[7],
+                            "客户端IP": r[8],
+                            "创建时间": r[9],
+                        }
+                        for r in rows
+                    ]
+                    return {"记录列表": items, "总数": total, "页码": page, "每页条数": page_size}
+        except Exception as e:
+            logger.error(f"查询循融宝操作审计失败: {e}")
+            raise
+
+    # ==================== AI预测每日刷新 ====================
+
+    def trigger_daily_ai_prediction(
+        self,
+        operator: Optional[str] = None,
+        client_ip: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """触发今日AI预测后台任务：垂直/战略库房全量，普通合作库房仅近30天有发货量。"""
+        try:
+            import uuid as _uuid
+            from datetime import datetime as _dt, timezone as _tz
+
+            batch_id = str(_uuid.uuid4())
+            batch_status = "pending"
+
+            # 先创建批次记录
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO pd_ip_prediction_batches (id, status, prediction_type, created_at) "
+                        "VALUES (%s, %s, %s, NOW())",
+                        (batch_id, batch_status, "manual"),
+                    )
+                    cur.execute(
+                        "INSERT INTO pd_ip_operation_audit "
+                        "(user_label, action, resource, detail, client_ip) "
+                        "VALUES (%s, %s, %s, %s, %s)",
+                        (
+                            operator,
+                            "trigger_daily_ai_prediction",
+                            "batch",
+                            json.dumps({"batch_id": batch_id, "prediction_type": "manual"}, ensure_ascii=False),
+                            client_ip,
+                        ),
+                    )
+                conn.commit()
+
+            # 入队 Celery 异步执行
+            try:
+                from app.intelligent_prediction.tasks.export_tasks import (
+                    run_daily_ai_prediction_task,
+                )
+                async_result = run_daily_ai_prediction_task.delay(batch_id)
+                task_id = async_result.id
+                with get_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "UPDATE pd_ip_prediction_batches SET celery_task_id = %s WHERE id = %s",
+                            (task_id, batch_id),
+                        )
+                    conn.commit()
+            except ImportError as e:
+                logger.exception("Celery 不可用，无法入队每日AI预测任务")
+                with get_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "UPDATE pd_ip_prediction_batches SET status = 'failed', "
+                            "error_message = %s, completed_at = NOW() WHERE id = %s",
+                            (f"Celery不可用: {e}"[:2000], batch_id),
+                        )
+                    conn.commit()
+                raise
+
+            return {
+                "task_id": task_id,
+                "batch_id": batch_id,
+                "status": "pending",
+                "message": "任务已提交，正在后台执行",
+            }
+        except ImportError:
+            raise
+        except Exception as e:
+            logger.error(f"触发每日AI预测失败: {e}")
+            raise
 
 
 # ==================== 单例工厂 ====================

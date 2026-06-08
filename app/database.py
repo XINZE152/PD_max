@@ -496,6 +496,42 @@ TABLE_STATEMENTS = [
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='智能预测-铅价/行情价历史';
     """,
     # 省份「对标城市」定价历史（同一省份多条记录时默认取 price_date 最新，同日取 id 最大）
+    # 循融宝加价历史配置（当前仅金利，按冶炼厂+生效日期维护，取不晚于业务日期的最新一条）
+    """
+    CREATE TABLE IF NOT EXISTS pd_xunrongbao_price_premiums (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '主键',
+        factory_id INT NOT NULL COMMENT '冶炼厂ID，目前仅金利',
+        premium_per_ton DECIMAL(18, 4) NOT NULL COMMENT '循融宝加价金额，元/吨',
+        effective_date DATE NOT NULL COMMENT '生效日期',
+        remark VARCHAR(255) DEFAULT NULL COMMENT '备注',
+        created_by VARCHAR(255) DEFAULT NULL COMMENT '创建人/操作人',
+        updated_by VARCHAR(255) DEFAULT NULL COMMENT '最近修改人',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+        CONSTRAINT fk_xrb_premium_factory FOREIGN KEY (factory_id) REFERENCES dict_factories (id)
+            ON UPDATE CASCADE ON DELETE RESTRICT,
+        UNIQUE KEY uk_xrb_factory_effective_date (factory_id, effective_date),
+        INDEX idx_xrb_factory_date (factory_id, effective_date)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='循融宝加价历史配置';
+    """,
+    # 循融宝加价操作审计日志
+    """
+    CREATE TABLE IF NOT EXISTS pd_xunrongbao_price_audit (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '主键',
+        factory_id INT NOT NULL COMMENT '冶炼厂ID',
+        action VARCHAR(32) NOT NULL COMMENT '操作类型：create/update/delete',
+        old_premium DECIMAL(18, 4) DEFAULT NULL COMMENT '变更前加价金额',
+        new_premium DECIMAL(18, 4) DEFAULT NULL COMMENT '变更后加价金额',
+        effective_date DATE DEFAULT NULL COMMENT '生效日期',
+        remark VARCHAR(255) DEFAULT NULL COMMENT '备注',
+        operator VARCHAR(255) DEFAULT NULL COMMENT '操作人',
+        client_ip VARCHAR(64) DEFAULT NULL COMMENT '客户端IP',
+        detail JSON DEFAULT NULL COMMENT '补充详情',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+        INDEX idx_xrb_audit_factory (factory_id),
+        INDEX idx_xrb_audit_created (created_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='循融宝加价操作审计';
+    """,
     """
     CREATE TABLE IF NOT EXISTS pd_province_benchmark_prices (
         id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '主键',
@@ -730,6 +766,93 @@ def ensure_pd_ip_lead_market_prices_table() -> None:
                 """
             )
         connection.commit()
+    finally:
+        connection.close()
+
+
+def ensure_pd_xunrongbao_price_premiums_table() -> None:
+    """已有库补建：循融宝加价历史配置表，并为金利初始化默认配置。"""
+    config_dict = get_mysql_config()
+    connection = pymysql.connect(**config_dict)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pd_xunrongbao_price_premiums (
+                    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '主键',
+                    factory_id INT NOT NULL COMMENT '冶炼厂ID，目前仅金利',
+                    premium_per_ton DECIMAL(18, 4) NOT NULL COMMENT '循融宝加价金额，元/吨',
+                    effective_date DATE NOT NULL COMMENT '生效日期',
+                    remark VARCHAR(255) DEFAULT NULL COMMENT '备注',
+                    created_by VARCHAR(255) DEFAULT NULL COMMENT '创建人/操作人',
+                    updated_by VARCHAR(255) DEFAULT NULL COMMENT '最近修改人',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+                    CONSTRAINT fk_xrb_premium_factory FOREIGN KEY (factory_id) REFERENCES dict_factories (id)
+                        ON UPDATE CASCADE ON DELETE RESTRICT,
+                    UNIQUE KEY uk_xrb_factory_effective_date (factory_id, effective_date),
+                    INDEX idx_xrb_factory_date (factory_id, effective_date)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='循融宝加价历史配置';
+                """
+            )
+            for name in ("河南金利金铅集团有限公司", "金利"):
+                cursor.execute("SELECT id FROM dict_factories WHERE name = %s LIMIT 1", (name,))
+                row = cursor.fetchone()
+                if not row:
+                    continue
+                factory_id = int(row[0])
+                cursor.execute(
+                    "SELECT COUNT(*) FROM pd_xunrongbao_price_premiums WHERE factory_id = %s",
+                    (factory_id,),
+                )
+                if int(cursor.fetchone()[0] or 0) == 0:
+                    cursor.execute(
+                        """
+                        INSERT INTO pd_xunrongbao_price_premiums
+                            (factory_id, premium_per_ton, effective_date, remark, created_by, updated_by)
+                        VALUES (%s, %s, CURDATE(), %s, %s, %s)
+                        """,
+                        (
+                            factory_id,
+                            config.XUNRONGBAO_SHIPPING_PREMIUM_PER_TON,
+                            "系统初始化：沿用原循融宝默认加价",
+                            "system",
+                            "system",
+                        ),
+                    )
+                break
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def ensure_pd_xunrongbao_price_audit_table() -> None:
+    """已有库补建：循融宝加价操作审计日志表。"""
+    config_dict = get_mysql_config()
+    connection = pymysql.connect(**config_dict)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pd_xunrongbao_price_audit (
+                    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '主键',
+                    factory_id INT NOT NULL COMMENT '冶炼厂ID',
+                    action VARCHAR(32) NOT NULL COMMENT '操作类型：create/update/delete',
+                    old_premium DECIMAL(18, 4) DEFAULT NULL COMMENT '变更前加价金额',
+                    new_premium DECIMAL(18, 4) DEFAULT NULL COMMENT '变更后加价金额',
+                    effective_date DATE DEFAULT NULL COMMENT '生效日期',
+                    remark VARCHAR(255) DEFAULT NULL COMMENT '备注',
+                    operator VARCHAR(255) DEFAULT NULL COMMENT '操作人',
+                    client_ip VARCHAR(64) DEFAULT NULL COMMENT '客户端IP',
+                    detail JSON DEFAULT NULL COMMENT '补充详情',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+                    INDEX idx_xrb_audit_factory (factory_id),
+                    INDEX idx_xrb_audit_created (created_at)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='循融宝加价操作审计';
+                """
+            )
+        connection.commit()
+        logger.info("已创建 pd_xunrongbao_price_audit 循融宝加价操作审计表")
     finally:
         connection.close()
 
@@ -1547,6 +1670,10 @@ def create_tables() -> None:
     except Exception:
         logger.exception("检查/添加 dict_factories.use_xunrongbao 失败")
     try:
+        ensure_pd_xunrongbao_price_audit_table()
+    except Exception:
+        logger.exception("检查/创建 pd_xunrongbao_price_audit 失败")
+    try:
         ensure_dict_warehouse_links_table()
     except Exception:
         logger.exception("检查/创建 dict_warehouse_links 库房关联边表失败")
@@ -1578,6 +1705,10 @@ def create_tables() -> None:
         ensure_warehouse_inventory_and_receipt_price_tables()
     except Exception:
         logger.exception("检查/创建库房库存快照与按品种收货价格表失败")
+    try:
+        ensure_pd_ip_prediction_batches_type_column()
+    except Exception:
+        logger.exception("检查/添加 pd_ip_prediction_batches.prediction_type 失败")
     try:
         ensure_pd_ip_prediction_results_v2_columns()
     except Exception:
@@ -1958,6 +2089,33 @@ def ensure_dict_warehouse_links_table() -> None:
             )
         connection.commit()
         logger.info("dict_warehouse_links 表已就绪")
+    finally:
+        connection.close()
+
+
+def ensure_pd_ip_prediction_batches_type_column() -> None:
+    """已有库升级：为 pd_ip_prediction_batches 新增 prediction_type 列区分手动/定时/导出。"""
+    config_dict = get_mysql_config()
+    connection = pymysql.connect(**config_dict)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT COUNT(*) FROM information_schema.columns "
+                "WHERE table_schema = DATABASE() AND table_name = 'pd_ip_prediction_batches' "
+                "AND column_name = 'prediction_type'"
+            )
+            if int(cursor.fetchone()[0] or 0) == 0:
+                cursor.execute(
+                    "ALTER TABLE pd_ip_prediction_batches "
+                    "ADD COLUMN prediction_type VARCHAR(32) DEFAULT 'manual' "
+                    "COMMENT '预测类型：manual/scheduled/export' "
+                    "AFTER status"
+                )
+                cursor.execute(
+                    "CREATE INDEX idx_ip_batch_pred_type ON pd_ip_prediction_batches (prediction_type)"
+                )
+                logger.info("已为 pd_ip_prediction_batches 添加 prediction_type 列")
+        connection.commit()
     finally:
         connection.close()
 

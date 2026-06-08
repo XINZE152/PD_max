@@ -1029,3 +1029,96 @@ class WarehouseReceiptPriceUpdate(BaseModel):
 
     价格: float = Field(..., description="库房回收单价，元/吨")
     价格日期: Optional[str] = Field(None, description="YYYY-MM-DD；缺省为当天")
+
+
+# ======================== 循融宝价格基准维护 ========================
+
+
+class XunrongbaoPricePremiumCreate(BaseModel):
+    """新增/修改循融宝加价配置"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    冶炼厂id: int = Field(..., ge=1, description="冶炼厂ID")
+    加价金额: float = Field(..., description="循融宝加价金额，元/吨")
+    生效日期: str = Field(..., description="生效日期，YYYY-MM-DD")
+    备注: Optional[str] = Field(None, description="备注")
+    操作人: Optional[str] = Field(None, description="操作人标识或姓名")
+
+
+class XunrongbaoPricePremiumItem(BaseModel):
+    """循融宝加价记录条目"""
+
+    记录id: int
+    冶炼厂id: int
+    冶炼厂名: Optional[str] = None
+    加价金额: float
+    生效日期: str
+    备注: Optional[str] = None
+    创建人: Optional[str] = None
+    修改人: Optional[str] = None
+    创建时间: Optional[str] = None
+    更新时间: Optional[str] = None
+
+
+class XunrongbaoPricePremiumListResponse(BaseModel):
+    """循融宝加价记录列表"""
+
+    最新加价元每吨: Optional[float] = None
+    最新生效日期: Optional[str] = None
+    记录列表: List[XunrongbaoPricePremiumItem] = Field(default_factory=list)
+    总数: int = 0
+
+
+class XunrongbaoPricePremiumDeleteRequest(BaseModel):
+    """删除循融宝加价记录"""
+
+    记录id: int = Field(..., ge=1)
+    操作人: Optional[str] = Field(None, description="操作人标识或姓名")
+
+
+class XunrongbaoPriceAuditItem(BaseModel):
+    """循融宝加价操作审计条目"""
+
+    记录id: int
+    冶炼厂id: int
+    操作类型: str
+    变更前加价: Optional[float] = None
+    变更后加价: Optional[float] = None
+    生效日期: Optional[str] = None
+    备注: Optional[str] = None
+    操作人: Optional[str] = None
+    客户端IP: Optional[str] = None
+    创建时间: Optional[str] = None
+
+
+class XunrongbaoPriceAuditListResponse(BaseModel):
+    """循融宝加价操作审计列表"""
+
+    记录列表: List[XunrongbaoPriceAuditItem] = Field(default_factory=list)
+    总数: int = 0
+    页码: int = 1
+    每页条数: int = 20
+
+
+# ======================== AI 预测每日刷新 ========================
+
+
+class DailyAiPredictionTriggerResponse(BaseModel):
+    """触发今日 AI 预测任务响应"""
+
+    task_id: str = Field(..., description="Celery 任务 ID")
+    batch_id: str = Field(..., description="预测批次 UUID")
+    status: str = Field(..., description="任务状态：pending/processing")
+    message: str = Field(default="任务已提交，正在后台执行", description="提示信息")
+
+
+class DailyAiPredictionStatusResponse(BaseModel):
+    """AI 预测任务状态"""
+
+    batch_id: str
+    status: str = Field(..., description="pending/processing/completed/failed")
+    result_count: int = 0
+    error_message: Optional[str] = None
+    created_at: Optional[str] = None
+    completed_at: Optional[str] = None
