@@ -9,6 +9,7 @@ import asyncio
 import hashlib
 import json
 import time
+from collections import defaultdict
 from datetime import date, timedelta
 from decimal import Decimal
 from typing import Any, Optional
@@ -79,24 +80,34 @@ class DoubaoPredictionService:
             len(req.history),
         )
 
-        # 1. 缓存检查
+        # 1. 缓存检查（校验脏数据：空报告 + 全零预测 = 旧版 local_rule 污染，拒绝命中）
         cache_key = self._build_cache_key(req)
         if req.use_cache:
             cached = await self._cache.redis.get_json(cache_key)
             if cached is not None:
-                logger.info("doubao_prediction_cache_hit warehouse=%s", req.warehouse)
-                return self._result_from_cache(cached)
+                if self._is_cache_data_valid(cached):
+                    logger.info("doubao_prediction_cache_hit warehouse=%s", req.warehouse)
+                    return self._result_from_cache(cached)
+                else:
+                    logger.warning(
+                        "doubao_prediction_cache_rejected warehouse=%s — stale/bad data, refetching",
+                        req.warehouse,
+                    )
 
         # 2. 构建 prompt
         system_prompt, user_prompt = self._prompt.build_messages(req, forecast_dates)
 
-        # 3. 调用 AI
+        # 3. 调用 AI（历史重量按日期聚合后传入，用于本地 fallback 的日发货量均值计算）
         t0 = time.monotonic()
+        daily_agg: dict[date, float] = defaultdict(float)
+        for h in (req.history or []):
+            daily_agg[h.送货日期] += float(h.重量吨)
+        history_weights = [Decimal(str(w)) for w in daily_agg.values()]
         parsed_json, provider, latency_ms, cost_usd, raw_excerpt, errors = (
             await self._ai.complete_with_fallback(
                 system_prompt,
                 user_prompt,
-                history_weights=None,
+                history_weights=history_weights,
                 horizon_days=HORIZON,
                 warehouse=req.warehouse,
                 product_variety=req.product_variety or "",
@@ -128,8 +139,8 @@ class DoubaoPredictionService:
             parse_error=parse_error or (raw_excerpt if errors else None),
         )
 
-        # 5. 写缓存
-        if req.use_cache:
+        # 5. 写缓存（本地规则推算的结果不缓存，避免污染）
+        if req.use_cache and provider != "local_rule":
             await self._cache.redis.set_json(
                 cache_key,
                 result.model_dump(mode="json"),
@@ -387,6 +398,31 @@ class DoubaoPredictionService:
     # 内部方法
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _is_cache_data_valid(cached: dict[str, Any]) -> bool:
+        """校验缓存数据是否合法，拒绝已知的脏数据模式。
+
+        拒绝条件（任一满足即拒绝）：
+        - analysis_report 为空 且 全部 predicted_weight == 0
+          （旧版 _local_rule_json 污染的典型特征）
+        - items 为空列表
+        """
+        items = cached.get("items")
+        if not isinstance(items, list) or len(items) == 0:
+            return False
+
+        report = cached.get("analysis_report")
+        report_empty = not report or not str(report).strip()
+        all_zero = all(
+            float(it.get("predicted_weight", 0) or 0) == 0.0
+            for it in items
+            if isinstance(it, dict)
+        )
+        if report_empty and all_zero:
+            return False
+
+        return True
+
     def _build_cache_key(self, req: DoubaoPredictionRequest) -> str:
         """基于请求数据指纹生成 Redis 缓存键。"""
         fingerprint_data = {
@@ -398,7 +434,7 @@ class DoubaoPredictionService:
             "smm_hash": self._hash_list(req.smm_prices),
         }
         fp = CacheManager.stats_fingerprint(fingerprint_data)
-        return f"pred:doubao:{fp}"
+        return f"pred:doubao:v2:{fp}"
 
     @staticmethod
     def _hash_list(items: list[Any]) -> str:
