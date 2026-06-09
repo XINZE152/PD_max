@@ -176,7 +176,8 @@ async def _run_daily_prediction_async(batch_id: str) -> None:
 
             # 从 pd_ip_delivery_records 查询每个仓+品种组合
             wh_list = list(target_warehouses)
-            from app.intelligent_prediction.models import DeliveryRecord
+            from app.intelligent_prediction.models import DeliveryRecord, PredictionResult as PredictionResultRow
+            from sqlalchemy import delete as sa_delete
             from app.intelligent_prediction.services.ai_client import get_ai_client
             from app.intelligent_prediction.services.cache_manager import get_cache_manager
             from app.intelligent_prediction.services.doubao_prediction_service import (
@@ -196,6 +197,8 @@ async def _run_daily_prediction_async(batch_id: str) -> None:
             smm_prices = await _load_smm_prices(session)
 
             items: list[DoubaoPredictionRequest] = []
+            # 构建 history_map：仓库名 → 历史记录列表，用于 persist 时推断 regional_manager/smelter
+            history_map: dict[str, list] = {}
             for wh_name in wh_list:
                 stmt = (
                     sa_select(DeliveryRecord.product_variety)
@@ -217,6 +220,8 @@ async def _run_daily_prediction_async(batch_id: str) -> None:
                             use_cache=True,
                         )
                     )
+                    if wh_name not in history_map:
+                        history_map[wh_name] = history
                 if not varieties:
                     logger.info("daily prediction: no varieties for %s, skip", wh_name)
 
@@ -232,7 +237,31 @@ async def _run_daily_prediction_async(batch_id: str) -> None:
                 get_ai_client(), get_cache_manager(), DoubaoPromptBuilder()
             )
             results = await svc.predict_batch(body)
-            await svc.persist_sync_results(session, results, batch_id=batch_id)
+
+            # 覆盖机制：先删除同类型旧批次结果，再写入新结果，保证缓存数据每日覆盖
+            old_batch_stmt = sa_select(PredictionBatch.id).where(
+                PredictionBatch.prediction_type == "manual",
+                PredictionBatch.status == "completed",
+                PredictionBatch.id != batch_id,
+            )
+            old_res = await session.execute(old_batch_stmt)
+            old_batch_ids = [r[0] for r in old_res.all()]
+            if old_batch_ids:
+                del_stmt = sa_delete(PredictionResultRow).where(
+                    PredictionResultRow.batch_id.in_(old_batch_ids)
+                )
+                del_result = await session.execute(del_stmt)
+                logger.info(
+                    "daily prediction: cleaned %s old results from %s previous batches",
+                    del_result.rowcount, len(old_batch_ids),
+                )
+                # 清理旧批次记录本身
+                batch_del_stmt = sa_delete(PredictionBatch).where(
+                    PredictionBatch.id.in_(old_batch_ids)
+                )
+                await session.execute(batch_del_stmt)
+
+            await svc.persist_sync_results(session, results, batch_id=batch_id, history_map=history_map)
 
             batch.status = "completed"
             batch.completed_at = datetime.now(timezone.utc)

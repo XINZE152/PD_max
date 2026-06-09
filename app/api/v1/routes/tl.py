@@ -67,6 +67,7 @@ TL比价模块路由
       GET /tl/xunrongbao_price_audit — 循融宝加价操作审计日志
       POST /tl/trigger_daily_ai_prediction — 触发今日AI预测后台任务
       GET /tl/daily_ai_prediction_status/{batch_id} — 查询每日AI预测任务状态
+      GET /tl/daily_ai_prediction_results — 查询最新每日AI预测结果缓存（支持按仓库/品种筛选）
 """
 import asyncio
 import io
@@ -2971,6 +2972,84 @@ def get_daily_ai_prediction_status(
                         "created_at": batch[3],
                         "completed_at": batch[4],
                         "result_count": result_count,
+                    },
+                }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get(
+    "/daily_ai_prediction_results",
+    summary="查询最新每日AI预测结果",
+)
+def get_daily_ai_prediction_results(
+    warehouse: Optional[str] = Query(None, description="仓库名称筛选（可选）"),
+    product_variety: Optional[str] = Query(None, description="品种筛选（可选）"),
+    service: TLService = Depends(get_tl_service),
+):
+    """读取最新完成的每日AI预测批次结果，供前端页面直接展示缓存数据。
+    支持按仓库和品种筛选；不传参数则返回全部最新预测结果。
+    """
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, DATE_FORMAT(created_at, '%%Y-%%m-%%d %%H:%%i:%%s'), "
+                    "DATE_FORMAT(completed_at, '%%Y-%%m-%%d %%H:%%i:%%s') "
+                    "FROM pd_ip_prediction_batches "
+                    "WHERE prediction_type = 'manual' AND status = 'completed' "
+                    "ORDER BY completed_at DESC LIMIT 1"
+                )
+                latest = cur.fetchone()
+                if not latest:
+                    return {"code": 200, "data": {"batch_id": None, "结果列表": [], "总数": 0}}
+                batch_id, created_at, completed_at = latest[0], latest[1], latest[2]
+
+                conditions = ["r.batch_id = %s"]
+                params: List[Any] = [batch_id]
+                if warehouse:
+                    conditions.append("r.warehouse = %s")
+                    params.append(warehouse)
+                if product_variety:
+                    conditions.append("r.product_variety = %s")
+                    params.append(product_variety)
+                where_clause = " AND ".join(conditions)
+
+                cur.execute(
+                    f"SELECT r.warehouse, r.product_variety, r.smelter, r.regional_manager, "
+                    f"r.target_date, r.predicted_weight, r.ship_probability, r.confidence_level, "
+                    f"r.main_factors, r.comprehensive_analysis "
+                    f"FROM pd_ip_prediction_results r "
+                    f"WHERE {where_clause} "
+                    f"ORDER BY r.warehouse, r.product_variety, r.target_date",
+                    tuple(params),
+                )
+                rows = cur.fetchall()
+                items = [
+                    {
+                        "仓库": r[0],
+                        "品种": r[1],
+                        "冶炼厂": r[2],
+                        "大区经理": r[3],
+                        "预测日期": str(r[4]) if r[4] else None,
+                        "预测发货吨数": float(r[5]) if r[5] is not None else None,
+                        "发货概率": r[6],
+                        "置信度": r[7],
+                        "主要因素": r[8],
+                        "分析报告": (r[9][:500] if r[9] else None),
+                    }
+                    for r in rows
+                ]
+                return {
+                    "code": 200,
+                    "data": {
+                        "batch_id": batch_id,
+                        "创建时间": created_at,
+                        "完成时间": completed_at,
+                        "结果列表": items,
+                        "总数": len(items),
                     },
                 }
     except HTTPException:
