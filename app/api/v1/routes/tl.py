@@ -81,6 +81,7 @@ from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Query, 
 from fastapi.responses import StreamingResponse
 
 from app.database import get_conn
+from app.request_context import get_request_operator_label
 from app.models.tl import (
     AiPricingSnapshotCreate,
     AiPricingSnapshotItemRemarkBody,
@@ -2846,12 +2847,13 @@ def upsert_xunrongbao_price_premium(
     """同冶炼厂同日期则更新加价金额，否则新增记录。自动记录操作审计。"""
     try:
         client_ip = request.client.host if request.client else None
+        operator = get_request_operator_label()
         return service.upsert_xunrongbao_price_premium(
             factory_id=body.冶炼厂id,
             premium_per_ton=body.加价金额,
             effective_date_str=body.生效日期,
             remark=body.备注,
-            operator=body.操作人,
+            operator=operator,
             client_ip=client_ip,
         )
     except ValueError as e:
@@ -2867,12 +2869,12 @@ def upsert_xunrongbao_price_premium(
 def delete_xunrongbao_price_premium(
     record_id: int,
     request: Request,
-    operator: Optional[str] = Query(None, description="操作人"),
     service: TLService = Depends(get_tl_service),
 ):
     """删除指定循融宝加价历史记录。自动记录操作审计。"""
     try:
         client_ip = request.client.host if request.client else None
+        operator = get_request_operator_label()
         return service.delete_xunrongbao_price_premium(
             record_id=record_id,
             operator=operator,
