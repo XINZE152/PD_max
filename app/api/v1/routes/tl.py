@@ -2866,12 +2866,13 @@ def upsert_xunrongbao_price_premium(
 )
 def delete_xunrongbao_price_premium(
     record_id: int,
+    request: Request,
     operator: Optional[str] = Query(None, description="操作人"),
-    client_ip: Optional[str] = Query(None, description="客户端IP（可选）"),
     service: TLService = Depends(get_tl_service),
 ):
     """删除指定循融宝加价历史记录。自动记录操作审计。"""
     try:
+        client_ip = request.client.host if request.client else None
         return service.delete_xunrongbao_price_premium(
             record_id=record_id,
             operator=operator,

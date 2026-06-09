@@ -9929,54 +9929,48 @@ class TLService:
         operator: Optional[str] = None,
         client_ip: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """新增/修改循融宝加价配置（同厂同日期则更新）。"""
+        """新增循融宝加价配置（每次均 INSERT，保留完整变更历史）。"""
         try:
+            # 组装操作人：admin (127.0.0.1) 格式
+            op_parts: list[str] = []
+            if operator and operator.strip():
+                op_parts.append(operator.strip())
+            if client_ip and client_ip.strip():
+                op_parts.append(f"({client_ip.strip()})")
+            op_label = " ".join(op_parts) if op_parts else None
+
             old_premium: Optional[float] = None
             with get_conn() as conn:
                 with conn.cursor() as cur:
-                    # 查询旧值用于审计
+                    # 查询该厂不晚于本次生效日期的最近加价值，用于审计
                     cur.execute(
-                        "SELECT id, premium_per_ton FROM pd_xunrongbao_price_premiums "
-                        "WHERE factory_id = %s AND effective_date = %s LIMIT 1",
+                        "SELECT premium_per_ton FROM pd_xunrongbao_price_premiums "
+                        "WHERE factory_id = %s AND effective_date <= %s "
+                        "ORDER BY effective_date DESC, id DESC LIMIT 1",
                         (factory_id, effective_date_str),
                     )
-                    existing = cur.fetchone()
-                    action = "update" if existing else "create"
-                    if existing:
-                        old_premium = float(existing[1])
-                        cur.execute(
-                            "UPDATE pd_xunrongbao_price_premiums "
-                            "SET premium_per_ton = %s, remark = %s, updated_by = %s "
-                            "WHERE id = %s",
-                            (premium_per_ton, remark, operator, int(existing[0])),
-                        )
-                        record_id = int(existing[0])
-                    else:
-                        cur.execute(
-                            "SELECT COALESCE(MAX(premium_per_ton), NULL) FROM pd_xunrongbao_price_premiums "
-                            "WHERE factory_id = %s AND effective_date <= %s "
-                            "ORDER BY effective_date DESC, id DESC LIMIT 1",
-                            (factory_id, effective_date_str),
-                        )
-                        prev = cur.fetchone()
-                        if prev and prev[0] is not None:
-                            old_premium = float(prev[0])
-                        cur.execute(
-                            "INSERT INTO pd_xunrongbao_price_premiums "
-                            "(factory_id, premium_per_ton, effective_date, remark, created_by, updated_by) "
-                            "VALUES (%s, %s, %s, %s, %s, %s)",
-                            (factory_id, premium_per_ton, effective_date_str, remark, operator, operator),
-                        )
-                        record_id = cur.lastrowid
+                    prev = cur.fetchone()
+                    if prev and prev[0] is not None:
+                        old_premium = float(prev[0])
+
+                    # 始终新增一条记录（不再 UPDATE 覆盖）
+                    cur.execute(
+                        "INSERT INTO pd_xunrongbao_price_premiums "
+                        "(factory_id, premium_per_ton, effective_date, remark, created_by, updated_by) "
+                        "VALUES (%s, %s, %s, %s, %s, %s)",
+                        (factory_id, premium_per_ton, effective_date_str, remark, op_label, op_label),
+                    )
+                    record_id = cur.lastrowid
+
                     # 写入审计日志
                     cur.execute(
                         "INSERT INTO pd_xunrongbao_price_audit "
-                        "(factory_id, action, old_premium, new_premium, effective_date, remark, operator, client_ip) "
-                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
-                        (factory_id, action, old_premium, premium_per_ton, effective_date_str, remark, operator, client_ip),
+                        "(factory_id, action, old_premium, new_premium, effective_date, remark, operator) "
+                        "VALUES (%s, 'create', %s, %s, %s, %s, %s)",
+                        (factory_id, old_premium, premium_per_ton, effective_date_str, remark, op_label),
                     )
                 conn.commit()
-            return {"code": 200, "msg": f"已{'更新' if action == 'update' else '新增'}循融宝加价配置", "记录id": record_id}
+            return {"code": 200, "msg": "已新增循融宝加价配置", "记录id": record_id}
         except Exception as e:
             logger.error(f"维护循融宝加价配置失败: {e}")
             raise
@@ -9989,6 +9983,13 @@ class TLService:
     ) -> Dict[str, Any]:
         """删除循融宝加价记录。"""
         try:
+            op_parts: list[str] = []
+            if operator and operator.strip():
+                op_parts.append(operator.strip())
+            if client_ip and client_ip.strip():
+                op_parts.append(f"({client_ip.strip()})")
+            op_label = " ".join(op_parts) if op_parts else None
+
             with get_conn() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
@@ -10006,9 +10007,9 @@ class TLService:
                     cur.execute("DELETE FROM pd_xunrongbao_price_premiums WHERE id = %s", (record_id,))
                     cur.execute(
                         "INSERT INTO pd_xunrongbao_price_audit "
-                        "(factory_id, action, old_premium, new_premium, effective_date, remark, operator, client_ip) "
-                        "VALUES (%s, 'delete', %s, NULL, %s, %s, %s, %s)",
-                        (factory_id, old_premium, effective_date, remark, operator, client_ip),
+                        "(factory_id, action, old_premium, new_premium, effective_date, remark, operator) "
+                        "VALUES (%s, 'delete', %s, NULL, %s, %s, %s)",
+                        (factory_id, old_premium, effective_date, remark, op_label),
                     )
                 conn.commit()
             return {"code": 200, "msg": "已删除循融宝加价记录"}

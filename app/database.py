@@ -510,7 +510,6 @@ TABLE_STATEMENTS = [
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
         CONSTRAINT fk_xrb_premium_factory FOREIGN KEY (factory_id) REFERENCES dict_factories (id)
             ON UPDATE CASCADE ON DELETE RESTRICT,
-        UNIQUE KEY uk_xrb_factory_effective_date (factory_id, effective_date),
         INDEX idx_xrb_factory_date (factory_id, effective_date)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='循融宝加价历史配置';
     """,
@@ -790,11 +789,22 @@ def ensure_pd_xunrongbao_price_premiums_table() -> None:
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
                     CONSTRAINT fk_xrb_premium_factory FOREIGN KEY (factory_id) REFERENCES dict_factories (id)
                         ON UPDATE CASCADE ON DELETE RESTRICT,
-                    UNIQUE KEY uk_xrb_factory_effective_date (factory_id, effective_date),
                     INDEX idx_xrb_factory_date (factory_id, effective_date)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='循融宝加价历史配置';
                 """
             )
+            # 已有库迁移：移除旧的 UNIQUE 约束，允许同日多次修改保留完整历史
+            cursor.execute(
+                "SELECT COUNT(*) FROM information_schema.table_constraints "
+                "WHERE table_schema = DATABASE() AND table_name = 'pd_xunrongbao_price_premiums' "
+                "AND constraint_name = 'uk_xrb_factory_effective_date' AND constraint_type = 'UNIQUE'"
+            )
+            if int(cursor.fetchone()[0] or 0) > 0:
+                cursor.execute(
+                    "ALTER TABLE pd_xunrongbao_price_premiums "
+                    "DROP INDEX uk_xrb_factory_effective_date"
+                )
+                logger.info("已移除 pd_xunrongbao_price_premiums 的 uk_xrb_factory_effective_date UNIQUE 约束")
             for name in ("河南金利金铅集团有限公司", "金利"):
                 cursor.execute("SELECT id FROM dict_factories WHERE name = %s LIMIT 1", (name,))
                 row = cursor.fetchone()
