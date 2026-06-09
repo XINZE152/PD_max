@@ -1670,6 +1670,10 @@ def create_tables() -> None:
     except Exception:
         logger.exception("检查/添加 dict_factories.use_xunrongbao 失败")
     try:
+        ensure_pd_xunrongbao_price_premiums_table()
+    except Exception:
+        logger.exception("检查/补建 pd_xunrongbao_price_premiums 失败")
+    try:
         ensure_pd_xunrongbao_price_audit_table()
     except Exception:
         logger.exception("检查/创建 pd_xunrongbao_price_audit 失败")
