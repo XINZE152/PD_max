@@ -10084,6 +10084,26 @@ class TLService:
             import uuid as _uuid
             from datetime import datetime as _dt, timezone as _tz
 
+            batch_status = "pending"
+
+            # 防重复点击：已有每日预测任务运行中时直接返回原批次。
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT id, celery_task_id, status FROM pd_ip_prediction_batches "
+                        "WHERE prediction_type = %s AND status IN ('pending', 'processing') "
+                        "ORDER BY created_at DESC LIMIT 1",
+                        ("manual",),
+                    )
+                    running = cur.fetchone()
+                    if running:
+                        return {
+                            "task_id": running[1],
+                            "batch_id": running[0],
+                            "status": running[2],
+                            "message": "正在预测，请勿重复提交",
+                        }
+
             batch_id = str(_uuid.uuid4())
             batch_status = "pending"
 
