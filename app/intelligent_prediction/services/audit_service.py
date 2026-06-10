@@ -64,6 +64,26 @@ async def write_audit_standalone(
         logger.warning("write_audit_standalone failed", exc_info=True)
 
 
+async def write_background_audit(
+    session: AsyncSession,
+    action: str,
+    *,
+    resource: Optional[str] = None,
+    detail: Optional[dict[str, Any]] = None,
+) -> None:
+    """后台任务审计：无 HTTP 请求上下文，写入当前 session 事务中。"""
+    session.add(
+        OperationAudit(
+            user_id=None,
+            user_label="system(ai_daily_prediction)",
+            action=action,
+            resource=resource,
+            detail=detail,
+            client_ip=None,
+        )
+    )
+
+
 async def list_audit_events(
     session: AsyncSession,
     *,

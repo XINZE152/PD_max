@@ -94,6 +94,7 @@ async def prd_forecast_chart(
     product_varieties: list[str] = Query(default=[], description="品种（多值）"),
     smelter: str | None = Query(None, description="冶炼厂（单值）"),
     smelters: list[str] = Query(default=[], description="冶炼厂（多值）"),
+    use_cache: bool = Query(True, description="是否优先使用AI预测缓存，默认开启"),
     session: AsyncSession = Depends(get_prediction_db_session),
     svc: PrdForecastService = Depends(get_prd_forecast_service),
 ) -> PrdForecastChartResponse:
@@ -112,6 +113,8 @@ async def prd_forecast_chart(
         page_size=1,
     )
     try:
+        if use_cache:
+            return await svc.chart_only_or_cache(session, q)
         return await svc.chart_only(session, q)
     except BusinessException:
         raise
@@ -139,6 +142,7 @@ async def prd_forecast_detail(
     product_varieties: list[str] = Query(default=[], description="品种（多值）"),
     smelter: str | None = Query(None, description="冶炼厂（单值）"),
     smelters: list[str] = Query(default=[], description="冶炼厂（多值）"),
+    use_cache: bool = Query(True, description="是否优先使用AI预测缓存，默认开启"),
     session: AsyncSession = Depends(get_prediction_db_session),
     svc: PrdForecastService = Depends(get_prd_forecast_service),
 ) -> PrdForecastDetailResponse:
@@ -157,6 +161,8 @@ async def prd_forecast_detail(
         page_size=page_size,
     )
     try:
+        if use_cache:
+            return await svc.detail_page_or_cache(session, q)
         return await svc.detail_page(session, q)
     except BusinessException:
         raise

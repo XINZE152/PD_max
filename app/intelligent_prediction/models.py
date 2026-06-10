@@ -54,6 +54,7 @@ class PredictionBatch(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending", index=True)
+    prediction_type: Mapped[str] = mapped_column(String(32), nullable=False, default="manual", index=True)
     celery_task_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, index=True)
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     export_file_path: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)

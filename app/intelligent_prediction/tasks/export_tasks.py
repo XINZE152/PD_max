@@ -20,6 +20,7 @@ from app.intelligent_prediction.services.doubao_prediction_service import (
     get_doubao_prediction_service,
 )
 from app.intelligent_prediction.services.doubao_prompt_builder import DoubaoPromptBuilder
+from app.intelligent_prediction.services.audit_service import write_background_audit
 from app.intelligent_prediction.tasks.celery_app import celery_app
 
 logger = get_logger(__name__)
@@ -265,6 +266,18 @@ async def _run_daily_prediction_async(batch_id: str) -> None:
 
             batch.status = "completed"
             batch.completed_at = datetime.now(timezone.utc)
+
+            await write_background_audit(
+                session,
+                "daily_ai_prediction_completed",
+                resource=f"batch:{batch_id}",
+                detail={
+                    "warehouses_count": len(wh_list),
+                    "results_count": len(results),
+                    "items_predicted": len(items),
+                },
+            )
+
             await session.commit()
             logger.info(
                 "daily prediction finished: batch_id=%s, warehouses=%s, results=%s",
@@ -275,6 +288,14 @@ async def _run_daily_prediction_async(batch_id: str) -> None:
             batch.status = "failed"
             batch.error_message = str(e)[:2000]
             batch.completed_at = datetime.now(timezone.utc)
+
+            await write_background_audit(
+                session,
+                "daily_ai_prediction_failed",
+                resource=f"batch:{batch_id}",
+                detail={"error": str(e)[:500]},
+            )
+
             await session.commit()
 
 

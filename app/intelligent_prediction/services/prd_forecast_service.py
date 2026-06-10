@@ -11,7 +11,7 @@ from typing import Any, Optional
 from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.intelligent_prediction.models import DeliveryRecord
+from app.intelligent_prediction.models import DeliveryRecord, PredictionBatch, PredictionResult
 from app.intelligent_prediction.schemas.forecast import (
     PrdForecastByRmSeries,
     PrdForecastChartResponse,
@@ -367,6 +367,157 @@ class PrdForecastService:
         q: PrdForecastQuery,
     ) -> PrdForecastChartResponse:
         _rows, chart = await self.compute(session, q)
+        return chart
+
+    # ── 缓存感知方法 ──────────────────────────────────────
+
+    async def _fetch_cached_results(
+        self,
+        session: AsyncSession,
+        q: PrdForecastQuery,
+    ) -> list[PredictionResult] | None:
+        """查最新完成的 daily AI 预测批次中匹配筛选条件的缓存行。
+
+        若缓存不完整（任一 (仓库, 品种) 缺少请求日期范围的任何一天）则返回 None。
+        """
+        latest_stmt = (
+            select(PredictionBatch)
+            .where(
+                PredictionBatch.prediction_type == "manual",
+                PredictionBatch.status == "completed",
+            )
+            .order_by(PredictionBatch.completed_at.desc())
+            .limit(1)
+        )
+        res = await session.execute(latest_stmt)
+        latest_batch = res.scalars().first()
+        if latest_batch is None:
+            return None
+
+        conditions = [
+            PredictionResult.batch_id == latest_batch.id,
+            PredictionResult.target_date >= q.date_from,
+            PredictionResult.target_date <= q.date_to,
+        ]
+        if q.warehouses:
+            conditions.append(PredictionResult.warehouse.in_(q.warehouses))
+        if q.product_varieties:
+            conditions.append(PredictionResult.product_variety.in_(q.product_varieties))
+
+        results_stmt = (
+            select(PredictionResult)
+            .where(and_(*conditions))
+            .order_by(PredictionResult.warehouse, PredictionResult.product_variety, PredictionResult.target_date)
+        )
+        res2 = await session.execute(results_stmt)
+        rows = list(res2.scalars().all())
+        if not rows:
+            return None
+
+        # 完整性校验：每个 (仓库, 品种) 组合必须覆盖全部请求日期
+        pairs = {(r.warehouse, r.product_variety) for r in rows}
+        expected_dates = set(_daterange_inclusive(q.date_from, q.date_to))
+        for wh, pv in pairs:
+            pair_dates = {r.target_date for r in rows if r.warehouse == wh and r.product_variety == pv}
+            if not expected_dates.issubset(pair_dates):
+                return None
+
+        return rows
+
+    @staticmethod
+    def _build_forecast_from_cache(
+        cached_rows: list[PredictionResult],
+        q: PrdForecastQuery,
+    ) -> tuple[list[PrdForecastDetailRow], PrdForecastChartResponse]:
+        """将 AI 缓存行映射为预测响应格式。非 AI 字段置零，analysis 标记来源。"""
+        from collections import defaultdict as _defaultdict
+
+        detail_rows: list[PrdForecastDetailRow] = []
+        for r in cached_rows:
+            analysis_text = r.comprehensive_analysis or r.analysis or ""
+            detail_rows.append(
+                PrdForecastDetailRow(
+                    target_date=r.target_date,
+                    regional_manager=r.regional_manager or "未分配",
+                    warehouse=r.warehouse,
+                    product_variety=r.product_variety,
+                    smelter=r.smelter,
+                    wma_base=Decimal("0"),
+                    week_coef=Decimal("0"),
+                    history_baseline=Decimal("0"),
+                    price_factor=Decimal("0"),
+                    lead_market_price=None,
+                    own_calibration_price=None,
+                    competitor_price_max=None,
+                    price_sensitivity=None,
+                    analysis=f"[AI预测缓存] {analysis_text}"[:2000],
+                    predicted_weight=r.predicted_weight,
+                )
+            )
+
+        dates = sorted({r.target_date for r in detail_rows})
+        by_d_total: dict[date, Decimal] = _defaultdict(Decimal)
+        by_d_rm: dict[tuple[date, str], Decimal] = _defaultdict(Decimal)
+        for row in detail_rows:
+            by_d_total[row.target_date] += row.predicted_weight
+            by_d_rm[(row.target_date, row.regional_manager)] += row.predicted_weight
+
+        rms_sorted = sorted({r for (_, r) in by_d_rm.keys()})
+        by_rm_series = [
+            PrdForecastByRmSeries(
+                regional_manager=rm,
+                totals=[by_d_rm.get((dt, rm), Decimal("0")).quantize(Decimal("0.01")) for dt in dates],
+            )
+            for rm in rms_sorted
+        ]
+        total_by_date = [
+            by_d_total.get(dt, Decimal("0")).quantize(Decimal("0.01")) for dt in dates
+        ]
+
+        warehouse_set = {(r.warehouse, r.product_variety) for r in detail_rows}
+        chart = PrdForecastChartResponse(
+            dates=dates,
+            total_by_date=total_by_date,
+            by_regional_manager=by_rm_series,
+            warehouse_profiles=[],
+            summary_analysis=(
+                f"[AI预测缓存] 最近一批 AI 预测（批次 {cached_rows[0].batch_id}），"
+                f"覆盖 {len(warehouse_set)} 个仓库-品种组合。"
+                f"wma_base / week_coef / price_factor 字段置零。"
+            ),
+        )
+        return detail_rows, chart
+
+    async def compute_or_cache(
+        self,
+        session: AsyncSession,
+        q: PrdForecastQuery,
+    ) -> tuple[list[PrdForecastDetailRow], PrdForecastChartResponse]:
+        """缓存优先：有完整 AI 缓存则直接返回，否则回退实时规则计算。"""
+        cached = await self._fetch_cached_results(session, q)
+        if cached is not None:
+            return self._build_forecast_from_cache(cached, q)
+        return await self.compute(session, q)
+
+    async def detail_page_or_cache(
+        self,
+        session: AsyncSession,
+        q: PrdForecastQuery,
+    ) -> PrdForecastDetailResponse:
+        rows, _chart = await self.compute_or_cache(session, q)
+        total = len(rows)
+        offset = (q.page - 1) * q.page_size
+        page_rows = rows[offset : offset + q.page_size]
+        return PrdForecastDetailResponse(
+            total=total, page=q.page, page_size=q.page_size, items=page_rows,
+        )
+
+    async def chart_only_or_cache(
+        self,
+        session: AsyncSession,
+        q: PrdForecastQuery,
+    ) -> PrdForecastChartResponse:
+        _rows, chart = await self.compute_or_cache(session, q)
         return chart
 
 
