@@ -121,6 +121,35 @@
 |------|------|------|
 | POST | `/tl/trigger_daily_ai_prediction` | 触发今日 AI 预测后台任务。返回 task_id + batch_id |
 | GET | `/tl/daily_ai_prediction_status/{batch_id}` | 查询任务执行状态与结果条数 |
+| GET | `/tl/daily_ai_prediction_results` | 查询最新完成的每日AI预测结果（支持 `?warehouse=&product_variety=` 筛选） |
+
+#### GET `/tl/daily_ai_prediction_results` 响应示例
+
+```json
+{
+  "code": 200,
+  "data": {
+    "batch_id": "prediction-batch-uuid",
+    "创建时间": "2026-06-09 10:05:30",
+    "完成时间": "2026-06-09 10:05:30",
+    "结果列表": [
+      {
+        "仓库": "某仓库",
+        "品种": "某品种",
+        "冶炼厂": "某冶炼厂",
+        "大区经理": "某经理",
+        "预测日期": "2026-06-10",
+        "预测发货吨数": 12.5,
+        "发货概率": "high",
+        "置信度": "high",
+        "主要因素": "价格优势明显",
+        "分析报告": "综合分析文本前500字..."
+      }
+    ],
+    "总数": 156
+  }
+}
+```
 
 #### POST 触发响应示例
 
@@ -161,9 +190,10 @@
 1. 读取 `dict_warehouses` + `dict_warehouse_types`，识别垂直/战略库房
 2. 垂直/战略 → 全部纳入预测范围
 3. 普通合作 → 查 `pd_ip_delivery_records` 近 30 天 DISTINCT warehouse
-4. 对每个 (仓库, 品种) 组合构建 `DoubaoPredictionRequest`
+4. 对每个 (仓库, 品种) 组合加载历史数据，构建 `history_map`（仓库→历史记录列表）
 5. 调用 `DoubaoPredictionService.predict_batch()` 执行 AI 预测
-6. 结果持久化到 `pd_ip_prediction_results`，batch_id 关联批次
+6. **覆盖旧缓存：** 删除此前已完成的其他 daily prediction 批次的 `pd_ip_prediction_results` 记录及旧 batch 行
+7. 结果持久化到 `pd_ip_prediction_results`，传入 `batch_id` + `history_map` 以正确填充 `regional_manager`、`smelter` 等字段
 
 ### 2.6 涉及文件
 
