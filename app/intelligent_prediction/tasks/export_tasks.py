@@ -175,7 +175,7 @@ async def _run_daily_prediction_async(batch_id: str) -> None:
                 len(target_warehouses), batch_id,
             )
 
-            # 从 pd_ip_delivery_records 查询每个仓+品种组合
+            # 从 pd_ip_delivery_records 查询每个仓库的全部历史，按仓库级别预测
             wh_list = list(target_warehouses)
             from app.intelligent_prediction.models import DeliveryRecord, PredictionResult as PredictionResultRow
             from sqlalchemy import delete as sa_delete
@@ -187,11 +187,11 @@ async def _run_daily_prediction_async(batch_id: str) -> None:
             )
             from app.intelligent_prediction.services.doubao_prompt_builder import DoubaoPromptBuilder
             from app.intelligent_prediction.services.scheduled_prediction import (
-                _load_history_for_pair,
                 _load_smm_prices,
             )
             from app.intelligent_prediction.schemas.doubao_prediction import (
                 DoubaoBatchRequest,
+                DoubaoHistoryItem,
                 DoubaoPredictionRequest,
             )
 
@@ -200,31 +200,47 @@ async def _run_daily_prediction_async(batch_id: str) -> None:
             items: list[DoubaoPredictionRequest] = []
             # 构建 history_map：仓库名 → 历史记录列表，用于 persist 时推断 regional_manager/smelter
             history_map: dict[str, list] = {}
+            cutoff_history = _date.today() - timedelta(days=180)
             for wh_name in wh_list:
                 stmt = (
-                    sa_select(DeliveryRecord.product_variety)
+                    sa_select(DeliveryRecord)
                     .where(DeliveryRecord.warehouse == wh_name)
-                    .distinct()
+                    .where(DeliveryRecord.delivery_date >= cutoff_history)
+                    .order_by(DeliveryRecord.delivery_date)
                 )
                 res = await session.execute(stmt)
-                varieties = [r[0] for r in res.all()]
-                for variety in varieties:
-                    history = await _load_history_for_pair(session, wh_name, variety)
-                    if not history:
-                        continue
-                    items.append(
-                        DoubaoPredictionRequest(
-                            warehouse=wh_name,
-                            product_variety=variety,
-                            history=history,
-                            smm_prices=smm_prices,
-                            use_cache=True,
+                records = list(res.scalars().all())
+                if not records:
+                    logger.info("daily prediction: no history for %s, skip", wh_name)
+                    continue
+
+                history = []
+                for record in records:
+                    weather = record.import_weather
+                    if not weather and record.weather_json:
+                        weather = record.weather_json.get("text") or record.weather_json.get("description")
+                    history.append(
+                        DoubaoHistoryItem(
+                            送货日期=record.delivery_date,
+                            大区经理=record.regional_manager,
+                            冶炼厂=record.smelter,
+                            仓库=record.warehouse,
+                            品类=record.product_variety,
+                            天气=weather,
+                            重量吨=record.weight,
                         )
                     )
-                    if wh_name not in history_map:
-                        history_map[wh_name] = history
-                if not varieties:
-                    logger.info("daily prediction: no varieties for %s, skip", wh_name)
+
+                items.append(
+                    DoubaoPredictionRequest(
+                        warehouse=wh_name,
+                        product_variety=None,
+                        history=history,
+                        smm_prices=smm_prices,
+                        use_cache=True,
+                    )
+                )
+                history_map[wh_name] = history
 
             if not items:
                 batch.status = "completed"

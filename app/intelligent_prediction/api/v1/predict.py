@@ -361,7 +361,7 @@ async def list_stored_prediction_results(
 ) -> StoredPredictionResultListResponse:
     """分页查询已写入数据库的预测明细（含同步预测 batch_id 为空）。"""
     filters = []
-    if batch_id is None:
+    if batch_id is None and not (product_variety and product_variety.strip()):
         latest_daily_batch_id = await _latest_daily_prediction_batch_id(session)
         if latest_daily_batch_id:
             filters.append(PredictionResultRow.batch_id == latest_daily_batch_id)
