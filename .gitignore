@@ -14,6 +14,7 @@ __pycache__/
 *.wav
 *.avi
 *.mp3
+*.md
 /tmp/
 temp/
 logs/
