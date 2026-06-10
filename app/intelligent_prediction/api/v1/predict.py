@@ -74,6 +74,9 @@ async def _daily_cache_result_for_request(
     session: AsyncSession,
     req,
 ) -> DoubaoPredictionResult | None:
+    if not getattr(req, "use_cache", True):
+        return None
+
     batch_id = await _latest_daily_prediction_batch_id(session)
     if not batch_id:
         return None
@@ -94,15 +97,26 @@ async def _daily_cache_result_for_request(
             PredictionResultRow.id.desc(),
         )
     )
-    if req.product_variety:
-        stmt = stmt.where(PredictionResultRow.product_variety == req.product_variety)
+    async def _fetch_rows(product_variety: str | None) -> list[PredictionResultRow]:
+        query = stmt
+        if product_variety is not None:
+            query = query.where(PredictionResultRow.product_variety == product_variety)
+        result = await session.execute(query)
+        return list(result.scalars().all())
 
-    res = await session.execute(stmt)
-    rows = list(res.scalars().all())
+    requested_product_variety = (req.product_variety or "").strip()
+    has_exact_variety_rows = False
+    if requested_product_variety:
+        rows = await _fetch_rows(requested_product_variety)
+        has_exact_variety_rows = bool(rows)
+        if not rows:
+            rows = await _fetch_rows("")
+    else:
+        rows = await _fetch_rows(None)
     if not rows:
         return None
 
-    if req.product_variety:
+    if has_exact_variety_rows:
         by_date: dict[date, PredictionResultRow] = {}
         for row in rows:
             by_date.setdefault(row.target_date, row)
@@ -153,7 +167,7 @@ async def _daily_cache_result_for_request(
 
     return DoubaoPredictionResult(
         warehouse=req.warehouse,
-        product_variety=req.product_variety,
+        product_variety=req.product_variety if has_exact_variety_rows else None,
         analysis_report=analysis_report,
         items=items,
         provider_used="daily_cache",
