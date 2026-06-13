@@ -33,6 +33,9 @@ from app.intelligent_prediction.services.cache_manager import CacheManager
 from app.intelligent_prediction.services.doubao_prompt_builder import DoubaoPromptBuilder
 from app.intelligent_prediction.db import get_prediction_session_factory
 from app.intelligent_prediction.utils.json_extract import extract_json_object
+from app.intelligent_prediction.utils.prediction_report_sync import (
+    reconcile_items_with_summary_table,
+)
 
 logger = get_logger(__name__)
 
@@ -568,24 +571,28 @@ class DoubaoPredictionService:
             raw_items = []
 
         items: list[DailyTonnageItem] = []
-        used_dates: set[str] = set()
 
-        for i, ed in enumerate(forecast_dates):
-            entry: dict[str, Any] | None = None
+        def _norm_target_date(raw: Any) -> date | None:
+            if raw is None:
+                return None
+            if isinstance(raw, date):
+                return raw
+            s = str(raw).strip()[:10]
+            try:
+                return date.fromisoformat(s)
+            except ValueError:
+                return None
 
-            # 优先按索引匹配
-            if i < len(raw_items) and isinstance(raw_items[i], dict):
-                entry = raw_items[i]
+        by_target_date: dict[date, dict[str, Any]] = {}
+        for cand in raw_items:
+            if not isinstance(cand, dict):
+                continue
+            td = _norm_target_date(cand.get("target_date"))
+            if td is not None:
+                by_target_date[td] = cand
 
-            # 其次按日期匹配
-            if entry is None:
-                for cand in raw_items:
-                    if not isinstance(cand, dict):
-                        continue
-                    td = cand.get("target_date")
-                    if td == ed.isoformat() or td == str(ed):
-                        entry = cand
-                        break
+        for ed in forecast_dates:
+            entry = by_target_date.get(ed)
 
             if entry is None:
                 items.append(
@@ -628,6 +635,7 @@ class DoubaoPredictionService:
                 )
             )
 
+        items = reconcile_items_with_summary_table(items, report_text, forecast_dates)
         return items, report_text, None
 
     @staticmethod
