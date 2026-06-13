@@ -4,7 +4,7 @@ import numpy as np
 import joblib
 from io import BytesIO
 from PIL import Image, ExifTags
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 
 class PixelLevelDetector:
@@ -14,6 +14,12 @@ class PixelLevelDetector:
     _BLEND_DE_COMBINED_MIN = 0.045
     _BLEND_LG_COMBINED_MIN = 0.05
     _BLEND_DE_STRONG_MIN = 0.08
+
+    # 宽高比惩罚：极细长 ROI（max(w,h)/min(w,h) ≥ 此值）文字边缘/梯度/ELA 天然偏高
+    _ASPECT_RATIO_PENALTY_START = 3.0   # 宽高比 >= 此值开始惩罚
+    _ASPECT_RATIO_PENALTY_FULL = 8.0    # 宽高比 >= 此值达到最大惩罚
+    _ASPECT_RATIO_PENALTY_MAX = 0.60    # 最大惩罚比例（0.60 = 最多降权 60%）
+    _ASPECT_RATIO_MIN_THIN_PX = 50      # 短边 < 此值(px)才视为"细长"，避免宽矩形误伤
 
     @staticmethod
     def _structural_overlap_score(gray: np.ndarray, band_ratio: float = 0.08, min_band: int = 4) -> float:
@@ -150,9 +156,38 @@ class PixelLevelDetector:
         return float(min(1.0, (ratio - 0.55) * 0.55))
 
     @classmethod
-    def _alpha_blend_overlap_score(cls, double_edge_ratio: float, long_gradient_ratio: float) -> float:
+    def _aspect_ratio_penalty(
+        cls,
+        aspect_ratio: Optional[float],
+        min_dimension: Optional[int] = None,
+    ) -> float:
+        """计算宽高比惩罚系数（0.0 = 无惩罚，1.0 = 最大惩罚）。
+
+        极细长 ROI（文字行）的边缘/梯度/ELA 指标天然偏高，需降权。
+        min_dimension = min(w, h) 像素值；提供时仅对真正细条（< 50px）施加惩罚，
+        避免 429×93 等宽矩形被误伤。
+        """
+        if aspect_ratio is None or aspect_ratio < cls._ASPECT_RATIO_PENALTY_START:
+            return 0.0
+        if min_dimension is not None and min_dimension >= cls._ASPECT_RATIO_MIN_THIN_PX:
+            return 0.0
+        linear = min(1.0, (aspect_ratio - cls._ASPECT_RATIO_PENALTY_START)
+                     / (cls._ASPECT_RATIO_PENALTY_FULL - cls._ASPECT_RATIO_PENALTY_START))
+        return linear * cls._ASPECT_RATIO_PENALTY_MAX
+
+    @classmethod
+    def _alpha_blend_overlap_score(
+        cls,
+        double_edge_ratio: float,
+        long_gradient_ratio: float,
+        aspect_ratio: Optional[float] = None,
+        min_dimension: Optional[int] = None,
+    ) -> float:
         """
         以双重边缘为主、长梯度为辅；避免仅凭高梯度误报正常 UI 截图。
+
+        aspect_ratio = max(w, h) / min(w, h)，用于抑制文字行等极细长 ROI
+        的天然高边缘/梯度虚高。传入 None 保持原有行为。
         """
         de = double_edge_ratio
         lg = long_gradient_ratio
@@ -160,16 +195,34 @@ class PixelLevelDetector:
         if de >= cls._BLEND_DE_COMBINED_MIN and lg >= cls._BLEND_LG_COMBINED_MIN:
             de_boost = min(1.0, (de - cls._BLEND_DE_COMBINED_MIN) / 0.085)
             lg_boost = min(0.30, max(0.0, (lg - cls._BLEND_LG_COMBINED_MIN) * 1.2))
-            return float(min(1.0, 0.42 + de_boost * 0.48 + lg_boost))
+            score = float(min(1.0, 0.42 + de_boost * 0.48 + lg_boost))
+        elif de >= cls._BLEND_DE_STRONG_MIN:
+            score = float(min(1.0, 0.38 + (de - cls._BLEND_DE_STRONG_MIN) / 0.10))
+        else:
+            score = float(min(0.35, max(0.0, (de - 0.030) / 0.08) * 0.28))
 
-        if de >= cls._BLEND_DE_STRONG_MIN:
-            return float(min(1.0, 0.38 + (de - cls._BLEND_DE_STRONG_MIN) / 0.10))
-
-        return float(min(0.35, max(0.0, (de - 0.030) / 0.08) * 0.28))
+        penalty = cls._aspect_ratio_penalty(aspect_ratio, min_dimension=min_dimension)
+        if penalty > 0.0:
+            score *= (1.0 - penalty)
+        return float(min(1.0, score))
 
     @classmethod
-    def overlap_metrics(cls, cropped_img_np: np.ndarray) -> Dict[str, float]:
-        """返回像素重叠分项指标，供 API 调试展示。"""
+    def overlap_metrics(
+        cls,
+        cropped_img_np: np.ndarray,
+        aspect_ratio_override: Optional[float] = None,
+        min_dimension_override: Optional[int] = None,
+    ) -> Dict[str, float]:
+        """返回像素重叠分项指标，供 API 调试展示。
+
+        对极细长 ROI（宽高比 ≥ 3:1，如文字行）自动施加渐进惩罚，
+        抑制文字笔画天然高边缘/梯度/ELA 导致的虚高分数。
+
+        aspect_ratio_override: 优先使用的宽高比（max(w,h)/min(w,h)）。
+        min_dimension_override: 优先使用的短边像素值。
+        两者同时传入时覆盖从 cropped_img_np 自动计算的值，
+        用于 margin 扩展后仍按原始 ROI 形状惩罚的场景。
+        """
         if cropped_img_np is None or cropped_img_np.size == 0:
             return {
                 "structural_score": 0.0,
@@ -186,9 +239,25 @@ class PixelLevelDetector:
         gray = cv2.GaussianBlur(gray, (3, 3), 0)
         structural = cls._structural_overlap_score(gray)
         de, lg = cls._alpha_blend_metrics(gray)
-        blend = cls._alpha_blend_overlap_score(de, lg)
+
+        # 宽高比：优先使用外部传入值（原始 ROI），否则从扩展后图像计算
+        if aspect_ratio_override is not None:
+            aspect_ratio = aspect_ratio_override
+            min_dim = min_dimension_override  # 调用方传入原始 ROI 短边
+        else:
+            h, w = cropped_img_np.shape[:2]
+            aspect_ratio = max(w, h) / max(min(w, h), 1)
+            min_dim = min(w, h)
+
+        blend = cls._alpha_blend_overlap_score(de, lg, aspect_ratio=aspect_ratio, min_dimension=min_dim)
         ela = cls._ela_inconsistency_score(gray)
         noise_inc = cls._noise_inconsistency_score(gray)
+
+        # ELA 也对文字行天然偏高（笔画 JPEG 重压缩残差大），施加同等惩罚
+        ela_penalty = cls._aspect_ratio_penalty(aspect_ratio, min_dimension=min_dim)
+        if ela_penalty > 0.0:
+            ela *= (1.0 - ela_penalty)
+
         text_splice = float(min(1.0, max(ela, noise_inc * 0.9)))
         final = float(min(1.0, max(structural, blend, text_splice)))
         return {

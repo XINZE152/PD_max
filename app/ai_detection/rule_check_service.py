@@ -10,15 +10,7 @@ import yaml
 
 from app.ai_detection.core.detectors import PixelLevelDetector
 from app.ai_detection.core.utils import safe_read_image
-from app.ai_detection.rule_check_roi import (
-    find_high_risk_pixel_rois,
-    should_auto_scan_high_risk_pixel_rois,
-)
-from app.ai_detection.semantic_checker import (
-    check_receipt_semantics,
-    find_account_field_bbox,
-    find_labeled_field_bbox,
-)
+from app.ai_detection.rule_check_roi import find_suggested_rois
 from app.ai_detection.timestamp_checker import check_image_timestamps
 
 
@@ -92,9 +84,12 @@ def crop_expanded_roi(
 def evaluate_pixel_overlap_alert(
     metrics: Dict[str, float],
     thresholds: Dict[str, Any],
+    *,
+    roi_area: Optional[int] = None,
 ) -> bool:
     """
-    分层告警：blend 达阈即报；或 structural 高且伴随双重边缘；
+    分层告警：blend 达阈即报（小 ROI 须面积 ≥ 6000 以避免文字边缘误报）；
+    或 structural 高且伴随双重边缘；
     或 ELA/噪声条带检测到文字级无痕替换。
     """
     structural = float(metrics.get("structural_score", 0.0))
@@ -109,10 +104,13 @@ def evaluate_pixel_overlap_alert(
     text_splice_alert = float(thresholds.get("pixel_overlap_text_splice_alert", 0.38))
     ela_corroboration_min = float(thresholds.get("pixel_overlap_ela_corroboration_min", 0.22))
     structural_text_min = float(thresholds.get("pixel_overlap_structural_text_min", 0.52))
+    # 小 ROI（<4000 px²）边缘/压缩指标不可靠，文字笔画天然高密度高 ELA
+    small_roi_min_area = int(thresholds.get("pixel_overlap_small_roi_min_area", 4000))
+    is_small = roi_area is not None and roi_area < small_roi_min_area
 
-    if blend >= blend_alert:
+    if blend >= blend_alert and not is_small:
         return True
-    if text_splice >= text_splice_alert:
+    if text_splice >= text_splice_alert and ela >= ela_corroboration_min and not is_small:
         return True
     if ela >= ela_corroboration_min and structural >= structural_text_min:
         return True
@@ -122,24 +120,36 @@ def evaluate_pixel_overlap_alert(
 def _pixel_overlap_has_blend_corroboration(
     metrics: Dict[str, float],
     thresholds: Dict[str, Any],
+    *,
+    roi_area: Optional[int] = None,
 ) -> bool:
-    """hard 判需羽化/双重边缘佐证，避免纯 structural 高分误 hard。"""
+    """hard 判需羽化/双重边缘佐证，避免纯 structural 高分误 hard。
+
+    小 ROI（<4000 px²）的文字边缘天然高密度，blend 佐证不可靠。"""
     blend = float(metrics.get("blend_score", 0.0))
     double_edge = float(metrics.get("double_edge_ratio", 0.0))
     blend_min = float(thresholds.get("pixel_overlap_hard_blend_min", 0.55))
     de_min = float(thresholds.get("pixel_overlap_hard_de_min", 0.045))
+    small_roi_min_area = int(thresholds.get("pixel_overlap_small_roi_min_area", 4000))
+    if roi_area is not None and roi_area < small_roi_min_area:
+        return False
     return blend >= blend_min or double_edge >= de_min
 
 
 def _pixel_overlap_has_text_splice_corroboration(
     metrics: Dict[str, float],
     thresholds: Dict[str, Any],
+    *,
+    roi_area: Optional[int] = None,
 ) -> bool:
     text_splice = float(metrics.get("text_splice_score", 0.0))
     ela = float(metrics.get("ela_score", 0.0))
     text_min = float(thresholds.get("pixel_overlap_text_splice_hard_min", 0.42))
     ela_min = float(thresholds.get("pixel_overlap_ela_hard_min", 0.28))
-    return text_splice >= text_min or ela >= ela_min
+    small_roi_min_area = int(thresholds.get("pixel_overlap_small_roi_min_area", 4000))
+    if roi_area is not None and roi_area < small_roi_min_area:
+        return False
+    return text_splice >= text_min and ela >= ela_min
 
 
 def evaluate_pixel_overlap_hard_tamper(
@@ -147,6 +157,7 @@ def evaluate_pixel_overlap_hard_tamper(
     thresholds: Dict[str, Any],
     *,
     corroboration_signals: Optional[Dict[str, bool]] = None,
+    roi_area: Optional[int] = None,
 ) -> bool:
     """根据阈值判定像素重叠是否硬判篡改；独立接口需 blend/双重边缘或 ELA 佐证。"""
     score = float(metrics.get("pixel_overlap_score", 0.0))
@@ -155,8 +166,8 @@ def evaluate_pixel_overlap_hard_tamper(
     requires_corroboration = bool(
         thresholds.get("pixel_overlap_hard_tamper_requires_corroboration", True)
     )
-    has_blend_signal = _pixel_overlap_has_blend_corroboration(metrics, thresholds)
-    has_text_splice_signal = _pixel_overlap_has_text_splice_corroboration(metrics, thresholds)
+    has_blend_signal = _pixel_overlap_has_blend_corroboration(metrics, thresholds, roi_area=roi_area)
+    has_text_splice_signal = _pixel_overlap_has_text_splice_corroboration(metrics, thresholds, roi_area=roi_area)
 
     if score >= thresh_overlap_absolute and (has_blend_signal or has_text_splice_signal):
         return True
@@ -210,7 +221,16 @@ def run_pixel_overlap_check(
     x1, y1, x2, y2 = normalize_roi_bbox(bbox_xyxy, img_w, img_h, bbox_format)
     roi_expanded, bbox_xywh = crop_expanded_roi(img, [x1, y1, x2, y2], margin)
 
-    raw_metrics = pixel_detector.overlap_metrics(roi_expanded)
+    # 按原始 ROI（非扩展后）计算宽高比，避免 margin padding 稀释惩罚
+    roi_w = x2 - x1
+    roi_h = y2 - y1
+    original_aspect_ratio = max(roi_w, roi_h) / max(min(roi_w, roi_h), 1)
+
+    raw_metrics = pixel_detector.overlap_metrics(
+        roi_expanded,
+        aspect_ratio_override=original_aspect_ratio,
+        min_dimension_override=min(roi_w, roi_h),
+    )
     overlap_metrics = {
         "structural_score": raw_metrics["structural_score"],
         "blend_score": raw_metrics["blend_score"],
@@ -222,11 +242,13 @@ def run_pixel_overlap_check(
         "pixel_overlap_score": raw_metrics["pixel_overlap_score"],
     }
     score = float(overlap_metrics["pixel_overlap_score"])
-    alert = evaluate_pixel_overlap_alert(overlap_metrics, thresh)
+    roi_area = roi_w * roi_h
+    alert = evaluate_pixel_overlap_alert(overlap_metrics, thresh, roi_area=roi_area)
     hard_tamper = evaluate_pixel_overlap_hard_tamper(
         overlap_metrics,
         thresh,
         corroboration_signals=corroboration_signals,
+        roi_area=roi_area,
     )
 
     reasons: List[str] = []
@@ -278,59 +300,6 @@ def run_timestamp_check(
     }
 
 
-def run_semantic_check(
-    image_path: str,
-    *,
-    ocr_tokens: Optional[Sequence[Any]] = None,
-    image_shape: Optional[Tuple[int, int, int]] = None,
-    thresholds: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    """单据语义规则：金额格式、明细排版、无 EXIF 合成图信号。"""
-    result = check_receipt_semantics(
-        image_path,
-        ocr_tokens=ocr_tokens,
-        image_shape=image_shape,
-        thresholds=thresholds or {},
-    )
-    return {
-        "semantic_check": result.get("semantic_check"),
-        "anomalies": list(result.get("anomalies") or []),
-        "reasons": list(result.get("reasons") or []),
-        "risk": float(result.get("risk", 0.0)),
-        "hard_tamper": bool(result.get("hard_tamper")),
-        "account_field_bbox": result.get("account_field_bbox"),
-    }
-
-
-def _resolve_pixel_overlap_bbox(
-    bbox_xyxy: Optional[Sequence[int]],
-    ocr_tokens: Optional[Sequence[Any]],
-    *,
-    auto_detect_account_field: bool,
-) -> Optional[List[int]]:
-    if bbox_xyxy is not None:
-        return [int(v) for v in bbox_xyxy[:4]]
-    if auto_detect_account_field and ocr_tokens:
-        detected = find_account_field_bbox(ocr_tokens)
-        if detected is not None:
-            return detected
-    return None
-
-
-def _annotate_pixel_overlap_scan(
-    result: Dict[str, Any],
-    *,
-    auto_label: Optional[str] = None,
-    auto_source: Optional[str] = None,
-) -> Dict[str, Any]:
-    tagged = dict(result)
-    if auto_label:
-        tagged["auto_label"] = auto_label
-    if auto_source:
-        tagged["auto_source"] = auto_source
-    return tagged
-
-
 def merge_pixel_overlap_results(
     primary: Optional[Dict[str, Any]],
     scans: Sequence[Dict[str, Any]],
@@ -370,45 +339,6 @@ def merge_pixel_overlap_results(
     return merged
 
 
-def run_auto_high_risk_pixel_scans(
-    image_path: str,
-    pixel_detector: PixelLevelDetector,
-    *,
-    rois: Sequence[Dict[str, Any]],
-    thresholds: Dict[str, Any],
-    margin: int,
-    bbox_format: str,
-    corroboration_signals: Dict[str, bool],
-    image_bgr: Optional[Any] = None,
-) -> List[Dict[str, Any]]:
-    """对自动定位的高风险 ROI 逐个执行像素拼接检测。
-
-    若调用方已持有 ``image_bgr``，传入可避免每个 ROI 重复从磁盘读取整张图片。"""
-    results: List[Dict[str, Any]] = []
-    for roi in rois:
-        bbox = roi.get("bbox")
-        if not bbox or len(bbox) != 4:
-            continue
-        checked = run_pixel_overlap_check(
-            image_path,
-            bbox,
-            pixel_detector,
-            thresholds=thresholds,
-            margin=margin,
-            bbox_format=bbox_format,
-            corroboration_signals=corroboration_signals,
-            image_bgr=image_bgr,
-        )
-        results.append(
-            _annotate_pixel_overlap_scan(
-                checked,
-                auto_label=str(roi.get("label") or ""),
-                auto_source=str(roi.get("source") or "auto_high_risk"),
-            )
-        )
-    return results
-
-
 def run_rule_checks(
     image_path: str,
     pixel_detector: PixelLevelDetector,
@@ -423,27 +353,17 @@ def run_rule_checks(
     corroboration_signals: Optional[Dict[str, bool]] = None,
     image_bgr: Optional[Any] = None,
 ) -> Dict[str, Any]:
-    """聚合规则检测：像素重叠（bbox 或 OCR 自动定位）+ 语义 + 时间戳。
+    """聚合规则检测：像素重叠（仅手动传入 bbox 时执行）+ 时间戳。
 
-    若调用方已通过 ``run_full_image_ocr`` 加载图片，传入 ``image_bgr`` 可避免
-    像素重叠检测中重复从磁盘读取整张图片（自动扫描时为每 ROI 节省一次读取）。"""
+    未传 bbox 时通过 OCR 定位建议检测区域（suggested_rois），供前端展示勾选。"""
     rules = business_rules or {}
     margin = int(rules.get("roi_expand_margin", 15))
     thresh = thresholds or {}
-    auto_detect = bool(rules.get("auto_detect_account_field", True))
 
-    semantic = run_semantic_check(
-        image_path,
-        ocr_tokens=ocr_tokens,
-        image_shape=image_shape,
-        thresholds=thresh,
-    )
-    merged_signals = dict(corroboration_signals or {})
-    if semantic.get("anomalies"):
-        merged_signals["semantic_anomaly"] = True
-
+    # 像素重叠检测：仅当手动传入 bbox 时执行
     pixel_overlap: Optional[Dict[str, Any]] = None
     pixel_overlap_source: Optional[str] = None
+    suggested_rois: Optional[List[Dict[str, Any]]] = None
 
     if bbox_xyxy is not None:
         pixel_overlap = run_pixel_overlap_check(
@@ -453,59 +373,19 @@ def run_rule_checks(
             thresholds=thresh,
             margin=margin,
             bbox_format=bbox_format,
-            corroboration_signals=merged_signals,
+            corroboration_signals=corroboration_signals,
             image_bgr=image_bgr,
         )
         pixel_overlap_source = "manual_bbox"
-    elif (
-        ocr_tokens
-        and image_shape
-        and should_auto_scan_high_risk_pixel_rois(
-            manual_bbox=bbox_xyxy,
-            business_rules=rules,
-        )
-    ):
-        high_risk_rois = find_high_risk_pixel_rois(
+    elif ocr_tokens and image_shape:
+        # 未传 bbox：通过 OCR 定位建议检测区域
+        suggested_rois = find_suggested_rois(
             ocr_tokens,
             image_shape,
             business_rules=rules,
         )
-        if high_risk_rois:
-            auto_scans = run_auto_high_risk_pixel_scans(
-                image_path,
-                pixel_detector,
-                rois=high_risk_rois,
-                thresholds=thresh,
-                margin=margin,
-                bbox_format=bbox_format,
-                corroboration_signals=merged_signals,
-                image_bgr=image_bgr,
-            )
-            if auto_scans:
-                pixel_overlap = merge_pixel_overlap_results(None, auto_scans)
-                pixel_overlap["auto_detected"] = True
-                pixel_overlap_source = "auto_high_risk_rois"
-    else:
-        effective_bbox = _resolve_pixel_overlap_bbox(
-            bbox_xyxy,
-            ocr_tokens,
-            auto_detect_account_field=auto_detect,
-        )
-        if effective_bbox is not None:
-            pixel_overlap = run_pixel_overlap_check(
-                image_path,
-                effective_bbox,
-                pixel_detector,
-                thresholds=thresh,
-                margin=margin,
-                bbox_format=bbox_format,
-                corroboration_signals=merged_signals,
-                image_bgr=image_bgr,
-            )
-            pixel_overlap_source = "ocr_account_field"
-            pixel_overlap["auto_detected"] = True
-            pixel_overlap["auto_detect_source"] = "收款账号"
 
+    # 时间戳检测：始终执行
     timestamp = run_timestamp_check(
         image_path,
         ocr_tokens=ocr_tokens,
@@ -517,21 +397,18 @@ def run_rule_checks(
     reasons: List[str] = []
     if pixel_overlap and pixel_overlap.get("reasons"):
         reasons.extend(pixel_overlap["reasons"])
-    if semantic.get("reasons"):
-        reasons.extend(semantic["reasons"])
     if timestamp.get("reasons"):
         reasons.extend(timestamp["reasons"])
 
     hard_tamper_flags = {
         "pixel_overlap": bool(pixel_overlap and pixel_overlap.get("hard_tamper")),
         "timestamp": bool(timestamp.get("hard_tamper")),
-        "semantic": bool(semantic.get("hard_tamper")),
     }
 
     return {
         "pixel_overlap": pixel_overlap,
         "pixel_overlap_source": pixel_overlap_source,
-        "semantic": semantic,
+        "suggested_rois": suggested_rois,
         "timestamp": timestamp,
         "hard_tamper_flags": hard_tamper_flags,
         "reason": "；".join(dict.fromkeys(reasons)) if reasons else "未检出明显规则类异常",

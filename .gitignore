@@ -30,3 +30,4 @@ uploads/
 *.txt
 CLAUDE.md
 .pytest_cache
+/tests

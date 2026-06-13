@@ -9,7 +9,9 @@ import numpy as np
 from app.ai_detection.core.detectors import OriginalityChecker
 
 
-AMOUNT_PATTERN = re.compile(r"(?<!\d)[+\-]?(?:[¥￥])?\d[\d,]{0,12}[.:]\d{2}(?:元)?")
+AMOUNT_PATTERN = re.compile(r"(?<!\d)[+\-]?(?:[¥￥])?\d[\d,]{0,12}(?:[.:]\d{2})?(?:元)?(?![.:\d])")
+# 仅匹配含小数点的金额（供证书检测等需要精确判断的场景）
+DECIMAL_AMOUNT_PATTERN = re.compile(r"(?<!\d)[+\-]?(?:[¥￥])?\d[\d,]{0,12}[.:]\d{2}(?:元)?")
 DATE_PATTERN = re.compile(r"\d{4}[-/.]\d{1,2}[-/.]\d{1,2}")
 TIME_PATTERN = re.compile(r"\d{1,2}:\d{2}(?::\d{2})?")
 ORDER_PATTERN = re.compile(r"\d{10,}")
@@ -528,7 +530,7 @@ def detect_certificate_document_override(
             )
             has_uppercase_amount = bool(re.search(r"大写[:：]?[壹贰叁肆伍陆柒捌玖拾佰仟万零圆整元]+", row_text))
             broken_small_amount = bool(re.search(r"(?:小写|小)[:：]?[¥￥]?\d{5,}元", row_text))
-            has_decimal_amount = bool(AMOUNT_PATTERN.search(row_text))
+            has_decimal_amount = bool(DECIMAL_AMOUNT_PATTERN.search(row_text))
             low_quality_candidate = candidate.ocr_confidence < 0.35 or "." not in candidate.clean_text
 
             if not (has_amount_row and has_uppercase_amount and broken_small_amount and low_quality_candidate):
