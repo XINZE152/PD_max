@@ -111,6 +111,10 @@ def evaluate_pixel_overlap_alert(
     if blend >= blend_alert and not is_small:
         return True
     if text_splice >= text_splice_alert and ela >= ela_corroboration_min and not is_small:
+        # 纯 text_splice（ela/noise 极高但 blend 和 de 都极低）可能源于
+        # 整图 JPEG 重压缩伪影而非局部拼接，需至少一项佐证
+        if blend < 0.15 and double_edge < 0.04:
+            return False
         return True
     if ela >= ela_corroboration_min and structural >= structural_text_min:
         return True

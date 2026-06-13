@@ -82,6 +82,19 @@ class PixelOverlapAlertTests(unittest.TestCase):
                 {
                     "blend_score": 0.0,
                     "structural_score": 0.30,
+                    "double_edge_ratio": 0.04,  # 达到 text_splice alert 的最低佐证阈值
+                    "text_splice_score": 0.45,
+                    "ela_score": 0.40,
+                },
+                thresholds,
+            )
+        )
+        # 纯 text_splice 无任何 blend/de 佐证 → 整图 JPEG 伪影，应抑制
+        self.assertFalse(
+            evaluate_pixel_overlap_alert(
+                {
+                    "blend_score": 0.0,
+                    "structural_score": 0.30,
                     "double_edge_ratio": 0.01,
                     "text_splice_score": 0.45,
                     "ela_score": 0.40,
