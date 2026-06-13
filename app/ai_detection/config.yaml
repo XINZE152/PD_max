@@ -32,13 +32,14 @@ thresholds:
   pixel_anomaly_alert: 0.60      # 局部像素风险 > 此值，触发拼接涂抹报警
   pixel_overlap_alert: 0.55      # 像素重叠风险 > 此值，触发重叠/拼接报警（legacy，分层规则优先）
   pixel_overlap_blend_alert: 0.55           # blend 分 >= 此值即告警
+  pixel_overlap_small_roi_min_area: 4000     # 小于此面积（px²）的 ROI 跳过 blend/text_splice 告警（小文字区域边缘指标不可靠）
   pixel_overlap_structural_alert: 0.79      # structural 告警需同时满足 de_min
   pixel_overlap_structural_de_min: 0.018    # structural 告警所需最低双重边缘占比
-  pixel_overlap_text_splice_alert: 0.38    # ELA/噪声条带文字替换告警阈值
-  pixel_overlap_ela_corroboration_min: 0.22  # ELA 佐证 + structural 联合告警
+  pixel_overlap_text_splice_alert: 0.38    # ELA/噪声条带文字替换告警阈值（需同时满足 ela >= ela_corroboration_min）
+  pixel_overlap_ela_corroboration_min: 0.20  # ELA 佐证下限（text_splice 告警 & structural 联合告警共用）
   pixel_overlap_structural_text_min: 0.52    # 文字 ROI structural 联合告警下限
-  pixel_overlap_text_splice_hard_min: 0.42  # 文字替换 hard 佐证阈值
-  pixel_overlap_ela_hard_min: 0.28         # ELA hard 佐证阈值
+  pixel_overlap_text_splice_hard_min: 0.42  # 文字替换 hard 佐证阈值（需同时满足 ela >= ela_hard_min）
+  pixel_overlap_ela_hard_min: 0.20         # ELA hard 佐证阈值
   pixel_overlap_text_hard_score: 0.48      # 有 ELA 佐证时的 hard 最低总分
   pixel_overlap_hard_blend_min: 0.55        # hard 判所需最低 blend 分
   pixel_overlap_hard_de_min: 0.045          # hard 判所需最低双重边缘占比
