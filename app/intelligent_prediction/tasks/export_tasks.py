@@ -255,12 +255,7 @@ async def _run_daily_prediction_async(batch_id: str) -> None:
 
             results = []
             for req_item in items:
-                result, _hist = await resolve_one_predict_item(
-                    session,
-                    svc,
-                    req_item,
-                    allow_daily_db_cache=False,
-                )
+                result, _hist = await resolve_one_predict_item(session, svc, req_item)
                 results.append(result)
 
             # 覆盖机制：先删除同类型旧批次结果，再写入新结果，保证缓存数据每日覆盖
