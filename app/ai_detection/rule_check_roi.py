@@ -2,6 +2,7 @@
 """规则检测高风险 ROI 自动定位（与 AI 鉴伪共用金额候选逻辑）。"""
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from app.ai_detection.amount_candidates import (
@@ -24,6 +25,15 @@ HIGH_RISK_FIELD_LABELS = (
     "金额",
     "小写",
 )
+
+# 建议检测区域分类定义：(标签关键词元组, 分类名, 展示优先级)
+SUGGESTED_ROI_CATEGORIES = [
+    (("转账金额", "交易金额", "金额", "小写", "大写"), "金额", 1),
+    (("收款账号", "付款账号", "收款方账户", "付款方账户", "对方账户"), "账号", 2),
+    (("申请时间", "交易时间", "转账时间", "收款时间", "交易日期"), "时间", 3),
+    (("转账单号", "订单号", "交易单号", "电子凭证号", "业务单号"), "单号", 4),
+    (("收款人", "付款人", "收款方", "付款方", "姓名", "微信昵称", "微信号"), "姓名/昵称", 5),
+]
 
 
 def _dedupe_rois(
@@ -119,3 +129,83 @@ def rule_checks_need_auto_pixel_rescan(
         manual_bbox=manual_bbox,
         business_rules=business_rules,
     )
+
+
+def find_suggested_rois(
+    tokens: Sequence[OCRToken],
+    image_shape: Tuple[int, int, int],
+    *,
+    business_rules: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    未传 bbox 时，用 OCR 定位建议检测区域（金额/账号/时间/单号/姓名），
+    供前端展示让用户勾选后再做像素重叠检测。
+
+    返回按 priority 升序排列的 ROI 列表，每项含 bbox/分类标签/OCR 文本。
+    """
+    from app.ai_detection.semantic_checker import find_labeled_field_bbox
+
+    rules = business_rules or {}
+    max_rois = max(1, int(rules.get("suggested_rois_max", 12)))
+    min_amount_score = float(rules.get("auto_pixel_rescan_min_amount_score", 0.35))
+
+    rois: List[Dict[str, Any]] = []
+    seen_bboxes: List[Tuple[int, int, int, int]] = []
+
+    def _add_roi(bbox_xyxy: List[int], label: str, category: str, priority: int, source: str = "ocr_label") -> None:
+        bbox_tuple = tuple(int(v) for v in bbox_xyxy[:4])
+        # 去重：与已添加区域 IoU >= 0.8 则跳过
+        if any(bbox_iou(bbox_tuple, seen) >= 0.80 for seen in seen_bboxes):
+            return
+        seen_bboxes.append(bbox_tuple)
+        rois.append({
+            "bbox": [int(v) for v in bbox_xyxy[:4]],
+            "label": label,
+            "category": category,
+            "priority": priority,
+            "source": source,
+        })
+
+    # 1. 按标签定位字段值区域（金额/账号/时间/单号/姓名）
+    for labels, category, priority in SUGGESTED_ROI_CATEGORIES:
+        for label_text in labels:
+            bbox = find_labeled_field_bbox(tokens, label_text)
+            if bbox is not None:
+                _add_roi(bbox, label_text, category, priority, source="ocr_labeled_field")
+
+    # 2. 自动检测的数字/金额候选区域
+    amount_candidates: List[AmountCandidate] = build_amount_candidates(tokens, image_shape)
+    image_h, image_w = image_shape[:2]
+    for candidate in amount_candidates:
+        if float(candidate.amount_score) < min_amount_score:
+            continue
+        text = (candidate.clean_text or "").strip()
+        if text:
+            digit_count = len(re.findall(r'\d', text))
+            # 无数字或数字占比过低 → 非金额
+            if digit_count == 0 or digit_count / max(len(text), 1) < 0.20:
+                continue
+            # 含中文 → OCR 粘连，金额区域不应有中文
+            if re.search(r'[一-鿿]', text):
+                continue
+            # 含过多异常标点（..、+、连续符号）→ OCR 噪声
+            noisy = len(re.findall(r'\.{2,}|\+|[*@#]', text))
+            if noisy > 0 and noisy / max(len(text), 1) > 0.05:
+                continue
+            # 状态栏：顶部 7% 区域无金额关键词的数字直接排除
+            if candidate.bbox[1] < image_h * 0.07:
+                continue
+            # 纯4位数字（无逗号/符号/小数点）→ 极可能是账号碎片或验证码
+            if re.fullmatch(r'\d{4}', text):
+                continue
+        _add_roi(
+            [int(v) for v in candidate.bbox],
+            candidate.clean_text[:32] or "数字区域",
+            "金额候选",
+            6,
+            source=f"amount_{candidate.source}",
+        )
+
+    # 按 priority 排序
+    rois.sort(key=lambda r: (r["priority"], r.get("label", "")))
+    return rois[:max_rois]

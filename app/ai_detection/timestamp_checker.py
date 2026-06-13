@@ -300,6 +300,8 @@ def _compare_business_and_visible(
     transaction_datetime: Optional[str],
     transaction_time: Optional[str],
     tolerance_seconds: float,
+    *,
+    date_only: bool = False,
 ) -> List[str]:
     anomalies: List[str] = []
     visible_dt: Optional[datetime] = None
@@ -314,6 +316,12 @@ def _compare_business_and_visible(
         visible_dt = parse_loose_datetime(transaction_time)
 
     if visible_dt is None:
+        return anomalies
+
+    # 只传日期时仅比较日期部分，忽略时刻差异
+    if date_only:
+        if business_dt.date() != visible_dt.date():
+            anomalies.append("business_visible_datetime_mismatch")
         return anomalies
 
     delta = abs((business_dt - visible_dt).total_seconds())
@@ -557,12 +565,19 @@ def check_image_timestamps(
 
     if business_dt is not None:
         tolerance = float(thresh.get("business_time_tolerance_seconds", 300))
+        # 用户仅传日期（如 2026-01-22）时只比对日期，不因时刻差异误报
+        raw_doc_time = str(business_datetime or "").strip()
+        date_only = bool(
+            raw_doc_time
+            and not re.search(r"\d{1,2}:\d{2}", raw_doc_time)
+        )
         anomalies.extend(
             _compare_business_and_visible(
                 business_dt,
                 ocr_info.get("transaction_datetime"),
                 ocr_info.get("transaction_time"),
                 tolerance,
+                date_only=date_only,
             )
         )
         anomalies.extend(_compare_business_and_exif(business_dt, exif_info, tolerance))

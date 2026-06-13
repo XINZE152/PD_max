@@ -47,20 +47,6 @@ def _summary_from_timestamp(data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def _summary_from_semantic(data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    if not data:
-        return {
-            "semantic_risk": None,
-            "semantic_hard_tamper": False,
-            "semantic_anomaly_codes": [],
-        }
-    return {
-        "semantic_risk": data.get("risk"),
-        "semantic_hard_tamper": bool(data.get("hard_tamper")),
-        "semantic_anomaly_codes": list(data.get("anomalies") or []),
-    }
-
-
 def build_rule_checks_outcome(
     data: Dict[str, Any],
     *,
@@ -69,15 +55,12 @@ def build_rule_checks_outcome(
 ) -> Dict[str, Any]:
     pixel = data.get("pixel_overlap")
     timestamp = data.get("timestamp")
-    semantic = data.get("semantic")
     flags = data.get("hard_tamper_flags") or {}
     pixel_summary = _summary_from_pixel_overlap(pixel if isinstance(pixel, dict) else None)
     ts_summary = _summary_from_timestamp(timestamp if isinstance(timestamp, dict) else None)
-    semantic_summary = _summary_from_semantic(semantic if isinstance(semantic, dict) else None)
     any_hard = (
         bool(flags.get("pixel_overlap"))
         or bool(flags.get("timestamp"))
-        or bool(flags.get("semantic"))
     )
     return {
         "api_version": "v1",
@@ -88,14 +71,13 @@ def build_rule_checks_outcome(
         },
         "pixel_overlap": pixel,
         "pixel_overlap_source": data.get("pixel_overlap_source"),
-        "semantic": semantic,
+        "suggested_rois": data.get("suggested_rois"),
         "timestamp": timestamp,
         "hard_tamper_flags": flags,
         "reason": data.get("reason"),
         "summary": {
             **pixel_summary,
             **ts_summary,
-            **semantic_summary,
             "any_hard_tamper": any_hard,
         },
     }
