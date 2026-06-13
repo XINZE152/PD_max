@@ -39,9 +39,14 @@ from app.intelligent_prediction.schemas.prediction import (
     StoredPredictionResultListResponse,
 )
 from app.intelligent_prediction.services.audit_service import list_audit_events
+from app.intelligent_prediction.services.daily_prediction_cache import (
+    latest_daily_prediction_batch_id,
+)
 from app.intelligent_prediction.services.doubao_prediction_service import (
-    HORIZON,
     DoubaoPredictionService,
+)
+from app.intelligent_prediction.services.predict_item_resolver import (
+    resolve_one_predict_item,
 )
 from app.intelligent_prediction.services.dimension_options_service import (
     list_dimensions_from_prediction_results,
@@ -52,147 +57,6 @@ from app.intelligent_prediction.services.dict_geo_lookup import (
 
 logger = get_logger(__name__)
 router = APIRouter()
-
-_DAILY_PREDICTION_TYPE = "manual"
-_DAILY_PREDICTION_HORIZON_DAYS = 16
-
-
-async def _ensure_history_for_recent_shipment_check(
-    session: AsyncSession,
-    svc: DoubaoPredictionService,
-    item,
-):
-    """为近30天发货校验补齐 history（与 predict_single 自动加载一致）。"""
-    if item.history:
-        return item
-    loaded = await svc._load_history_from_db(
-        session, item.warehouse, item.product_variety,
-    )
-    if not loaded:
-        return item
-    return item.model_copy(update={"history": loaded})
-
-
-async def _latest_daily_prediction_batch_id(session: AsyncSession) -> str | None:
-    stmt = (
-        select(PredictionBatch.id)
-        .where(
-            PredictionBatch.prediction_type == _DAILY_PREDICTION_TYPE,
-            PredictionBatch.status == "completed",
-        )
-        .order_by(PredictionBatch.completed_at.desc(), PredictionBatch.created_at.desc())
-        .limit(1)
-    )
-    res = await session.execute(stmt)
-    return res.scalar_one_or_none()
-
-
-async def _daily_cache_result_for_request(
-    session: AsyncSession,
-    req,
-) -> DoubaoPredictionResult | None:
-    if not getattr(req, "use_cache", True):
-        return None
-
-    batch_id = await _latest_daily_prediction_batch_id(session)
-    if not batch_id:
-        return None
-
-    start = req.prediction_start_date or date.today()
-    end = start + timedelta(days=_DAILY_PREDICTION_HORIZON_DAYS - 1)
-    stmt = (
-        select(PredictionResultRow)
-        .where(
-            PredictionResultRow.batch_id == batch_id,
-            PredictionResultRow.warehouse == req.warehouse,
-            PredictionResultRow.target_date >= start,
-            PredictionResultRow.target_date <= end,
-        )
-        .order_by(
-            PredictionResultRow.target_date.asc(),
-            PredictionResultRow.created_at.desc(),
-            PredictionResultRow.id.desc(),
-        )
-    )
-    async def _fetch_rows(product_variety: str | None) -> list[PredictionResultRow]:
-        query = stmt
-        if product_variety is not None:
-            query = query.where(PredictionResultRow.product_variety == product_variety)
-        result = await session.execute(query)
-        return list(result.scalars().all())
-
-    requested_product_variety = (req.product_variety or "").strip()
-    has_exact_variety_rows = False
-    if requested_product_variety:
-        rows = await _fetch_rows(requested_product_variety)
-        has_exact_variety_rows = bool(rows)
-        if not rows:
-            rows = await _fetch_rows("")
-    else:
-        rows = await _fetch_rows(None)
-    if not rows:
-        return None
-
-    if has_exact_variety_rows:
-        by_date: dict[date, PredictionResultRow] = {}
-        for row in rows:
-            by_date.setdefault(row.target_date, row)
-        if len(by_date) < _DAILY_PREDICTION_HORIZON_DAYS:
-            return None
-        ordered_rows = [by_date[start + timedelta(days=i)] for i in range(_DAILY_PREDICTION_HORIZON_DAYS)]
-        items = [
-            DailyTonnageItem(
-                target_date=row.target_date,
-                predicted_weight=row.predicted_weight,
-                ship_probability=row.ship_probability or "中",
-                confidence_level=row.confidence_level or row.confidence or "中",
-                main_factors=row.main_factors or "",
-            )
-            for row in ordered_rows
-        ]
-        analysis_report = next(
-            (
-                row.comprehensive_analysis or row.analysis or ""
-                for row in ordered_rows
-                if row.comprehensive_analysis or row.analysis
-            ),
-            "",
-        )
-    else:
-        totals: dict[date, Decimal] = defaultdict(Decimal)
-        factors_by_date: dict[date, list[str]] = defaultdict(list)
-        for row in rows:
-            totals[row.target_date] += Decimal(str(row.predicted_weight or 0))
-            if row.main_factors:
-                factors_by_date[row.target_date].append(str(row.main_factors))
-        if len(totals) < _DAILY_PREDICTION_HORIZON_DAYS:
-            return None
-        items = []
-        for i in range(_DAILY_PREDICTION_HORIZON_DAYS):
-            day = start + timedelta(days=i)
-            items.append(
-                DailyTonnageItem(
-                    target_date=day,
-                    predicted_weight=totals[day],
-                    ship_probability="中",
-                    confidence_level="中",
-                    main_factors="；".join(factors_by_date.get(day, [])[:3]),
-                )
-            )
-        varieties = sorted({row.product_variety for row in rows if row.product_variety})
-        analysis_report = f"[AI预测缓存] 最新每日预测批次 {batch_id}，按仓库汇总 {len(varieties)} 个品种。"
-
-    return DoubaoPredictionResult(
-        warehouse=req.warehouse,
-        product_variety=req.product_variety if has_exact_variety_rows else None,
-        analysis_report=analysis_report,
-        items=items,
-        provider_used="daily_cache",
-        latency_ms=0,
-        cost_usd=None,
-        cache_hit=True,
-        parse_error=None,
-    )
 
 @router.get(
     "/dict-addresses",
@@ -266,56 +130,24 @@ async def predict_sync(
     """同步批量15天发货预测并写库。"""
     try:
         results_by_index: dict[int, DoubaoPredictionResult] = {}
-        missing_items = []
-        missing_indexes: list[int] = []
+        to_persist: list[DoubaoPredictionResult] = []
+        history_map: dict[str, list] = {}
 
         for idx, item in enumerate(body.items):
-            item_for_check = await _ensure_history_for_recent_shipment_check(
-                session, svc, item,
+            result, hist = await resolve_one_predict_item(
+                session, svc, item, allow_daily_db_cache=True,
             )
-            start = item.prediction_start_date or date.today()
-            forecast_dates = [start + timedelta(days=i) for i in range(HORIZON)]
-            if DoubaoPredictionService._recent_shipment_tonnage(
-                item_for_check.history, start,
-            ) <= 0:
-                results_by_index[idx] = DoubaoPredictionService._zero_prediction_result(
-                    item,
-                    forecast_dates,
-                    reason="近30天无发货记录或发货量为0，未调用模型，预测未来15天发货量为0",
-                )
-                continue
+            results_by_index[idx] = result
+            if hist is not None:
+                to_persist.append(result)
+                if hist:
+                    history_map[item.warehouse] = hist
 
-            cached = await _daily_cache_result_for_request(session, item)
-            if cached is not None:
-                results_by_index[idx] = cached
-            else:
-                missing_indexes.append(idx)
-                missing_items.append(item)
-
-        if missing_items:
-            # 构建 history_map 用于 persist 时推断 regional_manager 和 smelter
-            history_map: dict[str, list] = {}
-            for item in missing_items:
-                if item.history:
-                    history_map[item.warehouse] = item.history
-
-            missing_body = body.model_copy(update={"items": missing_items})
-            fresh_results = await svc.predict_batch(missing_body)
-
-            # 对于 history 为空的请求，从 DB 补充 history_map
-            for item in missing_items:
-                if item.warehouse not in history_map:
-                    loaded = await svc._load_history_from_db(
-                        session, item.warehouse, item.product_variety,
-                    )
-                    if loaded:
-                        history_map[item.warehouse] = loaded
-
+        if to_persist:
             await svc.persist_sync_results(
-                session, fresh_results, batch_id=None, history_map=history_map
+                session, to_persist, batch_id=None, history_map=history_map or None,
             )
-            for idx, result in zip(missing_indexes, fresh_results):
-                results_by_index[idx] = result
+            await session.commit()
 
         return [results_by_index[i] for i in range(len(body.items))]
     except BusinessException:
@@ -408,7 +240,7 @@ async def list_stored_prediction_results(
     """分页查询已写入数据库的预测明细（含同步预测 batch_id 为空）。"""
     filters = []
     if batch_id is None and not (product_variety and product_variety.strip()):
-        latest_daily_batch_id = await _latest_daily_prediction_batch_id(session)
+        latest_daily_batch_id = await latest_daily_prediction_batch_id(session)
         if latest_daily_batch_id:
             filters.append(PredictionResultRow.batch_id == latest_daily_batch_id)
     if warehouse and warehouse.strip():

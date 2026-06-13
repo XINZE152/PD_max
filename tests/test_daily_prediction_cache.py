@@ -3,8 +3,10 @@ from datetime import date, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 
-from app.intelligent_prediction.api.v1 import predict as predict_api
+from app.intelligent_prediction.services import daily_prediction_cache as cache_mod
 from app.intelligent_prediction.schemas.doubao_prediction import DoubaoPredictionRequest
+
+_DAILY_PREDICTION_HORIZON_DAYS = 16
 
 
 class _ScalarResult:
@@ -50,7 +52,7 @@ def _daily_rows(start: date, product_variety: str = ""):
             analysis=None,
             created_at=None,
         )
-        for index in range(predict_api._DAILY_PREDICTION_HORIZON_DAYS)
+        for index in range(_DAILY_PREDICTION_HORIZON_DAYS)
     ]
 
 
@@ -58,17 +60,17 @@ def test_daily_cache_returns_warehouse_level_prediction(monkeypatch):
     async def latest_batch_id(_session):
         return "batch-1"
 
-    monkeypatch.setattr(predict_api, "_latest_daily_prediction_batch_id", latest_batch_id)
+    monkeypatch.setattr(cache_mod, "latest_daily_prediction_batch_id", latest_batch_id)
     start = date(2026, 6, 10)
     session = _FakeSession([_daily_rows(start)])
     req = DoubaoPredictionRequest(warehouse="W1", prediction_start_date=start)
 
-    result = asyncio.run(predict_api._daily_cache_result_for_request(session, req))
+    result = asyncio.run(cache_mod.daily_cache_result_for_request(session, req))
 
     assert result is not None
     assert result.cache_hit is True
     assert result.provider_used == "daily_cache"
-    assert len(result.items) == predict_api._DAILY_PREDICTION_HORIZON_DAYS
+    assert len(result.items) == _DAILY_PREDICTION_HORIZON_DAYS
     assert result.items[0].predicted_weight == Decimal("1")
     assert session.execute_count == 1
 
@@ -77,7 +79,7 @@ def test_daily_cache_falls_back_to_warehouse_level_when_variety_missing(monkeypa
     async def latest_batch_id(_session):
         return "batch-1"
 
-    monkeypatch.setattr(predict_api, "_latest_daily_prediction_batch_id", latest_batch_id)
+    monkeypatch.setattr(cache_mod, "latest_daily_prediction_batch_id", latest_batch_id)
     start = date(2026, 6, 10)
     session = _FakeSession([[], _daily_rows(start)])
     req = DoubaoPredictionRequest(
@@ -86,7 +88,7 @@ def test_daily_cache_falls_back_to_warehouse_level_when_variety_missing(monkeypa
         prediction_start_date=start,
     )
 
-    result = asyncio.run(predict_api._daily_cache_result_for_request(session, req))
+    result = asyncio.run(cache_mod.daily_cache_result_for_request(session, req))
 
     assert result is not None
     assert result.cache_hit is True
@@ -98,9 +100,9 @@ def test_daily_cache_respects_use_cache_false(monkeypatch):
     async def latest_batch_id(_session):
         raise AssertionError("daily cache should not query latest batch")
 
-    monkeypatch.setattr(predict_api, "_latest_daily_prediction_batch_id", latest_batch_id)
+    monkeypatch.setattr(cache_mod, "latest_daily_prediction_batch_id", latest_batch_id)
     req = DoubaoPredictionRequest(warehouse="W1", use_cache=False)
 
-    result = asyncio.run(predict_api._daily_cache_result_for_request(_FakeSession([]), req))
+    result = asyncio.run(cache_mod.daily_cache_result_for_request(_FakeSession([]), req))
 
     assert result is None

@@ -210,9 +210,6 @@ async def _run_daily_prediction_async(batch_id: str) -> None:
                 )
                 res = await session.execute(stmt)
                 records = list(res.scalars().all())
-                if not records:
-                    logger.info("daily prediction: no history for %s, skip", wh_name)
-                    continue
 
                 history = []
                 for record in records:
@@ -249,11 +246,22 @@ async def _run_daily_prediction_async(batch_id: str) -> None:
                 logger.info("daily prediction: no items to predict, batch_id=%s", batch_id)
                 return
 
-            body = DoubaoBatchRequest(items=items)
             svc: DoubaoPredictionService = get_doubao_prediction_service(
                 get_ai_client(), get_cache_manager(), DoubaoPromptBuilder()
             )
-            results = await svc.predict_batch(body)
+            from app.intelligent_prediction.services.predict_item_resolver import (
+                resolve_one_predict_item,
+            )
+
+            results = []
+            for req_item in items:
+                result, _hist = await resolve_one_predict_item(
+                    session,
+                    svc,
+                    req_item,
+                    allow_daily_db_cache=False,
+                )
+                results.append(result)
 
             # 覆盖机制：先删除同类型旧批次结果，再写入新结果，保证缓存数据每日覆盖
             old_batch_stmt = sa_select(PredictionBatch.id).where(
