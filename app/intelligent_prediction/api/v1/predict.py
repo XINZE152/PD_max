@@ -40,6 +40,7 @@ from app.intelligent_prediction.schemas.prediction import (
 )
 from app.intelligent_prediction.services.audit_service import list_audit_events
 from app.intelligent_prediction.services.doubao_prediction_service import (
+    HORIZON,
     DoubaoPredictionService,
 )
 from app.intelligent_prediction.services.dimension_options_service import (
@@ -54,6 +55,22 @@ router = APIRouter()
 
 _DAILY_PREDICTION_TYPE = "manual"
 _DAILY_PREDICTION_HORIZON_DAYS = 16
+
+
+async def _ensure_history_for_recent_shipment_check(
+    session: AsyncSession,
+    svc: DoubaoPredictionService,
+    item,
+):
+    """为近30天发货校验补齐 history（与 predict_single 自动加载一致）。"""
+    if item.history:
+        return item
+    loaded = await svc._load_history_from_db(
+        session, item.warehouse, item.product_variety,
+    )
+    if not loaded:
+        return item
+    return item.model_copy(update={"history": loaded})
 
 
 async def _latest_daily_prediction_batch_id(session: AsyncSession) -> str | None:
@@ -253,6 +270,21 @@ async def predict_sync(
         missing_indexes: list[int] = []
 
         for idx, item in enumerate(body.items):
+            item_for_check = await _ensure_history_for_recent_shipment_check(
+                session, svc, item,
+            )
+            start = item.prediction_start_date or date.today()
+            forecast_dates = [start + timedelta(days=i) for i in range(HORIZON)]
+            if DoubaoPredictionService._recent_shipment_tonnage(
+                item_for_check.history, start,
+            ) <= 0:
+                results_by_index[idx] = DoubaoPredictionService._zero_prediction_result(
+                    item,
+                    forecast_dates,
+                    reason="近30天无发货记录或发货量为0，未调用模型，预测未来15天发货量为0",
+                )
+                continue
+
             cached = await _daily_cache_result_for_request(session, item)
             if cached is not None:
                 results_by_index[idx] = cached

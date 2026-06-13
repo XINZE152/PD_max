@@ -39,6 +39,9 @@ logger = get_logger(__name__)
 # 预测天数（day0 ~ day15）
 HORIZON = 16
 
+# 近 N 天无发货则不调模型，直接返回全零预测
+RECENT_SHIPMENT_LOOKBACK_DAYS = 30
+
 # 缓存 TTL（秒）
 CACHE_TTL_SECONDS = 600  # 10 分钟
 
@@ -79,6 +82,22 @@ class DoubaoPredictionService:
             req.product_variety or "(全部)",
             len(req.history),
         )
+
+        recent_tonnage = self._recent_shipment_tonnage(req.history, start)
+        if recent_tonnage <= 0:
+            logger.info(
+                "doubao_prediction_skip_ai warehouse=%s variety=%s reason=no_recent_shipment "
+                "lookback_days=%d recent_tonnage=%s",
+                req.warehouse,
+                req.product_variety or "(全部)",
+                RECENT_SHIPMENT_LOOKBACK_DAYS,
+                recent_tonnage,
+            )
+            return self._zero_prediction_result(
+                req,
+                forecast_dates,
+                reason="近30天无发货记录或发货量为0，未调用模型，预测未来15天发货量为0",
+            )
 
         # 1. 缓存检查（校验脏数据：空报告 + 全零预测 = 旧版 local_rule 污染，拒绝命中）
         cache_key = self._build_cache_key(req)
@@ -397,6 +416,52 @@ class DoubaoPredictionService:
     # ------------------------------------------------------------------
     # 内部方法
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _recent_shipment_tonnage(
+        history: list[DoubaoHistoryItem] | None,
+        anchor: date,
+        lookback_days: int = RECENT_SHIPMENT_LOOKBACK_DAYS,
+    ) -> Decimal:
+        """近 lookback_days 天内（含 anchor 当日）历史发货总吨数。"""
+        if not history:
+            return Decimal("0")
+        cutoff = anchor - timedelta(days=lookback_days)
+        total = Decimal("0")
+        for h in history:
+            d = h.送货日期
+            if cutoff <= d <= anchor:
+                total += Decimal(str(h.重量吨))
+        return total
+
+    @staticmethod
+    def _zero_prediction_result(
+        req: DoubaoPredictionRequest,
+        forecast_dates: list[date],
+        reason: str,
+    ) -> DoubaoPredictionResult:
+        """不调模型，返回全零逐日预测。"""
+        items = [
+            DailyTonnageItem(
+                target_date=d,
+                predicted_weight=Decimal("0"),
+                ship_probability="低",
+                confidence_level="低",
+                main_factors=reason[:500],
+            )
+            for d in forecast_dates
+        ]
+        return DoubaoPredictionResult(
+            warehouse=req.warehouse,
+            product_variety=req.product_variety,
+            analysis_report=reason,
+            items=items,
+            provider_used="skip_no_recent_shipment",
+            latency_ms=0.0,
+            cost_usd=None,
+            cache_hit=False,
+            parse_error=None,
+        )
 
     @staticmethod
     def _is_cache_data_valid(cached: dict[str, Any]) -> bool:
