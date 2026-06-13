@@ -1,4 +1,4 @@
-"""单仓预测解析：与 POST /predict 单条 item 逻辑一致（30 天规则 → daily 库缓存 → 调模型）。"""
+"""单仓预测：读 pd_ip_prediction_results → 无则算模型 → 由 predict_sync 整仓删后写。"""
 
 from __future__ import annotations
 
@@ -11,12 +11,12 @@ from app.intelligent_prediction.schemas.doubao_prediction import (
     DoubaoPredictionRequest,
     DoubaoPredictionResult,
 )
-from app.intelligent_prediction.services.daily_prediction_cache import (
-    daily_cache_result_for_request,
-)
 from app.intelligent_prediction.services.doubao_prediction_service import (
     HORIZON,
     DoubaoPredictionService,
+)
+from app.intelligent_prediction.services.warehouse_prediction_store import (
+    load_warehouse_forecast_from_db,
 )
 
 _ZERO_REASON = "近30天无发货记录或发货量为0，未调用模型，预测未来15天发货量为0"
@@ -41,18 +41,21 @@ async def resolve_one_predict_item(
     session: AsyncSession,
     svc: DoubaoPredictionService,
     item: DoubaoPredictionRequest,
-    *,
-    allow_daily_db_cache: bool = True,
 ) -> tuple[DoubaoPredictionResult, list[DoubaoHistoryItem] | None]:
-    """执行一条预测请求。
+    """执行一条预测。
 
     Returns:
-        (result, history_for_persist): daily 库命中时 history_for_persist 为 None（已落库）；
-        模型/全零短路时返回用于 persist 的 history 列表（可能为空）。
+        (result, history_for_persist):
+        - 库中已有本窗口完整数据 → history_for_persist=None（不写库、不调模型）
+        - 否则 → 需写库，history 用于推断大区经理/冶炼厂
     """
     item_checked = await ensure_history_for_item(session, svc, item)
     start = item.prediction_start_date or date.today()
     forecast_dates = [start + timedelta(days=i) for i in range(HORIZON)]
+
+    stored = await load_warehouse_forecast_from_db(session, item)
+    if stored is not None:
+        return stored, None
 
     if DoubaoPredictionService._recent_shipment_tonnage(item_checked.history, start) <= 0:
         return (
@@ -61,11 +64,6 @@ async def resolve_one_predict_item(
             ),
             list(item_checked.history or []),
         )
-
-    if allow_daily_db_cache:
-        cached = await daily_cache_result_for_request(session, item)
-        if cached is not None:
-            return cached, None
 
     result = await svc.predict_single(session, item.model_copy(update={"use_cache": False}))
     hist = list(item_checked.history or [])

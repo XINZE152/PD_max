@@ -118,8 +118,8 @@ async def list_operation_audit(
     response_model=list[DoubaoPredictionResult],
     summary="同步批量15天发货预测",
     description=(
-        "接收仓库历史送货数据、冶炼厂价格、SMM铅价三组数据，"
-        "调用大模型输出六维度分析报告 + 15天逐日发货吨数预测，并写入数据库。"
+        "先查 pd_ip_prediction_results：若该仓库在本预测窗口（prediction_start_date 起 16 天）"
+        "已有完整 target_date 数据则直接返回、不调模型；否则调模型后删除该仓库在表中的全部记录再写入。"
     ),
 )
 async def predict_sync(
@@ -130,22 +130,30 @@ async def predict_sync(
     """同步批量15天发货预测并写库。"""
     try:
         results_by_index: dict[int, DoubaoPredictionResult] = {}
-        to_persist: list[DoubaoPredictionResult] = []
+        persist_by_warehouse: dict[str, DoubaoPredictionResult] = {}
         history_map: dict[str, list] = {}
 
         for idx, item in enumerate(body.items):
-            result, hist = await resolve_one_predict_item(
-                session, svc, item, allow_daily_db_cache=True,
-            )
+            result, hist = await resolve_one_predict_item(session, svc, item)
             results_by_index[idx] = result
             if hist is not None:
-                to_persist.append(result)
+                wh = item.warehouse.strip()
+                persist_by_warehouse[wh] = result
                 if hist:
                     history_map[item.warehouse] = hist
 
-        if to_persist:
+        if persist_by_warehouse:
+            from app.intelligent_prediction.services.warehouse_prediction_store import (
+                delete_all_prediction_rows_for_warehouse,
+            )
+
+            for wh in persist_by_warehouse:
+                await delete_all_prediction_rows_for_warehouse(session, wh)
             await svc.persist_sync_results(
-                session, to_persist, batch_id=None, history_map=history_map or None,
+                session,
+                list(persist_by_warehouse.values()),
+                batch_id=None,
+                history_map=history_map or None,
             )
             await session.commit()
 
