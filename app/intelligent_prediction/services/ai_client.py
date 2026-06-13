@@ -13,6 +13,7 @@ import aiohttp
 
 from app.intelligent_prediction.settings import settings
 from app.intelligent_prediction.logging_utils import get_logger
+from app.intelligent_prediction.utils.ai_call_logger import log_ai_call
 from app.intelligent_prediction.utils.json_extract import extract_json_object
 from app.services.llm_client import build_openai_compatible_body
 
@@ -239,6 +240,39 @@ class AIModelClient:
         )
         return {"analysis_report": report, "items": items}
 
+    def _emit_ai_call_log(
+        self,
+        *,
+        system: str,
+        user: str,
+        warehouse: str,
+        product_variety: str,
+        start_date: date,
+        provider: str,
+        model: str | None,
+        latency_ms: float,
+        cost_usd: float | None,
+        errors: list[str],
+        raw_response: str,
+        parsed: dict[str, Any] | None,
+        parse_error: str | None = None,
+    ) -> None:
+        log_ai_call(
+            provider=provider,
+            model=model,
+            warehouse=warehouse,
+            product_variety=product_variety,
+            start_date=start_date.isoformat(),
+            system_prompt=system,
+            user_prompt=user,
+            latency_ms=latency_ms,
+            cost_usd=cost_usd,
+            errors=errors,
+            raw_response=raw_response,
+            parsed_json=parsed,
+            parse_error=parse_error,
+        )
+
     async def complete_with_fallback(
         self,
         system: str,
@@ -269,6 +303,20 @@ class AIModelClient:
                     force_json=True,
                 )
                 if parsed is not None:
+                    self._emit_ai_call_log(
+                        system=system,
+                        user=user,
+                        warehouse=warehouse,
+                        product_variety=product_variety,
+                        start_date=start_date,
+                        provider=prov,
+                        model=settings.openai_model,
+                        latency_ms=lat,
+                        cost_usd=cost,
+                        errors=errors,
+                        raw_response=raw,
+                        parsed=parsed,
+                    )
                     return parsed, prov, lat, cost, raw[:2000], errors
                 errors.append(f"openai:{err}")
 
@@ -292,12 +340,40 @@ class AIModelClient:
                     force_json=True,
                 )
                 if parsed is not None:
+                    self._emit_ai_call_log(
+                        system=system,
+                        user=user,
+                        warehouse=warehouse,
+                        product_variety=product_variety,
+                        start_date=start_date,
+                        provider=prov,
+                        model=settings.azure_openai_deployment,
+                        latency_ms=lat,
+                        cost_usd=cost,
+                        errors=errors,
+                        raw_response=raw,
+                        parsed=parsed,
+                    )
                     return parsed, prov, lat, cost, raw[:2000], errors
                 errors.append(f"azure:{err}")
 
             if settings.anthropic_api_key:
                 parsed, prov, lat, cost, raw, err = await self._call_anthropic(session, system, user)
                 if parsed is not None:
+                    self._emit_ai_call_log(
+                        system=system,
+                        user=user,
+                        warehouse=warehouse,
+                        product_variety=product_variety,
+                        start_date=start_date,
+                        provider=prov,
+                        model=settings.anthropic_model,
+                        latency_ms=lat,
+                        cost_usd=cost,
+                        errors=errors,
+                        raw_response=raw,
+                        parsed=parsed,
+                    )
                     return parsed, prov, lat, cost, raw[:2000], errors
                 errors.append(f"anthropic:{err}")
 
@@ -313,6 +389,21 @@ class AIModelClient:
             start_date,
         )
         lat = (time.perf_counter() - t0) * 1000.0
+        self._emit_ai_call_log(
+            system=system,
+            user=user,
+            warehouse=warehouse,
+            product_variety=product_variety,
+            start_date=start_date,
+            provider="local_rule",
+            model=None,
+            latency_ms=lat,
+            cost_usd=None,
+            errors=errors,
+            raw_response="",
+            parsed=parsed,
+            parse_error="remote providers failed, local_rule fallback",
+        )
         return parsed, "local_rule", lat, None, "", errors
 
 

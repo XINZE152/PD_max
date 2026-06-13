@@ -104,6 +104,19 @@ class IntelligentPredictionSettings(BaseModel):
     anthropic_api_key: str = Field(default_factory=lambda: (os.getenv("ANTHROPIC_API_KEY") or "").strip())
     anthropic_model: str = Field(default_factory=lambda: os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022"))
 
+    ai_call_log_enabled: bool = Field(
+        default_factory=lambda: _env_bool("AI_CALL_LOG_ENABLED", True),
+        description="是否将每次 AI 预测调用的输入/输出追加写入文本日志",
+    )
+    ai_call_log_path: str = Field(
+        default_factory=lambda: (os.getenv("AI_CALL_LOG_PATH") or "logs/ai_prediction_calls.log").strip(),
+        description="AI 调用日志文件路径（相对项目根或绝对路径）",
+    )
+    ai_call_log_max_chars: int = Field(
+        default_factory=lambda: _env_int("AI_CALL_LOG_MAX_CHARS", 500_000),
+        description="单段 prompt/响应在日志中最多保留字符数，超出截断",
+    )
+
     ai_request_timeout_seconds: float = Field(default_factory=lambda: _env_float("AI_REQUEST_TIMEOUT_SECONDS", 120.0))
     prediction_redis_ttl_seconds: int = Field(default_factory=lambda: _env_int("PREDICTION_REDIS_TTL_SECONDS", 3600))
     prompt_memory_ttl_seconds: int = Field(default_factory=lambda: _env_int("PROMPT_MEMORY_TTL_SECONDS", 300))
