@@ -51,6 +51,7 @@ def build_rule_checks_outcome(
     data: Dict[str, Any],
     *,
     bbox: Optional[List[int]] = None,
+    bboxes: Optional[List[List[int]]] = None,
     document_time: Optional[str] = None,
 ) -> Dict[str, Any]:
     pixel = data.get("pixel_overlap")
@@ -62,13 +63,15 @@ def build_rule_checks_outcome(
         bool(flags.get("pixel_overlap"))
         or bool(flags.get("timestamp"))
     )
+    request: Dict[str, Any] = {"document_time": document_time}
+    if bboxes:
+        request["bboxes"] = bboxes
+    elif bbox is not None:
+        request["bbox"] = bbox
     return {
         "api_version": "v1",
         "check_type": MODE_RULE_CHECKS,
-        "request": {
-            "bbox": bbox,
-            "document_time": document_time,
-        },
+        "request": request,
         "pixel_overlap": pixel,
         "pixel_overlap_source": data.get("pixel_overlap_source"),
         "suggested_rois": data.get("suggested_rois"),
@@ -87,12 +90,18 @@ def build_pixel_overlap_outcome(
     data: Dict[str, Any],
     *,
     bbox: List[int],
+    bboxes: Optional[List[List[int]]] = None,
 ) -> Dict[str, Any]:
     pixel_summary = _summary_from_pixel_overlap(data)
+    request: Dict[str, Any] = {}
+    if bboxes:
+        request["bboxes"] = bboxes
+    else:
+        request["bbox"] = bbox
     return {
         "api_version": "v1",
         "check_type": MODE_RULE_PIXEL_OVERLAP,
-        "request": {"bbox": bbox},
+        "request": request,
         "result": data,
         "summary": {
             **pixel_summary,
@@ -144,17 +153,22 @@ def persist_rule_check_history(
     mode: str,
     original_filename: Optional[str],
     bbox: Optional[List[int]],
+    bboxes: Optional[List[List[int]]] = None,
     status: str,
     outcome: Dict[str, Any],
     source_image_path: Optional[str] = None,
     task_id: Optional[str] = None,
 ) -> None:
-    """写入 ai_detection_history；失败仅打日志，不抛出。"""
+    """写入 ai_detection_history；失败仅打日志，不抛出。
+
+    bbox: 单框 [x1,y1,x2,y2]（向后兼容）；bboxes: 多框 [[x1,y1,x2,y2], ...]。
+    多框时优先使用 bboxes 写入 bbox 列（JSON 数组形式）。"""
+    stored_bbox = bboxes if bboxes else bbox
     insert_ai_detection_history(
         mode=mode,
         task_id=task_id,
         original_filename=original_filename,
-        bbox=bbox,
+        bbox=stored_bbox,
         status=status,
         outcome=outcome,
         source_image_path=source_image_path,
