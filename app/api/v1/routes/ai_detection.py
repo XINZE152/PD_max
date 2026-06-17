@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
 import mimetypes
@@ -22,7 +23,7 @@ import yaml
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 from PIL import Image, ImageDraw
 
@@ -33,6 +34,11 @@ from app.ai_detection.amount_candidates import (
 from app.ai_detection.core.utils import load_chinese_font
 from app.config import AI_RULE_CHECK_PERSIST, AI_RULE_CHECK_STORE_IMAGE, UPLOAD_DIR
 from app.ai_detection.easyocr_download_patch import patch_easyocr_download
+from app.ai_detection.history_export import (
+    EXPORT_MAX_RECORDS,
+    build_export_zip,
+    preview_export,
+)
 from app.ai_detection.history_db import (
     HISTORY_RETENTION_DAYS,
     clear_feedback_status,
@@ -1706,6 +1712,167 @@ async def delete_detection_history(record_id: int):
     if not removed:
         raise HTTPException(status_code=404, detail="历史记录不存在")
     return {"status": "success"}
+
+
+class HistoryExportRequest(BaseModel):
+    """鉴伪历史导出/预览共用筛选条件。"""
+
+    start_time: datetime = Field(..., description="开始时间（含），ISO8601 或 YYYY-MM-DD HH:MM:SS")
+    end_time: datetime = Field(..., description="结束时间（含），须不早于 start_time")
+    detection_results: Optional[List[str]] = Field(
+        None,
+        description="鉴伪结论过滤：正常、可疑、篡改；不传或空数组表示全部",
+    )
+    bbox_mode: str = Field(
+        "all",
+        description="检测框来源：all=全部，manual=用户提交检测时手动画框，auto=自动 OCR 框选",
+    )
+    modes: Optional[List[str]] = Field(
+        None,
+        description="历史 mode，默认 async_v3,sync_v1（AI 鉴伪主流程）",
+    )
+    status: str = Field("COMPLETED", description="记录状态，默认仅成功完成的检测")
+    match_mode: str = Field(
+        "primary",
+        description="结论匹配：primary=按主结果 result；any=multi_results 任一条命中即保留",
+    )
+    image_variant: str = Field(
+        "original",
+        description="导出图片类型：original=原图，annotated=在原图上绘制检测框与结论（仅 export 生效）",
+    )
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "start_time": "2026-06-01T00:00:00",
+                    "end_time": "2026-06-17T23:59:59",
+                    "detection_results": ["篡改", "可疑"],
+                    "bbox_mode": "all",
+                    "image_variant": "original",
+                }
+            ]
+        }
+    )
+
+
+def _parse_history_export_request(req: HistoryExportRequest) -> HistoryExportRequest:
+    if req.end_time < req.start_time:
+        raise HTTPException(status_code=400, detail="end_time 不能早于 start_time")
+    bbox = (req.bbox_mode or "all").strip().lower()
+    if bbox not in ("all", "manual", "auto"):
+        raise HTTPException(status_code=400, detail="bbox_mode 须为 all、manual 或 auto")
+    match = (req.match_mode or "primary").strip().lower()
+    if match not in ("primary", "any"):
+        raise HTTPException(status_code=400, detail="match_mode 须为 primary 或 any")
+    variant = (req.image_variant or "original").strip().lower()
+    if variant not in ("original", "annotated"):
+        raise HTTPException(status_code=400, detail="image_variant 须为 original 或 annotated")
+    allowed_results = {"正常", "可疑", "篡改"}
+    if req.detection_results:
+        bad = [x for x in req.detection_results if x not in allowed_results]
+        if bad:
+            raise HTTPException(
+                status_code=400,
+                detail=f"detection_results 含非法值: {bad}，仅支持 正常、可疑、篡改",
+            )
+    req.bbox_mode = bbox  # type: ignore[assignment]
+    req.match_mode = match  # type: ignore[assignment]
+    req.image_variant = variant  # type: ignore[assignment]
+    return req
+
+
+@router.post(
+    "/api/v1/history/export/preview",
+    summary="鉴伪历史导出预览",
+    description=(
+        "按时间范围、鉴伪结论、是否手动画框等条件统计并列出将参与导出的记录（默认最多返回 "
+        f"{int(os.getenv('AI_DETECTION_EXPORT_PREVIEW_MAX', '200'))} 条明细）。"
+        "不打包、不下载；用于导出前确认数量与是否超过单次上限。"
+    ),
+)
+async def history_export_preview(req: HistoryExportRequest):
+    req = _parse_history_export_request(req)
+    data = await run_in_threadpool(
+        partial(
+            preview_export,
+            start_time=req.start_time,
+            end_time=req.end_time,
+            detection_results=req.detection_results,
+            bbox_mode=req.bbox_mode,  # type: ignore[arg-type]
+            modes=req.modes,
+            status=req.status,
+            match_mode=req.match_mode,  # type: ignore[arg-type]
+            image_variant=req.image_variant,  # type: ignore[arg-type]
+        ),
+    )
+    return {"status": "success", **data}
+
+
+@router.post(
+    "/api/v1/history/export",
+    summary="导出鉴伪历史图片 ZIP",
+    description=(
+        "筛选条件与预览接口相同；将匹配记录的图片打入 ZIP 并直接下载。"
+        f"单次最多 {EXPORT_MAX_RECORDS} 条（可用环境变量 AI_DETECTION_EXPORT_MAX_RECORDS 调整）。"
+        "ZIP 内含 `images/` 与根目录 `export_manifest.json`。"
+    ),
+    response_class=StreamingResponse,
+)
+async def history_export_download(req: HistoryExportRequest):
+    req = _parse_history_export_request(req)
+    preview = await run_in_threadpool(
+        partial(
+            preview_export,
+            start_time=req.start_time,
+            end_time=req.end_time,
+            detection_results=req.detection_results,
+            bbox_mode=req.bbox_mode,  # type: ignore[arg-type]
+            modes=req.modes,
+            status=req.status,
+            match_mode=req.match_mode,  # type: ignore[arg-type]
+            image_variant=req.image_variant,  # type: ignore[arg-type]
+        ),
+    )
+    if preview["total_matched"] == 0:
+        raise HTTPException(status_code=404, detail="没有符合筛选条件的记录")
+    if preview["exceeds_limit"]:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"匹配 {preview['total_matched']} 条，超过单次导出上限 {EXPORT_MAX_RECORDS}，"
+                "请缩小时间范围或增加 detection_results 过滤"
+            ),
+        )
+
+    try:
+        zip_bytes, filename, stats = await run_in_threadpool(
+            partial(
+                build_export_zip,
+                start_time=req.start_time,
+                end_time=req.end_time,
+                detection_results=req.detection_results,
+                bbox_mode=req.bbox_mode,  # type: ignore[arg-type]
+                modes=req.modes,
+                status=req.status,
+                match_mode=req.match_mode,  # type: ignore[arg-type]
+                image_variant=req.image_variant,  # type: ignore[arg-type]
+            ),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    headers = {
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "X-Export-Record-Count": str(stats["record_count"]),
+        "X-Export-Images-Added": str(stats["images_added"]),
+        "X-Export-Skipped-No-Image": str(stats["skipped_no_image"]),
+    }
+    return StreamingResponse(
+        io.BytesIO(zip_bytes),
+        media_type="application/zip",
+        headers=headers,
+    )
 
 
 @router.post(

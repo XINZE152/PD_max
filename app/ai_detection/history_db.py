@@ -8,6 +8,7 @@ import os
 import shutil
 from decimal import Decimal
 from pathlib import Path
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from app.config import UPLOAD_DIR
@@ -458,3 +459,60 @@ def list_ai_detection_history(
                 rows_out.append(item)
 
     return total, rows_out
+
+
+def query_ai_detection_history_for_export(
+    *,
+    start_time: datetime,
+    end_time: datetime,
+    modes: Optional[Sequence[str]] = None,
+    status: str = "COMPLETED",
+    bbox_mode: str = "all",
+) -> List[Dict[str, Any]]:
+    """
+    按时间范围导出查询（不触发保留期 purge）。
+    bbox_mode: all | manual | auto（manual/auto 在 SQL 层粗筛，边界 case 由导出层再判）。
+    """
+    default_modes = ("async_v3", "sync_v1")
+    mode_list = [str(m).strip() for m in (modes or list(default_modes)) if str(m).strip()]
+    if not mode_list:
+        mode_list = list(default_modes)
+
+    status_val = str(status or "COMPLETED").strip() or "COMPLETED"
+    bbox_mode_val = str(bbox_mode or "all").strip().lower() or "all"
+
+    bbox_clause = ""
+    if bbox_mode_val == "auto":
+        bbox_clause = " AND JSON_EXTRACT(bbox, '$.auto_ocr') = true"
+    elif bbox_mode_val == "manual":
+        bbox_clause = (
+            " AND (JSON_TYPE(bbox) = 'ARRAY' OR "
+            "(JSON_TYPE(bbox) = 'OBJECT' AND JSON_EXTRACT(bbox, '$.x1') IS NOT NULL "
+            "AND (JSON_EXTRACT(bbox, '$.auto_ocr') IS NULL OR JSON_EXTRACT(bbox, '$.auto_ocr') = false)))"
+        )
+
+    placeholders = ", ".join(["%s"] * len(mode_list))
+    sql = f"""
+        SELECT id, created_at, mode, task_id, original_filename, bbox, status,
+               outcome_json, stored_image, feedback_status
+        FROM ai_detection_history
+        WHERE created_at >= %s AND created_at <= %s
+          AND status = %s
+          AND mode IN ({placeholders})
+          {bbox_clause}
+        ORDER BY id DESC
+    """
+    params: List[Any] = [start_time, end_time, status_val, *mode_list]
+
+    rows_out: List[Dict[str, Any]] = []
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, tuple(params))
+            cols = [c[0] for c in cur.description]
+            for r in cur.fetchall():
+                item = dict(zip(cols, r))
+                created = item.get("created_at")
+                if created is not None and hasattr(created, "isoformat"):
+                    item["created_at"] = created.isoformat(sep=" ", timespec="seconds")
+                rows_out.append(item)
+    return rows_out
