@@ -26,6 +26,8 @@ from app.ai_detection.history_db import (
 )
 from app.config import UPLOAD_DIR
 
+from app.ai_detection.rule_check_display import derive_rule_check_status
+
 logger = logging.getLogger(__name__)
 
 STORAGE_DIR = Path(UPLOAD_DIR) / "ai_detection_storage"
@@ -73,6 +75,7 @@ def classify_bbox_mode(bbox: Any) -> str:
 
 
 def extract_primary_detection_result(outcome: Dict[str, Any]) -> Optional[str]:
+    # sync_v1 / async_v3：结果在 outcome.result.result 两层嵌套
     inner = outcome.get("result")
     if isinstance(inner, dict) and inner.get("result"):
         return str(inner.get("result"))
@@ -80,6 +83,14 @@ def extract_primary_detection_result(outcome: Dict[str, Any]) -> Optional[str]:
         return inner
     if isinstance(outcome.get("error_msg"), str) and outcome.get("error_msg"):
         return None
+    # rule_* 模式：通过 check_type 识别结构
+    check_type = outcome.get("check_type")
+    if check_type == "rule_checks":
+        return derive_rule_check_status(outcome)
+    if check_type in ("rule_pixel_overlap", "rule_timestamp"):
+        key = "pixel_overlap" if check_type == "rule_pixel_overlap" else "timestamp"
+        inner_data = outcome.get("result")
+        return derive_rule_check_status({key: inner_data} if isinstance(inner_data, dict) else {})
     return None
 
 

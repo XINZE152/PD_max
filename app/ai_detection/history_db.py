@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from app.config import UPLOAD_DIR
 from app.database import get_conn
-from app.ai_detection.rule_check_display import build_rule_check_public_summary
+from app.ai_detection.rule_check_display import build_rule_check_public_summary, derive_rule_check_status
 
 logger = logging.getLogger(__name__)
 
@@ -389,6 +389,34 @@ def clear_feedback_status(task_id: str) -> bool:
             return bool(cur.rowcount)
 
 
+def _normalize_detection_result(mode: str, outcome: Optional[Dict[str, Any]]) -> Optional[str]:
+    """从各模式异构的 outcome 中提取统一的检测结果：正常 / 可疑 / 篡改。"""
+    if not isinstance(outcome, dict):
+        return None
+    # sync_v1 / async_v3：结果在 outcome.result.result 两层嵌套
+    if mode in ("sync_v1", "async_v3"):
+        inner = outcome.get("result")
+        if isinstance(inner, dict):
+            v = inner.get("result")
+            if isinstance(v, str) and v:
+                return v
+        if isinstance(inner, str) and inner in ("正常", "可疑", "篡改"):
+            return inner
+        return None
+    # rule_checks：outcome 本身包含 hard_tamper_flags / pixel_overlap / timestamp / reason
+    if mode == "rule_checks":
+        return derive_rule_check_status(outcome)
+    # rule_pixel_overlap：outcome.result 是原始 pixel_overlap 数据
+    if mode == "rule_pixel_overlap":
+        pixel_data = outcome.get("result")
+        return derive_rule_check_status({"pixel_overlap": pixel_data} if isinstance(pixel_data, dict) else {})
+    # rule_timestamp：outcome.result 是原始 timestamp 数据
+    if mode == "rule_timestamp":
+        ts_data = outcome.get("result")
+        return derive_rule_check_status({"timestamp": ts_data} if isinstance(ts_data, dict) else {})
+    return None
+
+
 def list_ai_detection_history(
     *,
     page: int = 1,
@@ -476,6 +504,9 @@ def list_ai_detection_history(
                         item["linked_rule_checks"] = build_rule_check_public_summary(rule_row.get("outcome") or {})
                     else:
                         item["linked_rule_checks"] = None
+                item["detection_result"] = _normalize_detection_result(
+                    item.get("mode", ""), item.get("outcome")
+                )
                 rid = item.get("id")
                 stored = item.pop("stored_image", None)
                 if stored and rid is not None:

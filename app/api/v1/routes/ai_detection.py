@@ -1741,7 +1741,7 @@ async def detect_tampering_endpoint(
         "**单条字段**：`id`、`created_at`、`mode`（sync_v1 | async_v3 | rule_checks | rule_pixel_overlap | rule_timestamp）、"
         "`task_id`、`original_filename`、"
         "`bbox`、`status`（COMPLETED | FAILED）、`outcome`（含 `result` / `multi_results` / `error_msg` / 规则检测完整结果）、"
-        "`summary`（规则检测摘要，若有）、"
+        "`summary`（规则检测摘要，若有）、`detection_result`（统一鉴定结果：正常/可疑/篡改，已对所有 mode 做标准化提取）、"
         "`image_url`（有归档图时为 `GET /ai-detection/api/v1/history/{id}/image` 的路径前缀，否则为 null）。\n"
     ),
 )
