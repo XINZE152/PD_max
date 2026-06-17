@@ -58,6 +58,35 @@ def get_ai_detection_history_image_path(record_id: int) -> Optional[Path]:
     return p if p.is_file() else None
 
 
+def get_ai_detection_history_outcome(record_id: int) -> Optional[Dict[str, Any]]:
+    """按 ID 查询单条历史记录，返回 {image_path, outcome, mode} 或 None。"""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, mode, outcome_json, stored_image FROM ai_detection_history WHERE id=%s",
+                (record_id,),
+            )
+            row = cur.fetchone()
+    if not row:
+        return None
+    rid, mode, outcome_json, stored_image = row
+    if isinstance(outcome_json, str):
+        try:
+            outcome = json.loads(outcome_json)
+        except json.JSONDecodeError:
+            outcome = {}
+    else:
+        outcome = outcome_json or {}
+    image_path = None
+    if stored_image:
+        name = str(stored_image)
+        if not ("/" in name or "\\" in name or name.startswith(".")):
+            p = HISTORY_IMAGES_DIR / name
+            if p.is_file():
+                image_path = p
+    return {"id": rid, "mode": mode, "outcome": outcome, "image_path": image_path}
+
+
 def delete_ai_detection_history(record_id: int) -> bool:
     """删除单条鉴伪历史记录，并清理对应归档图。"""
     rid = int(record_id)

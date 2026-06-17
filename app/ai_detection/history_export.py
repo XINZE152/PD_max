@@ -281,7 +281,7 @@ def render_annotated_jpeg(image_path: Path, outcome: Dict[str, Any]) -> bytes:
     return buf.tobytes()
 
 
-def build_export_preview_item(row: Dict[str, Any]) -> Dict[str, Any]:
+def build_export_preview_item(row: Dict[str, Any], *, image_variant: ImageVariant = "original") -> Dict[str, Any]:
     outcome = _jsonish_outcome(row.get("outcome_json"))
     bbox_raw = row.get("bbox")
     if isinstance(bbox_raw, str):
@@ -291,7 +291,14 @@ def build_export_preview_item(row: Dict[str, Any]) -> Dict[str, Any]:
             pass
     rid = int(row["id"])
     has_image = resolve_record_image_path(rid, row.get("task_id"), row.get("stored_image")) is not None
-    image_url = f"/ai-detection/api/v1/history/{rid}/image" if has_image else None
+    if has_image:
+        image_url = (
+            f"/ai-detection/api/v1/history/{rid}/image/annotated"
+            if image_variant == "annotated"
+            else f"/ai-detection/api/v1/history/{rid}/image"
+        )
+    else:
+        image_url = None
     return {
         "id": rid,
         "created_at": row.get("created_at"),
@@ -367,7 +374,7 @@ def preview_export(
             feedback_by_task=feedback_by_task,
         ):
             continue
-        item = build_export_preview_item(row)
+        item = build_export_preview_item(row, image_variant=image_variant)
         item["feedback_status"] = effective_feedback_status(row, feedback_by_task)
         matched.append(item)
         if item["has_image"]:

@@ -23,7 +23,7 @@ import yaml
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 from PIL import Image, ImageDraw
 
@@ -38,12 +38,14 @@ from app.ai_detection.history_export import (
     EXPORT_MAX_RECORDS,
     build_export_zip,
     preview_export,
+    render_annotated_jpeg,
 )
 from app.ai_detection.history_db import (
     HISTORY_RETENTION_DAYS,
     clear_feedback_status,
     delete_ai_detection_history,
     get_ai_detection_history_image_path,
+    get_ai_detection_history_outcome,
     get_async_v3_history_by_task_id,
     get_feedback_status,
     get_latest_ai_detection_history_by_task_id,
@@ -1782,6 +1784,25 @@ async def get_detection_history_image(record_id: int):
         media_type="image/jpeg",
         filename=path.name,
     )
+
+
+@router.get(
+    "/api/v1/history/{record_id}/image/annotated",
+    summary="鉴伪历史标注图",
+    description="返回该条历史记录对应的标注图（带检测框与结论的 JPEG）。无归档或记录不存在时返回 404。",
+    response_class=Response,
+)
+async def get_detection_history_annotated_image(record_id: int):
+    data = await run_in_threadpool(get_ai_detection_history_outcome, record_id)
+    if data is None or data.get("image_path") is None:
+        raise HTTPException(status_code=404, detail="记录不存在或未归档图片")
+    try:
+        jpeg_bytes = await run_in_threadpool(
+            render_annotated_jpeg, data["image_path"], data["outcome"]
+        )
+    except ValueError:
+        raise HTTPException(status_code=422, detail="图片处理失败")
+    return Response(content=jpeg_bytes, media_type="image/jpeg")
 
 
 @router.delete(
