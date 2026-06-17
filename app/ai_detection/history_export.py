@@ -19,7 +19,9 @@ from PIL import Image, ImageDraw
 from app.ai_detection.core.utils import load_chinese_font
 from app.ai_detection.history_db import (
     HISTORY_IMAGES_DIR,
+    HISTORY_RETENTION_DAYS,
     get_ai_detection_history_image_path,
+    get_feedback_by_task_ids,
     query_ai_detection_history_for_export,
 )
 from app.config import UPLOAD_DIR
@@ -58,12 +60,15 @@ def classify_bbox_mode(bbox: Any) -> str:
         if all(k in bbox for k in ("x1", "y1", "x2", "y2")):
             return "manual"
         return "unknown"
-    if isinstance(bbox, list) and len(bbox) == 4:
-        try:
-            [int(x) for x in bbox]
+    if isinstance(bbox, list):
+        if len(bbox) == 4 and not isinstance(bbox[0], (list, tuple, dict)):
+            try:
+                [int(x) for x in bbox]
+                return "manual"
+            except (TypeError, ValueError):
+                return "unknown"
+        if len(bbox) >= 1 and isinstance(bbox[0], (list, tuple)) and len(bbox[0]) == 4:
             return "manual"
-        except (TypeError, ValueError):
-            return "unknown"
     return "unknown"
 
 
@@ -71,6 +76,8 @@ def extract_primary_detection_result(outcome: Dict[str, Any]) -> Optional[str]:
     inner = outcome.get("result")
     if isinstance(inner, dict) and inner.get("result"):
         return str(inner.get("result"))
+    if isinstance(inner, str) and inner in ("正常", "可疑", "篡改", "错误"):
+        return inner
     if isinstance(outcome.get("error_msg"), str) and outcome.get("error_msg"):
         return None
     return None
@@ -101,6 +108,67 @@ def record_matches_detection_filter(
         return bool(allowed.intersection(extract_all_detection_results(outcome)))
     primary = extract_primary_detection_result(outcome)
     return primary in allowed if primary else False
+
+
+def record_matches_feedback_filter(
+    row_feedback: Optional[str],
+    feedback_status: Optional[Sequence[str]],
+) -> bool:
+    if not feedback_status:
+        return True
+    allowed = {str(x).strip().lower() for x in feedback_status if str(x).strip()}
+    current = (str(row_feedback).strip().lower() if row_feedback else None)
+    want_unmarked = bool(allowed.intersection({"unmarked", "none", "null", "未标注"}))
+    if current in ("correct", "wrong", "suspicious"):
+        return current in allowed
+    return want_unmarked
+
+
+def _parse_bbox_row(row: Dict[str, Any]) -> Any:
+    bbox_raw = row.get("bbox")
+    if isinstance(bbox_raw, str):
+        try:
+            return json.loads(bbox_raw)
+        except json.JSONDecodeError:
+            return bbox_raw
+    return bbox_raw
+
+
+def effective_feedback_status(
+    row: Dict[str, Any],
+    feedback_by_task: Optional[Dict[str, Optional[str]]] = None,
+) -> Optional[str]:
+    """本行 feedback；rule 等无标注时回退同 task_id 的 async_v3 标注。"""
+    fb = row.get("feedback_status")
+    if fb:
+        return str(fb)
+    tid = str(row.get("task_id") or "").strip()
+    if tid and feedback_by_task:
+        return feedback_by_task.get(tid)
+    return None
+
+
+def row_passes_export_filters(
+    row: Dict[str, Any],
+    *,
+    detection_results: Optional[List[str]],
+    bbox_mode: BboxModeFilter,
+    match_mode: MatchMode,
+    feedback_status: Optional[List[str]],
+    feedback_by_task: Optional[Dict[str, Optional[str]]] = None,
+) -> bool:
+    outcome = _jsonish_outcome(row.get("outcome_json"))
+    if not record_matches_detection_filter(outcome, detection_results, match_mode):
+        return False
+    if not record_matches_feedback_filter(
+        effective_feedback_status(row, feedback_by_task),
+        feedback_status,
+    ):
+        return False
+    bbox_raw = _parse_bbox_row(row)
+    if bbox_mode != "all" and classify_bbox_mode(bbox_raw) != bbox_mode:
+        return False
+    return True
 
 
 def _safe_zip_name(original_filename: Optional[str], record_id: int, suffix: str = ".jpg") -> str:
@@ -212,6 +280,7 @@ def build_export_preview_item(row: Dict[str, Any]) -> Dict[str, Any]:
             pass
     rid = int(row["id"])
     has_image = resolve_record_image_path(rid, row.get("task_id"), row.get("stored_image")) is not None
+    image_url = f"/ai-detection/api/v1/history/{rid}/image" if has_image else None
     return {
         "id": rid,
         "created_at": row.get("created_at"),
@@ -223,45 +292,72 @@ def build_export_preview_item(row: Dict[str, Any]) -> Dict[str, Any]:
         "detection_results_all": extract_all_detection_results(outcome),
         "bbox_mode": classify_bbox_mode(bbox_raw),
         "has_image": has_image,
-        "image_url": f"/ai-detection/api/v1/history/{rid}/image" if has_image else None,
+        "image_url": image_url,
         "feedback_status": row.get("feedback_status"),
     }
 
 
-def preview_export(
+def _fetch_export_rows(
     *,
-    start_time: datetime,
-    end_time: datetime,
-    detection_results: Optional[List[str]] = None,
-    bbox_mode: BboxModeFilter = "all",
-    modes: Optional[List[str]] = None,
-    status: str = "COMPLETED",
-    match_mode: MatchMode = "primary",
-    image_variant: ImageVariant = "original",
-) -> Dict[str, Any]:
-    rows = query_ai_detection_history_for_export(
+    start_time: Optional[datetime],
+    end_time: Optional[datetime],
+    retention_days: Optional[int],
+    modes: Optional[List[str]],
+    status: Optional[str],
+) -> List[Dict[str, Any]]:
+    if retention_days is not None:
+        return query_ai_detection_history_for_export(
+            retention_days=retention_days,
+            modes=modes,
+            status=status,
+        )
+    assert start_time is not None and end_time is not None
+    return query_ai_detection_history_for_export(
         start_time=start_time,
         end_time=end_time,
         modes=modes,
         status=status,
-        bbox_mode=bbox_mode,
     )
+
+
+def preview_export(
+    *,
+    start_time: Optional[datetime] = None,
+    end_time: Optional[datetime] = None,
+    retention_days: Optional[int] = None,
+    detection_results: Optional[List[str]] = None,
+    bbox_mode: BboxModeFilter = "all",
+    modes: Optional[List[str]] = None,
+    status: Optional[str] = None,
+    match_mode: MatchMode = "primary",
+    image_variant: ImageVariant = "original",
+    feedback_status: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    rows = _fetch_export_rows(
+        start_time=start_time,
+        end_time=end_time,
+        retention_days=retention_days,
+        modes=modes,
+        status=status,
+    )
+    task_ids = [str(r.get("task_id") or "").strip() for r in rows if r.get("task_id")]
+    feedback_by_task = get_feedback_by_task_ids(task_ids)
+
     matched: List[Dict[str, Any]] = []
     with_image = 0
     without_image = 0
     for row in rows:
-        outcome = _jsonish_outcome(row.get("outcome_json"))
-        if not record_matches_detection_filter(outcome, detection_results, match_mode):
-            continue
-        bbox_raw = row.get("bbox")
-        if isinstance(bbox_raw, str):
-            try:
-                bbox_raw = json.loads(bbox_raw)
-            except json.JSONDecodeError:
-                pass
-        if bbox_mode != "all" and classify_bbox_mode(bbox_raw) != bbox_mode:
+        if not row_passes_export_filters(
+            row,
+            detection_results=detection_results,
+            bbox_mode=bbox_mode,
+            match_mode=match_mode,
+            feedback_status=feedback_status,
+            feedback_by_task=feedback_by_task,
+        ):
             continue
         item = build_export_preview_item(row)
+        item["feedback_status"] = effective_feedback_status(row, feedback_by_task)
         matched.append(item)
         if item["has_image"]:
             with_image += 1
@@ -271,6 +367,20 @@ def preview_export(
     total = len(matched)
     exceeds_limit = total > EXPORT_MAX_RECORDS
     list_slice = matched[:PREVIEW_MAX_LIST]
+    filters_applied: Dict[str, Any] = {
+        "detection_results": detection_results or [],
+        "bbox_mode": bbox_mode,
+        "modes": modes if modes else "all",
+        "status": status if status else "all",
+        "feedback_status": feedback_status or [],
+        "match_mode": match_mode,
+        "image_variant": image_variant,
+    }
+    if retention_days is not None:
+        filters_applied["retention_days"] = retention_days
+    else:
+        filters_applied["start_time"] = start_time.isoformat(sep=" ", timespec="seconds") if start_time else None
+        filters_applied["end_time"] = end_time.isoformat(sep=" ", timespec="seconds") if end_time else None
     return {
         "total_matched": total,
         "with_image": with_image,
@@ -279,38 +389,65 @@ def preview_export(
         "exceeds_limit": exceeds_limit,
         "preview_truncated": total > len(list_slice),
         "preview_list_size": len(list_slice),
-        "filters_applied": {
-            "start_time": start_time.isoformat(sep=" ", timespec="seconds"),
-            "end_time": end_time.isoformat(sep=" ", timespec="seconds"),
-            "detection_results": detection_results or [],
-            "bbox_mode": bbox_mode,
-            "modes": modes or ["async_v3", "sync_v1"],
-            "status": status,
-            "match_mode": match_mode,
-            "image_variant": image_variant,
-        },
+        "filters_applied": filters_applied,
         "list": list_slice,
     }
 
 
+def _manifest_filters(
+    *,
+    start_time: Optional[datetime],
+    end_time: Optional[datetime],
+    retention_days: Optional[int],
+    detection_results: Optional[List[str]],
+    bbox_mode: BboxModeFilter,
+    modes: Optional[List[str]],
+    status: Optional[str],
+    feedback_status: Optional[List[str]],
+    match_mode: MatchMode,
+    image_variant: ImageVariant,
+) -> Dict[str, Any]:
+    f: Dict[str, Any] = {
+        "detection_results": detection_results or [],
+        "bbox_mode": bbox_mode,
+        "modes": modes if modes else "all",
+        "status": status if status else "all",
+        "feedback_status": feedback_status or [],
+        "match_mode": match_mode,
+        "image_variant": image_variant,
+    }
+    if retention_days is not None:
+        f["retention_days"] = retention_days
+    else:
+        if start_time:
+            f["start_time"] = start_time.isoformat(sep=" ", timespec="seconds")
+        if end_time:
+            f["end_time"] = end_time.isoformat(sep=" ", timespec="seconds")
+    return f
+
+
 def build_export_zip(
     *,
-    start_time: datetime,
-    end_time: datetime,
+    start_time: Optional[datetime] = None,
+    end_time: Optional[datetime] = None,
+    retention_days: Optional[int] = None,
     detection_results: Optional[List[str]] = None,
     bbox_mode: BboxModeFilter = "all",
     modes: Optional[List[str]] = None,
-    status: str = "COMPLETED",
+    status: Optional[str] = None,
     match_mode: MatchMode = "primary",
     image_variant: ImageVariant = "original",
+    feedback_status: Optional[List[str]] = None,
 ) -> Tuple[bytes, str, Dict[str, Any]]:
-    rows = query_ai_detection_history_for_export(
+    rows = _fetch_export_rows(
         start_time=start_time,
         end_time=end_time,
+        retention_days=retention_days,
         modes=modes,
         status=status,
-        bbox_mode=bbox_mode,
     )
+    task_ids = [str(r.get("task_id") or "").strip() for r in rows if r.get("task_id")]
+    feedback_by_task = get_feedback_by_task_ids(task_ids)
 
     manifest_records: List[Dict[str, Any]] = []
     zip_buffer = io.BytesIO()
@@ -319,21 +456,22 @@ def build_export_zip(
 
     with zipfile.ZipFile(zip_buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
         for row in rows:
-            outcome = _jsonish_outcome(row.get("outcome_json"))
-            if not record_matches_detection_filter(outcome, detection_results, match_mode):
+            if not row_passes_export_filters(
+                row,
+                detection_results=detection_results,
+                bbox_mode=bbox_mode,
+                match_mode=match_mode,
+                feedback_status=feedback_status,
+                feedback_by_task=feedback_by_task,
+            ):
                 continue
 
             rid = int(row["id"])
-            bbox_raw = row.get("bbox")
-            if isinstance(bbox_raw, str):
-                try:
-                    bbox_raw = json.loads(bbox_raw)
-                except json.JSONDecodeError:
-                    pass
-            if bbox_mode != "all" and classify_bbox_mode(bbox_raw) != bbox_mode:
-                continue
+            bbox_raw = _parse_bbox_row(row)
             if len(manifest_records) >= EXPORT_MAX_RECORDS:
                 break
+
+            outcome = _jsonish_outcome(row.get("outcome_json"))
 
             img_path = resolve_record_image_path(rid, row.get("task_id"), row.get("stored_image"))
             entry_name = _safe_zip_name(row.get("original_filename"), rid)
@@ -371,7 +509,7 @@ def build_export_zip(
                     "detection_result": extract_primary_detection_result(outcome),
                     "confidence": inner.get("confidence") if isinstance(inner, dict) else None,
                     "bbox_mode": classify_bbox_mode(bbox_raw),
-                    "feedback_status": row.get("feedback_status"),
+                    "feedback_status": effective_feedback_status(row, feedback_by_task),
                     "zip_path": arcname,
                     "has_image_in_zip": bool(file_bytes),
                 }
@@ -382,16 +520,18 @@ def build_export_zip(
             "record_count": len(manifest_records),
             "images_added": images_added,
             "skipped_no_image": skipped_no_image,
-            "filters": {
-                "start_time": start_time.isoformat(sep=" ", timespec="seconds"),
-                "end_time": end_time.isoformat(sep=" ", timespec="seconds"),
-                "detection_results": detection_results or [],
-                "bbox_mode": bbox_mode,
-                "modes": modes or ["async_v3", "sync_v1"],
-                "status": status,
-                "match_mode": match_mode,
-                "image_variant": image_variant,
-            },
+            "filters": _manifest_filters(
+                start_time=start_time,
+                end_time=end_time,
+                retention_days=retention_days,
+                detection_results=detection_results,
+                bbox_mode=bbox_mode,
+                modes=modes,
+                status=status,
+                feedback_status=feedback_status,
+                match_mode=match_mode,
+                image_variant=image_variant,
+            ),
             "records": manifest_records,
         }
         zf.writestr(

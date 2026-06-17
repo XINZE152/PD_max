@@ -1799,8 +1799,20 @@ async def delete_detection_history(record_id: int):
 class HistoryExportRequest(BaseModel):
     """鉴伪历史导出/预览共用筛选条件。"""
 
-    start_time: datetime = Field(..., description="开始时间（含），ISO8601 或 YYYY-MM-DD HH:MM:SS")
-    end_time: datetime = Field(..., description="结束时间（含），须不早于 start_time")
+    retention_days: Optional[int] = Field(
+        None,
+        ge=1,
+        le=365,
+        description="与 GET /history 一致：最近 N 天（UTC）；传此项时可不传 start_time/end_time，且与列表条数对齐",
+    )
+    start_time: Optional[datetime] = Field(
+        None,
+        description="开始时间（含）；未传 retention_days 时必填",
+    )
+    end_time: Optional[datetime] = Field(
+        None,
+        description="结束时间（含）；未传 retention_days 时必填",
+    )
     detection_results: Optional[List[str]] = Field(
         None,
         description="鉴伪结论过滤：正常、可疑、篡改；不传或空数组表示全部",
@@ -1811,9 +1823,16 @@ class HistoryExportRequest(BaseModel):
     )
     modes: Optional[List[str]] = Field(
         None,
-        description="历史 mode，默认 async_v3,sync_v1（AI 鉴伪主流程）",
+        description="历史 mode；不传表示全部（与 GET /history 未传 mode 一致），如 async_v3,sync_v1,rule_checks",
     )
-    status: str = Field("COMPLETED", description="记录状态，默认仅成功完成的检测")
+    status: Optional[str] = Field(
+        None,
+        description="记录状态 COMPLETED/FAILED；不传表示全部",
+    )
+    feedback_status: Optional[List[str]] = Field(
+        None,
+        description="人工标注：correct、wrong、suspicious、unmarked（未标注）；可多选，不传表示全部",
+    )
     match_mode: str = Field(
         "primary",
         description="结论匹配：primary=按主结果 result；any=multi_results 任一条命中即保留",
@@ -1839,8 +1858,18 @@ class HistoryExportRequest(BaseModel):
 
 
 def _parse_history_export_request(req: HistoryExportRequest) -> HistoryExportRequest:
-    if req.end_time < req.start_time:
-        raise HTTPException(status_code=400, detail="end_time 不能早于 start_time")
+    from app.ai_detection.history_db import HISTORY_RETENTION_DAYS
+
+    if req.retention_days is None:
+        if req.start_time is None and req.end_time is None:
+            req.retention_days = HISTORY_RETENTION_DAYS
+        elif req.start_time is None or req.end_time is None:
+            raise HTTPException(
+                status_code=400,
+                detail="请传 retention_days，或同时传 start_time 与 end_time",
+            )
+        elif req.end_time < req.start_time:
+            raise HTTPException(status_code=400, detail="end_time 不能早于 start_time")
     bbox = (req.bbox_mode or "all").strip().lower()
     if bbox not in ("all", "manual", "auto"):
         raise HTTPException(status_code=400, detail="bbox_mode 须为 all、manual 或 auto")
@@ -1858,6 +1887,19 @@ def _parse_history_export_request(req: HistoryExportRequest) -> HistoryExportReq
                 status_code=400,
                 detail=f"detection_results 含非法值: {bad}，仅支持 正常、可疑、篡改",
             )
+    allowed_fb = {"correct", "wrong", "suspicious", "unmarked", "none", "null", "未标注"}
+    if req.feedback_status:
+        bad_fb = [x for x in req.feedback_status if str(x).strip().lower() not in allowed_fb]
+        if bad_fb:
+            raise HTTPException(
+                status_code=400,
+                detail=f"feedback_status 含非法值: {bad_fb}，支持 correct、wrong、suspicious、unmarked",
+            )
+    if req.status is not None:
+        st = str(req.status).strip().upper()
+        if st and st not in ("COMPLETED", "FAILED"):
+            raise HTTPException(status_code=400, detail="status 须为 COMPLETED、FAILED 或不传")
+        req.status = st or None  # type: ignore[assignment]
     req.bbox_mode = bbox  # type: ignore[assignment]
     req.match_mode = match  # type: ignore[assignment]
     req.image_variant = variant  # type: ignore[assignment]
@@ -1880,12 +1922,14 @@ async def history_export_preview(req: HistoryExportRequest):
             preview_export,
             start_time=req.start_time,
             end_time=req.end_time,
+            retention_days=req.retention_days,
             detection_results=req.detection_results,
             bbox_mode=req.bbox_mode,  # type: ignore[arg-type]
             modes=req.modes,
             status=req.status,
             match_mode=req.match_mode,  # type: ignore[arg-type]
             image_variant=req.image_variant,  # type: ignore[arg-type]
+            feedback_status=req.feedback_status,
         ),
     )
     return {"status": "success", **data}
@@ -1908,12 +1952,14 @@ async def history_export_download(req: HistoryExportRequest):
             preview_export,
             start_time=req.start_time,
             end_time=req.end_time,
+            retention_days=req.retention_days,
             detection_results=req.detection_results,
             bbox_mode=req.bbox_mode,  # type: ignore[arg-type]
             modes=req.modes,
             status=req.status,
             match_mode=req.match_mode,  # type: ignore[arg-type]
             image_variant=req.image_variant,  # type: ignore[arg-type]
+            feedback_status=req.feedback_status,
         ),
     )
     if preview["total_matched"] == 0:
@@ -1933,12 +1979,14 @@ async def history_export_download(req: HistoryExportRequest):
                 build_export_zip,
                 start_time=req.start_time,
                 end_time=req.end_time,
+                retention_days=req.retention_days,
                 detection_results=req.detection_results,
                 bbox_mode=req.bbox_mode,  # type: ignore[arg-type]
                 modes=req.modes,
                 status=req.status,
                 match_mode=req.match_mode,  # type: ignore[arg-type]
                 image_variant=req.image_variant,  # type: ignore[arg-type]
+                feedback_status=req.feedback_status,
             ),
         )
     except ValueError as exc:

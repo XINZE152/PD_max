@@ -316,6 +316,32 @@ def _jsonish(val: Any) -> Any:
     return val
 
 
+def get_feedback_by_task_ids(task_ids: Sequence[str]) -> Dict[str, Optional[str]]:
+    """批量查询各 task_id 在 async_v3 上的最新人工标注（供 rule 行继承）。"""
+    ids = [str(t).strip() for t in task_ids if str(t or "").strip()]
+    if not ids:
+        return {}
+    out: Dict[str, Optional[str]] = {i: None for i in ids}
+    placeholders = ", ".join(["%s"] * len(ids))
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT task_id, feedback_status
+                FROM ai_detection_history
+                WHERE mode='async_v3' AND task_id IN ({placeholders})
+                  AND feedback_status IS NOT NULL
+                ORDER BY id DESC
+                """,
+                tuple(ids),
+            )
+            for tid, fb in cur.fetchall():
+                key = str(tid)
+                if key in out and out[key] is None and fb:
+                    out[key] = str(fb)
+    return out
+
+
 def get_feedback_status(task_id: str) -> Optional[str]:
     """查询指定 task_id 的当前标注状态，返回 'correct' / 'wrong' / 'suspicious' 或 None（未标注）。"""
     tid = str(task_id or "").strip()
@@ -463,46 +489,51 @@ def list_ai_detection_history(
 
 def query_ai_detection_history_for_export(
     *,
-    start_time: datetime,
-    end_time: datetime,
+    start_time: Optional[datetime] = None,
+    end_time: Optional[datetime] = None,
+    retention_days: Optional[int] = None,
     modes: Optional[Sequence[str]] = None,
-    status: str = "COMPLETED",
-    bbox_mode: str = "all",
+    status: Optional[str] = None,
+    feedback_status: Optional[Sequence[str]] = None,
 ) -> List[Dict[str, Any]]:
     """
-    按时间范围导出查询（不触发保留期 purge）。
-    bbox_mode: all | manual | auto（manual/auto 在 SQL 层粗筛，边界 case 由导出层再判）。
+    导出查询（不触发保留期 purge）。
+    - 传 retention_days：与 GET /history 相同，created_at >= UTC 往前 N 天（推荐与列表对齐）。
+    - 否则用 start_time～end_time（含边界）。
+    modes 为空时不按 mode 过滤；status 为空不过滤状态。
+    feedback_status：correct / wrong / suspicious / unmarked；空表示不过滤。
     """
-    default_modes = ("async_v3", "sync_v1")
-    mode_list = [str(m).strip() for m in (modes or list(default_modes)) if str(m).strip()]
-    if not mode_list:
-        mode_list = list(default_modes)
+    mode_list = [str(m).strip() for m in (modes or []) if str(m).strip()]
+    status_val = str(status or "").strip()
 
-    status_val = str(status or "COMPLETED").strip() or "COMPLETED"
-    bbox_mode_val = str(bbox_mode or "all").strip().lower() or "all"
+    if retention_days is not None:
+        d = max(1, int(retention_days))
+        clauses = ["created_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL %s DAY)"]
+        params: List[Any] = [d]
+    else:
+        if start_time is None or end_time is None:
+            raise ValueError("须同时提供 start_time 与 end_time，或提供 retention_days")
+        clauses = ["created_at >= %s", "created_at <= %s"]
+        params = [start_time, end_time]
 
-    bbox_clause = ""
-    if bbox_mode_val == "auto":
-        bbox_clause = " AND JSON_EXTRACT(bbox, '$.auto_ocr') = true"
-    elif bbox_mode_val == "manual":
-        bbox_clause = (
-            " AND (JSON_TYPE(bbox) = 'ARRAY' OR "
-            "(JSON_TYPE(bbox) = 'OBJECT' AND JSON_EXTRACT(bbox, '$.x1') IS NOT NULL "
-            "AND (JSON_EXTRACT(bbox, '$.auto_ocr') IS NULL OR JSON_EXTRACT(bbox, '$.auto_ocr') = false)))"
-        )
+    if status_val:
+        clauses.append("status = %s")
+        params.append(status_val)
 
-    placeholders = ", ".join(["%s"] * len(mode_list))
+    if mode_list:
+        placeholders = ", ".join(["%s"] * len(mode_list))
+        clauses.append(f"mode IN ({placeholders})")
+        params.extend(mode_list)
+
+    # feedback_status 在导出层按「本行 + 同 task_id 的 async_v3」合并后再筛，避免 rule_* 行筛错
+
     sql = f"""
         SELECT id, created_at, mode, task_id, original_filename, bbox, status,
                outcome_json, stored_image, feedback_status
         FROM ai_detection_history
-        WHERE created_at >= %s AND created_at <= %s
-          AND status = %s
-          AND mode IN ({placeholders})
-          {bbox_clause}
+        WHERE {" AND ".join(clauses)}
         ORDER BY id DESC
     """
-    params: List[Any] = [start_time, end_time, status_val, *mode_list]
 
     rows_out: List[Dict[str, Any]] = []
     with get_conn() as conn:
