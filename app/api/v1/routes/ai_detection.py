@@ -67,6 +67,7 @@ from app.ai_detection.rule_check_history import (
     persist_rule_check_history,
 )
 from app.ai_detection.rule_check_service import (
+    merge_pixel_overlap_results,
     run_pixel_overlap_check,
     run_rule_checks,
     run_timestamp_check,
@@ -656,6 +657,26 @@ def _parse_bbox_form(bbox: str) -> List[int]:
     return [int(x) for x in parsed]
 
 
+def _parse_bboxes_form(raw: str) -> List[List[int]]:
+    """解析多框参数：JSON 数组的数组 [[x1,y1,x2,y2], ...]。
+
+    也兼容前端传单个框的数组形式 [[x1,y1,x2,y2]]。"""
+    clean = raw.strip().strip("'").strip('"').strip()
+    if not clean.startswith("["):
+        raise ValueError("bboxes 格式无效，请使用 [[x1,y1,x2,y2], ...]")
+    parsed = json.loads(clean)
+    if not isinstance(parsed, list):
+        raise ValueError("bboxes 必须是数组")
+    bboxes: List[List[int]] = []
+    for i, item in enumerate(parsed):
+        if not isinstance(item, list) or len(item) != 4:
+            raise ValueError(f"bboxes[{i}] 格式无效，每项须为 [x1,y1,x2,y2]")
+        bboxes.append([int(x) for x in item])
+    if not bboxes:
+        raise ValueError("bboxes 不能为空数组")
+    return bboxes
+
+
 class RuleCheckService:
     """规则类检测（像素重叠、时间戳），与完整 AI 鉴伪解耦。"""
 
@@ -671,6 +692,7 @@ class RuleCheckService:
         mode: str,
         original_filename: Optional[str],
         bbox: Optional[List[int]],
+        bboxes: Optional[List[List[int]]] = None,
         status: str,
         outcome: Dict[str, Any],
         tmp_path: Optional[str],
@@ -687,6 +709,7 @@ class RuleCheckService:
                 mode=mode,
                 original_filename=original_filename,
                 bbox=bbox,
+                bboxes=bboxes,
                 status=status,
                 outcome=outcome,
                 source_image_path=source_image_path,
@@ -702,6 +725,7 @@ class RuleCheckService:
         ocr_reader: Any,
         *,
         bbox_list: Optional[List[int]] = None,
+        bboxes_list: Optional[List[List[int]]] = None,
         business_datetime: Optional[str] = None,
         task_id: Optional[str] = None,
     ) -> Dict[str, Any]:
@@ -723,6 +747,7 @@ class RuleCheckService:
                         tmp_path,
                         engine.pixel_detector,
                         bbox_xyxy=bbox_list,
+                        bboxes=bboxes_list,
                         business_datetime=business_datetime,
                         ocr_tokens=ocr_tokens or None,
                         image_shape=image_shape,
@@ -735,10 +760,12 @@ class RuleCheckService:
                 mode=MODE_RULE_CHECKS,
                 original_filename=file.filename,
                 bbox=bbox_list,
+                bboxes=bboxes_list,
                 status="COMPLETED",
                 outcome=build_rule_checks_outcome(
                     data,
                     bbox=bbox_list,
+                    bboxes=bboxes_list,
                     document_time=business_datetime,
                 ),
                 tmp_path=tmp_path,
@@ -750,6 +777,7 @@ class RuleCheckService:
                 mode=MODE_RULE_CHECKS,
                 original_filename=file.filename,
                 bbox=bbox_list,
+                bboxes=bboxes_list,
                 status="FAILED",
                 outcome=build_rule_check_failed_outcome(
                     MODE_RULE_CHECKS,
@@ -819,32 +847,56 @@ class RuleCheckService:
     @staticmethod
     async def process_pixel_overlap(
         file: UploadFile,
-        bbox_list: List[int],
+        bbox_list: Optional[List[int]],
         engine: InferenceEngineAPI,
         semaphore: asyncio.Semaphore,
         *,
+        bboxes_list: Optional[List[List[int]]] = None,
         task_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         tmp_path: Optional[str] = None
         try:
             tmp_path = await RuleCheckService._save_upload_to_temp(file)
             async with semaphore:
-                data = await run_in_threadpool(
-                    partial(
-                        run_pixel_overlap_check,
-                        tmp_path,
-                        bbox_list,
-                        engine.pixel_detector,
-                        thresholds=engine.config.get("thresholds", {}),
-                        margin=int(engine.config.get("business_rules", {}).get("roi_expand_margin", 15)),
-                    ),
-                )
+                # 多框：逐个检测后合并；单框：直接检测
+                if bboxes_list:
+                    all_results: List[Dict[str, Any]] = []
+                    for bbox in bboxes_list:
+                        r = await run_in_threadpool(
+                            partial(
+                                run_pixel_overlap_check,
+                                tmp_path,
+                                bbox,
+                                engine.pixel_detector,
+                                thresholds=engine.config.get("thresholds", {}),
+                                margin=int(engine.config.get("business_rules", {}).get("roi_expand_margin", 15)),
+                            ),
+                        )
+                        all_results.append(r)
+                    if len(all_results) == 1:
+                        data = all_results[0]
+                    else:
+                        data = merge_pixel_overlap_results(all_results[0], all_results[1:])
+                elif bbox_list:
+                    data = await run_in_threadpool(
+                        partial(
+                            run_pixel_overlap_check,
+                            tmp_path,
+                            bbox_list,
+                            engine.pixel_detector,
+                            thresholds=engine.config.get("thresholds", {}),
+                            margin=int(engine.config.get("business_rules", {}).get("roi_expand_margin", 15)),
+                        ),
+                    )
+                else:
+                    raise ValueError("请提供 bbox 或 bboxes 参数")
             await RuleCheckService._persist_rule_check_history(
                 mode=MODE_RULE_PIXEL_OVERLAP,
                 original_filename=file.filename,
                 bbox=bbox_list,
+                bboxes=bboxes_list,
                 status="COMPLETED",
-                outcome=build_pixel_overlap_outcome(data, bbox=bbox_list),
+                outcome=build_pixel_overlap_outcome(data, bbox=bbox_list or (bboxes_list[0] if bboxes_list else []), bboxes=bboxes_list),
                 tmp_path=tmp_path,
                 task_id=task_id,
             )
@@ -854,6 +906,7 @@ class RuleCheckService:
                 mode=MODE_RULE_PIXEL_OVERLAP,
                 original_filename=file.filename,
                 bbox=bbox_list,
+                bboxes=bboxes_list,
                 status="FAILED",
                 outcome=build_rule_check_failed_outcome(
                     MODE_RULE_PIXEL_OVERLAP,
@@ -1439,6 +1492,7 @@ _RULE_CHECK_SCHEMA = (
         "**输入参数**\n"
         "- **file**：图片文件（必填）\n"
         "- **bbox**（可选）：检测框 `[x1,y1,x2,y2]`；传入则额外做 ROI 像素重叠检测\n"
+        "- **bboxes**（可选）：多框检测 `[[x1,y1,x2,y2], ...]`；优先级高于 bbox"
         "- **document_time**（可选）：业务单据时间，与图内交易时间比对\n"
         "- **task_id**（可选）：与 `async_v3` 主鉴伪任务关联，便于历史聚合\n\n"
         "**说明**：可与 `POST .../api/v3/detect` 并行调用；主鉴伪接口不再包含像素重叠与时间戳。"
@@ -1452,6 +1506,11 @@ async def rule_checks_endpoint(
         None,
         description="可选。像素重叠检测 ROI：[x1,y1,x2,y2]",
         examples=["[120,80,400,140]"],
+    ),
+    bboxes: Optional[str] = Form(
+        None,
+        description="可选。多框像素重叠检测：[[x1,y1,x2,y2], ...]，优先级高于 bbox",
+        examples=["[[120,80,400,140],[500,200,700,350]]"],
     ),
     document_time: Optional[str] = Form(
         None,
@@ -1467,7 +1526,13 @@ async def rule_checks_endpoint(
     semaphore: asyncio.Semaphore = Depends(get_ai_semaphore),
 ):
     bbox_list: Optional[List[int]] = None
-    if bbox:
+    bboxes_list: Optional[List[List[int]]] = None
+    if bboxes:
+        try:
+            bboxes_list = _parse_bboxes_form(bboxes)
+        except Exception:
+            raise HTTPException(status_code=400, detail="bboxes 格式无效，请使用 [[x1,y1,x2,y2], ...]")
+    elif bbox:
         try:
             bbox_list = _parse_bbox_form(bbox)
         except Exception:
@@ -1479,6 +1544,7 @@ async def rule_checks_endpoint(
             semaphore,
             ocr_reader,
             bbox_list=bbox_list,
+            bboxes_list=bboxes_list,
             business_datetime=document_time,
             task_id=task_id,
         )
@@ -1494,29 +1560,45 @@ async def rule_checks_endpoint(
         "对指定 ROI 执行像素重叠/拼接规则检测（OpenCV + 统计阈值），不执行完整 AI 鉴伪。\n\n"
         "**请求方式**：`multipart/form-data`\n\n"
         "- **file**：图片文件（必填）\n"
-        "- **bbox**：检测框 `[x1,y1,x2,y2]`（必填）\n"
+        "- **bbox**：检测框 `[x1,y1,x2,y2]`（与 bboxes 二选一）\n"
+        "- **bboxes**：多框检测 `[[x1,y1,x2,y2], ...]`（与 bbox 二选一，优先级高于 bbox）\n"
         "- **task_id**（可选）：与主鉴伪 async_v3 任务关联\n"
         "\n成功/失败写入 `ai_detection_history`（`mode=rule_pixel_overlap`）。\n"
     ),
 )
 async def pixel_overlap_check_endpoint(
     file: UploadFile = File(..., description="待检测图片文件"),
-    bbox: str = Form(
-        ...,
-        description="像素重叠检测 ROI：[x1,y1,x2,y2]",
+    bbox: Optional[str] = Form(
+        None,
+        description="像素重叠检测 ROI：[x1,y1,x2,y2]（与 bboxes 二选一）",
         examples=["[120,80,400,140]"],
+    ),
+    bboxes: Optional[str] = Form(
+        None,
+        description="多框像素重叠检测：[[x1,y1,x2,y2], ...]（与 bbox 二选一，优先级高于 bbox）",
+        examples=["[[120,80,400,140],[500,200,700,350]]"],
     ),
     task_id: Optional[str] = Form(None, description="可选。与主鉴伪 async_v3 任务关联的 UUID"),
     engine: InferenceEngineAPI = Depends(get_engine),
     semaphore: asyncio.Semaphore = Depends(get_ai_semaphore),
 ):
-    try:
-        bbox_list = _parse_bbox_form(bbox)
-    except Exception:
-        raise HTTPException(status_code=400, detail="bbox 格式无效，请使用 [x1,y1,x2,y2] 或 x1,y1,x2,y2")
+    bbox_list: Optional[List[int]] = None
+    bboxes_list: Optional[List[List[int]]] = None
+    if bboxes:
+        try:
+            bboxes_list = _parse_bboxes_form(bboxes)
+        except Exception:
+            raise HTTPException(status_code=400, detail="bboxes 格式无效，请使用 [[x1,y1,x2,y2], ...]")
+    elif bbox:
+        try:
+            bbox_list = _parse_bbox_form(bbox)
+        except Exception:
+            raise HTTPException(status_code=400, detail="bbox 格式无效，请使用 [x1,y1,x2,y2] 或 x1,y1,x2,y2")
+    else:
+        raise HTTPException(status_code=400, detail="请提供 bbox 或 bboxes 参数")
     try:
         data = await RuleCheckService.process_pixel_overlap(
-            file, bbox_list, engine, semaphore, task_id=task_id,
+            file, bbox_list, engine, semaphore, bboxes_list=bboxes_list, task_id=task_id,
         )
         return {"status": "success", "data": data}
     except ValueError as exc:

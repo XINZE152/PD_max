@@ -111,6 +111,10 @@ def evaluate_pixel_overlap_alert(
     if blend >= blend_alert and not is_small:
         return True
     if text_splice >= text_splice_alert and ela >= ela_corroboration_min and not is_small:
+        # 纯 text_splice（ela/noise 极高但 blend 和 de 都极低）可能源于
+        # 整图 JPEG 重压缩伪影而非局部拼接，需至少一项佐证
+        if blend < 0.15 and double_edge < 0.04:
+            return False
         return True
     if ela >= ela_corroboration_min and structural >= structural_text_min:
         return True
@@ -169,8 +173,22 @@ def evaluate_pixel_overlap_hard_tamper(
     has_blend_signal = _pixel_overlap_has_blend_corroboration(metrics, thresholds, roi_area=roi_area)
     has_text_splice_signal = _pixel_overlap_has_text_splice_corroboration(metrics, thresholds, roi_area=roi_area)
 
-    if score >= thresh_overlap_absolute and (has_blend_signal or has_text_splice_signal):
-        return True
+    if score >= thresh_overlap_absolute:
+        # blend/de 是强篡改信号，可直接硬判
+        if has_blend_signal:
+            return True
+        # 纯 text_splice（无 blend/de 佐证）可能源于全局 JPEG 压缩伪影而非局部篡改
+        # 要求其他检测系统佐证，避免整图重压缩导致的系统性误报
+        if has_text_splice_signal:
+            if not requires_corroboration:
+                return True
+            signals = corroboration_signals or {}
+            return bool(
+                signals.get("global_fake")
+                or signals.get("pixel_anomaly")
+                or signals.get("font_anomaly")
+                or signals.get("semantic_anomaly")
+            )
     if score < thresh_overlap_hard:
         if has_text_splice_signal and score >= float(thresholds.get("pixel_overlap_text_hard_score", 0.48)):
             signals = corroboration_signals or {}
@@ -336,6 +354,22 @@ def merge_pixel_overlap_results(
             }
         )
     merged["auto_scan_regions"] = regions
+
+    # 多框手动检测时，附带每个框的完整结果供前端展示
+    per_bbox_results: List[Dict[str, Any]] = []
+    for row in items:
+        per_bbox_results.append(
+            {
+                "bbox_xyxy": row.get("bbox_xyxy"),
+                "pixel_overlap_score": row.get("pixel_overlap_score"),
+                "overlap_metrics": row.get("overlap_metrics"),
+                "alert": bool(row.get("alert")),
+                "hard_tamper": bool(row.get("hard_tamper")),
+                "reasons": row.get("reasons") or [],
+            }
+        )
+    merged["per_bbox_results"] = per_bbox_results
+
     return merged
 
 
@@ -344,6 +378,7 @@ def run_rule_checks(
     pixel_detector: PixelLevelDetector,
     *,
     bbox_xyxy: Optional[Sequence[int]] = None,
+    bboxes: Optional[List[Sequence[int]]] = None,
     business_datetime: Optional[str] = None,
     ocr_tokens: Optional[Sequence[Any]] = None,
     image_shape: Optional[Tuple[int, int, int]] = None,
@@ -353,29 +388,46 @@ def run_rule_checks(
     corroboration_signals: Optional[Dict[str, bool]] = None,
     image_bgr: Optional[Any] = None,
 ) -> Dict[str, Any]:
-    """聚合规则检测：像素重叠（仅手动传入 bbox 时执行）+ 时间戳。
+    """聚合规则检测：像素重叠（手动传入 bbox/bboxes 时执行）+ 时间戳。
 
-    未传 bbox 时通过 OCR 定位建议检测区域（suggested_rois），供前端展示勾选。"""
+    未传 bbox/bboxes 时通过 OCR 定位建议检测区域（suggested_rois），供前端展示勾选。
+
+    bbox_xyxy: 单框检测（向后兼容）；bboxes: 多框检测（优先级高于 bbox_xyxy）。"""
     rules = business_rules or {}
     margin = int(rules.get("roi_expand_margin", 15))
     thresh = thresholds or {}
 
-    # 像素重叠检测：仅当手动传入 bbox 时执行
+    # 像素重叠检测：仅当手动传入 bbox/bboxes 时执行
     pixel_overlap: Optional[Dict[str, Any]] = None
     pixel_overlap_source: Optional[str] = None
     suggested_rois: Optional[List[Dict[str, Any]]] = None
 
-    if bbox_xyxy is not None:
-        pixel_overlap = run_pixel_overlap_check(
-            image_path,
-            bbox_xyxy,
-            pixel_detector,
-            thresholds=thresh,
-            margin=margin,
-            bbox_format=bbox_format,
-            corroboration_signals=corroboration_signals,
-            image_bgr=image_bgr,
-        )
+    # 多框优先于单框
+    effective_bboxes: Optional[List[Sequence[int]]] = None
+    if bboxes:
+        effective_bboxes = list(bboxes)
+    elif bbox_xyxy is not None:
+        effective_bboxes = [bbox_xyxy]
+
+    if effective_bboxes is not None:
+        all_results: List[Dict[str, Any]] = []
+        for bbox in effective_bboxes:
+            result = run_pixel_overlap_check(
+                image_path,
+                bbox,
+                pixel_detector,
+                thresholds=thresh,
+                margin=margin,
+                bbox_format=bbox_format,
+                corroboration_signals=corroboration_signals,
+                image_bgr=image_bgr,
+            )
+            all_results.append(result)
+
+        if len(all_results) == 1:
+            pixel_overlap = all_results[0]
+        else:
+            pixel_overlap = merge_pixel_overlap_results(all_results[0], all_results[1:])
         pixel_overlap_source = "manual_bbox"
     elif ocr_tokens and image_shape:
         # 未传 bbox：通过 OCR 定位建议检测区域
