@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 
 HISTORY_RETENTION_DAYS = int(os.getenv("AI_DETECTION_HISTORY_DAYS", "7"))
 HISTORY_IMAGES_DIR = Path(UPLOAD_DIR) / "ai_detection_history_images"
+HISTORY_STORAGE_DIR = Path(UPLOAD_DIR) / "ai_detection_storage"
 HISTORY_ORIGINAL_FILENAME_MAX = 512
 
 
@@ -63,13 +64,13 @@ def get_ai_detection_history_outcome(record_id: int) -> Optional[Dict[str, Any]]
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT id, mode, outcome_json, stored_image FROM ai_detection_history WHERE id=%s",
+                "SELECT id, mode, task_id, outcome_json, stored_image FROM ai_detection_history WHERE id=%s",
                 (record_id,),
             )
             row = cur.fetchone()
     if not row:
         return None
-    rid, mode, outcome_json, stored_image = row
+    rid, mode, task_id, outcome_json, stored_image = row
     if isinstance(outcome_json, str):
         try:
             outcome = json.loads(outcome_json)
@@ -84,6 +85,10 @@ def get_ai_detection_history_outcome(record_id: int) -> Optional[Dict[str, Any]]
             p = HISTORY_IMAGES_DIR / name
             if p.is_file():
                 image_path = p
+    if image_path is None and task_id:
+        p = HISTORY_STORAGE_DIR / f"{task_id}.jpg"
+        if p.is_file():
+            image_path = p
     return {"id": rid, "mode": mode, "outcome": outcome, "image_path": image_path}
 
 

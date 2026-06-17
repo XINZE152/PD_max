@@ -1860,7 +1860,7 @@ class HistoryExportRequest(BaseModel):
     )
     image_variant: str = Field(
         "original",
-        description="导出图片类型：original=原图，annotated=在原图上绘制检测框与结论（仅 export 生效）",
+        description="图片类型：original=原图，annotated=在原图上绘制检测框与结论（预览与导出均生效）",
     )
 
     model_config = ConfigDict(
