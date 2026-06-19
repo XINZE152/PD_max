@@ -8,6 +8,7 @@ import cv2
 import numpy as np
 
 from app.ai_detection.amount_candidates import OCRToken, build_amount_candidates, tokenize_ocr_results
+from app.ai_detection.rule_check_roi import find_key_field_rois
 
 
 def run_full_image_ocr(
@@ -36,3 +37,11 @@ def build_detection_bboxes_from_tokens(
 ) -> List[List[int]]:
     """从 OCR token 构建金额/数字候选框列表，供 IoU 重叠鉴伪使用。"""
     return [list(candidate.bbox) for candidate in build_amount_candidates(tokens, image_shape)]
+
+
+def build_key_field_rois_from_tokens(
+    tokens: Sequence[OCRToken],
+    image_shape: Tuple[int, int, int],
+) -> List[dict]:
+    """从 OCR token 构建 v3 自动检测框：金额、姓名、时间。"""
+    return find_key_field_rois(tokens, image_shape)

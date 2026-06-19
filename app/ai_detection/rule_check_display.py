@@ -70,7 +70,7 @@ def build_rule_check_public_summary(data: Optional[Dict[str, Any]]) -> Dict[str,
     elif suggested:
         pixel_item = {
             "passed": True,
-            "message": f"未指定检测区域，已自动识别 {len(suggested)} 个建议检测区域（金额/账号/时间/单号等），请勾选后重新检测",
+            "message": f"未指定检测区域，已自动识别 {len(suggested)} 个建议检测区域（金额/姓名/时间），请勾选后重新检测",
             "suggested_rois": suggested,
         }
     else:
