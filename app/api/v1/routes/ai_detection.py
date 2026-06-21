@@ -87,6 +87,7 @@ STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 MAX_CONCURRENT_AI_TASKS = int(os.getenv("AI_MAX_CONCURRENT_TASKS", "1"))
 GC_MAX_AGE_HOURS = int(os.getenv("AI_GC_MAX_AGE_HOURS", "24"))
 GC_INTERVAL_SECONDS = int(os.getenv("AI_GC_INTERVAL_SECONDS", "3600"))
+FORGEGUARD_REPLACE_RULE_CHECKS = os.getenv("FORGEGUARD_REPLACE_RULE_CHECKS", "").strip().lower() in ("1", "true", "yes")
 
 TASK_INTERRUPTED_MSG = (
     "检测任务已中断：后端进程曾退出并重新启动（常见于崩溃后自动拉起、部署或内存不足），"
@@ -720,6 +721,88 @@ class RuleCheckService:
         )
 
     @staticmethod
+    async def _process_via_forgeguard(
+        file: UploadFile,
+        *,
+        bbox_list: Optional[List[int]] = None,
+        bboxes_list: Optional[List[List[int]]] = None,
+        business_datetime: Optional[str] = None,
+        task_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """FORGEGUARD_REPLACE_RULE_CHECKS=1 时，将规则检测请求转发到 ForgeGuard /verify。"""
+        from app.ai_detection.forgeguard_client import forgeguard_verify
+
+        image_bytes = await file.read()
+        if not image_bytes:
+            raise ValueError("上传文件为空")
+        filename = file.filename or "image.jpg"
+
+        roi_bbox = bbox_list
+        detection_bboxes = bboxes_list
+        if roi_bbox is None and detection_bboxes:
+            roi_bbox = detection_bboxes[0]
+
+        if roi_bbox is None:
+            raise ValueError("ForgeGuard 替换模式下须提供 bbox 或 bboxes")
+
+        raw = await run_in_threadpool(
+            forgeguard_verify,
+            image_bytes,
+            roi_bbox=roi_bbox,
+            detection_bboxes=detection_bboxes,
+            filename=filename,
+        )
+
+        data = raw.get("data") or raw
+        htf = data.get("hard_tamper_flags") or {}
+        overlap = data.get("bbox_overlap_check") or {}
+
+        converted: Dict[str, Any] = {
+            "pixel_overlap": {
+                "pixel_overlap_score": data.get("confidence", 0),
+                "alert": bool(htf.get("bbox_iou")) or data.get("result") in ("篡改", "可疑"),
+                "hard_tamper": bool(htf.get("bbox_iou")),
+                "bbox": data.get("bbox"),
+                "reasons": [data.get("reason", "")] if data.get("reason") else [],
+                "overlap_metrics": {},
+            },
+            "pixel_overlap_source": "forgeguard",
+            "suggested_rois": None,
+            "timestamp": {
+                "timestamp_check": {},
+                "risk": data.get("confidence", 0),
+                "reasons": [],
+                "anomalies": [],
+                "hard_tamper": False,
+                "business_mismatch": False,
+            },
+            "hard_tamper_flags": {
+                "pixel_overlap": bool(htf.get("bbox_iou")),
+                "timestamp": False,
+            },
+            "reason": data.get("reason") or "未检出明显规则类异常",
+            "forgeguard_overlap": overlap,
+        }
+
+        await RuleCheckService._persist_rule_check_history(
+            mode=MODE_RULE_CHECKS,
+            original_filename=file.filename,
+            bbox=bbox_list,
+            bboxes=bboxes_list,
+            status="COMPLETED",
+            outcome=build_rule_checks_outcome(
+                converted,
+                bbox=bbox_list,
+                bboxes=bboxes_list,
+                document_time=business_datetime,
+            ),
+            tmp_path=None,
+            task_id=task_id,
+        )
+
+        return converted
+
+    @staticmethod
     async def process_rule_checks(
         file: UploadFile,
         engine: InferenceEngineAPI,
@@ -733,6 +816,11 @@ class RuleCheckService:
     ) -> Dict[str, Any]:
         tmp_path: Optional[str] = None
         try:
+            if FORGEGUARD_REPLACE_RULE_CHECKS:
+                return await RuleCheckService._process_via_forgeguard(
+                    file, bbox_list=bbox_list, bboxes_list=bboxes_list,
+                    business_datetime=business_datetime, task_id=task_id,
+                )
             tmp_path = await RuleCheckService._save_upload_to_temp(file)
             async with semaphore:
                 img_cv2, ocr_tokens = await run_in_threadpool(run_full_image_ocr, tmp_path, ocr_reader)
