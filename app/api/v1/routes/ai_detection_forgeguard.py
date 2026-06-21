@@ -87,6 +87,49 @@ async def forgeguard_health_check():
 
 
 # ---------------------------------------------------------------------------
+# GET /api/v1/forgeguard/status — 诊断 / 可用性检查
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/api/v1/forgeguard/status",
+    summary="ForgeGuard 诊断检查",
+    description=(
+        "综合检查 ForgeGuard 连通性、模型状态、替换模式是否开启。适合用于排查集成问题。"
+    ),
+)
+async def forgeguard_status_check():
+    import os as _os
+
+    result: Dict[str, Any] = {
+        "forgeguard_base_url": FORGEGUARD_BASE_URL,
+        "forgeguard_api_key_configured": bool(FORGEGUARD_API_KEY),
+        "replacement_mode": _os.getenv("FORGEGUARD_REPLACE_RULE_CHECKS", "").strip().lower() in ("1", "true", "yes"),
+        "connectivity": "unknown",
+        "model_loaded": False,
+        "build": None,
+    }
+    try:
+        data = await run_in_threadpool(forgeguard_health)
+        result["connectivity"] = "ok"
+        result["model_loaded"] = bool(data.get("dl_model_loaded"))
+        result["build"] = data.get("build")
+        result["auth_enabled"] = bool(data.get("auth_enabled"))
+        result["rate_limit_rpm"] = data.get("rate_limit_rpm")
+        result["max_concurrent"] = data.get("max_concurrent")
+    except requests.ConnectionError:
+        result["connectivity"] = "unreachable"
+    except requests.Timeout:
+        result["connectivity"] = "timeout"
+    except Exception as exc:
+        result["connectivity"] = "error"
+        result["error"] = str(exc)
+
+    result["available"] = result["connectivity"] == "ok" and result["model_loaded"]
+    return {"status": "success", "diagnosis": result}
+
+
+# ---------------------------------------------------------------------------
 # POST /api/v1/forgeguard/detect — 整图篡改检测
 # ---------------------------------------------------------------------------
 
