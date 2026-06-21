@@ -12,6 +12,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 
 from app.ai_detection.forgeguard_client import (
+    FORGEGUARD_API_KEY,
     FORGEGUARD_BASE_URL,
     forgeguard_detect,
     forgeguard_health,

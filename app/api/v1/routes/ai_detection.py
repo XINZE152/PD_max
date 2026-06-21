@@ -730,7 +730,13 @@ class RuleCheckService:
         task_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """FORGEGUARD_REPLACE_RULE_CHECKS=1 时，将规则检测请求转发到 ForgeGuard。"""
-        from app.ai_detection.forgeguard_client import forgeguard_detect, forgeguard_verify
+        import requests as _requests
+
+        from app.ai_detection.forgeguard_client import (
+            FORGEGUARD_BASE_URL,
+            forgeguard_detect,
+            forgeguard_verify,
+        )
 
         image_bytes = await file.read()
         if not image_bytes:
@@ -742,113 +748,141 @@ class RuleCheckService:
         if roi_bbox is None and detection_bboxes:
             roi_bbox = detection_bboxes[0]
 
-        if roi_bbox is not None:
-            # 有 bbox → /verify（区域验证 + 重叠分析）
-            raw = await run_in_threadpool(
-                forgeguard_verify,
-                image_bytes,
-                roi_bbox=roi_bbox,
-                detection_bboxes=detection_bboxes,
-                filename=filename,
-            )
-            data = raw.get("data") or raw
-            htf = data.get("hard_tamper_flags") or {}
-            overlap = data.get("bbox_overlap_check") or {}
+        tmp_path: Optional[str] = None
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
+                tmp.write(image_bytes)
+                tmp_path = tmp.name
+            if roi_bbox is not None:
+                # 有 bbox → /verify（区域验证 + 重叠分析）
+                raw = await run_in_threadpool(
+                    forgeguard_verify,
+                    image_bytes,
+                    roi_bbox=roi_bbox,
+                    detection_bboxes=detection_bboxes,
+                    filename=filename,
+                )
+                data = raw.get("data") or raw
+                htf = data.get("hard_tamper_flags") or {}
+                overlap = data.get("bbox_overlap_check") or {}
 
-            converted: Dict[str, Any] = {
-                "pixel_overlap": {
-                    "pixel_overlap_score": data.get("confidence", 0),
-                    "alert": bool(htf.get("bbox_iou")) or data.get("result") in ("篡改", "可疑"),
-                    "hard_tamper": bool(htf.get("bbox_iou")),
-                    "bbox": data.get("bbox"),
-                    "reasons": [data.get("reason", "")] if data.get("reason") else [],
-                    "overlap_metrics": {},
-                },
-                "pixel_overlap_source": "forgeguard_verify",
-                "suggested_rois": None,
-                "timestamp": {
-                    "timestamp_check": {},
-                    "risk": data.get("confidence", 0),
-                    "reasons": [],
-                    "anomalies": [],
-                    "hard_tamper": False,
-                    "business_mismatch": False,
-                },
-                "hard_tamper_flags": {
-                    "pixel_overlap": bool(htf.get("bbox_iou")),
-                    "timestamp": False,
-                },
-                "reason": data.get("reason") or "未检出明显规则类异常",
-                "forgeguard_overlap": overlap,
-            }
-        else:
-            # 无 bbox → /detect（整图三引擎检测）
-            raw = await run_in_threadpool(
-                forgeguard_detect, image_bytes, filename=filename, technique="auto",
-            )
-            prediction = raw.get("prediction", "authentic")
-            confidence = float(raw.get("confidence", 0) or 0)
-            is_tampered = prediction == "forged"
-            is_suspicious = prediction == "uncertain"
-            regions = raw.get("forgery_regions") or []
+                converted: Dict[str, Any] = {
+                    "pixel_overlap": {
+                        "pixel_overlap_score": data.get("confidence", 0),
+                        "alert": bool(htf.get("bbox_iou")) or data.get("result") in ("篡改", "可疑"),
+                        "hard_tamper": bool(htf.get("bbox_iou")),
+                        "bbox": data.get("bbox"),
+                        "reasons": [data.get("reason", "")] if data.get("reason") else [],
+                        "overlap_metrics": {},
+                    },
+                    "pixel_overlap_source": "forgeguard_verify",
+                    "suggested_rois": None,
+                    "timestamp": {
+                        "timestamp_check": {},
+                        "risk": data.get("confidence", 0),
+                        "reasons": [],
+                        "anomalies": [],
+                        "hard_tamper": False,
+                        "business_mismatch": False,
+                    },
+                    "hard_tamper_flags": {
+                        "pixel_overlap": bool(htf.get("bbox_iou")),
+                        "timestamp": False,
+                    },
+                    "reason": data.get("reason") or "未检出明显规则类异常",
+                    "forgeguard_overlap": overlap,
+                }
+            else:
+                # 无 bbox → /detect（整图三引擎检测）
+                raw = await run_in_threadpool(
+                    forgeguard_detect, image_bytes, filename=filename, technique="auto",
+                )
+                prediction = raw.get("prediction", "authentic")
+                confidence = float(raw.get("confidence", 0) or 0)
+                is_tampered = prediction == "forged"
+                is_suspicious = prediction == "uncertain"
+                regions = raw.get("forgery_regions") or []
 
-            converted = {
-                "pixel_overlap": {
-                    "pixel_overlap_score": confidence,
-                    "alert": is_tampered or is_suspicious,
-                    "hard_tamper": is_tampered,
-                    "reasons": [f"ForgeGuard 整图: {prediction} (confidence={confidence:.2f})"],
-                    "overlap_metrics": {},
-                },
-                "pixel_overlap_source": "forgeguard_detect",
-                "suggested_rois": [
-                    {
-                        "bbox": [r.get("x"), r.get("y"), r.get("w"), r.get("h")],
-                        "label": r.get("label", ""),
-                        "type": r.get("type", ""),
-                        "source": "forgeguard",
-                    }
-                    for r in regions
-                ] if regions else None,
-                "timestamp": {
-                    "timestamp_check": {},
-                    "risk": confidence,
-                    "reasons": [],
-                    "anomalies": [],
-                    "hard_tamper": False,
-                    "business_mismatch": False,
-                },
-                "hard_tamper_flags": {
-                    "pixel_overlap": is_tampered,
-                    "timestamp": False,
-                },
-                "reason": f"ForgeGuard 整图: {prediction} (confidence={confidence:.2f})",
-                "forgeguard_detect": {
-                    "prediction": prediction,
-                    "confidence": confidence,
-                    "technique": raw.get("technique"),
-                    "votes_forged": raw.get("votes_forged"),
-                    "detectors": raw.get("detectors"),
-                },
-            }
+                converted = {
+                    "pixel_overlap": {
+                        "pixel_overlap_score": confidence,
+                        "alert": is_tampered or is_suspicious,
+                        "hard_tamper": is_tampered,
+                        "reasons": [f"ForgeGuard 整图: {prediction} (confidence={confidence:.2f})"],
+                        "overlap_metrics": {},
+                    },
+                    "pixel_overlap_source": "forgeguard_detect",
+                    "suggested_rois": [
+                        {
+                            "bbox": [r.get("x"), r.get("y"), r.get("w"), r.get("h")],
+                            "label": r.get("label", ""),
+                            "type": r.get("type", ""),
+                            "source": "forgeguard",
+                        }
+                        for r in regions
+                    ] if regions else None,
+                    "timestamp": {
+                        "timestamp_check": {},
+                        "risk": confidence,
+                        "reasons": [],
+                        "anomalies": [],
+                        "hard_tamper": False,
+                        "business_mismatch": False,
+                    },
+                    "hard_tamper_flags": {
+                        "pixel_overlap": is_tampered,
+                        "timestamp": False,
+                    },
+                    "reason": f"ForgeGuard 整图: {prediction} (confidence={confidence:.2f})",
+                    "forgeguard_detect": {
+                        "prediction": prediction,
+                        "confidence": confidence,
+                        "technique": raw.get("technique"),
+                        "votes_forged": raw.get("votes_forged"),
+                        "detectors": raw.get("detectors"),
+                    },
+                }
 
-        await RuleCheckService._persist_rule_check_history(
-            mode=MODE_RULE_CHECKS,
-            original_filename=file.filename,
-            bbox=bbox_list,
-            bboxes=bboxes_list,
-            status="COMPLETED",
-            outcome=build_rule_checks_outcome(
-                converted,
+            await RuleCheckService._persist_rule_check_history(
+                mode=MODE_RULE_CHECKS,
+                original_filename=file.filename,
                 bbox=bbox_list,
                 bboxes=bboxes_list,
-                document_time=business_datetime,
-            ),
-            tmp_path=None,
-            task_id=task_id,
-        )
+                status="COMPLETED",
+                outcome=build_rule_checks_outcome(
+                    converted,
+                    bbox=bbox_list,
+                    bboxes=bboxes_list,
+                    document_time=business_datetime,
+                ),
+                tmp_path=tmp_path,
+                task_id=task_id,
+            )
 
-        return converted
+            return converted
+
+        except _requests.ConnectionError:
+            raise ValueError(f"ForgeGuard 服务连接失败 ({FORGEGUARD_BASE_URL})，请确认服务已启动")
+        except _requests.Timeout:
+            raise ValueError(f"ForgeGuard 服务响应超时 ({FORGEGUARD_BASE_URL})")
+        except _requests.HTTPError as exc:
+            detail = str(exc)
+            try:
+                detail = str(exc.response.json() if exc.response is not None else str(exc))
+            except Exception:
+                pass
+            raise ValueError(f"ForgeGuard 返回错误: {detail}")
+        except ValueError:
+            raise
+        except Exception as exc:
+            logger.exception("forgeguard rule checks failed")
+            raise ValueError(f"ForgeGuard 检测异常: {exc}")
+        finally:
+            if tmp_path and os.path.isfile(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
 
     @staticmethod
     async def process_rule_checks(
