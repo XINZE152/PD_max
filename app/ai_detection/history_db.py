@@ -300,6 +300,7 @@ def insert_ai_detection_history(
     status: str,
     outcome: Dict[str, Any],
     source_image_path: Optional[str] = None,
+    image_created_at: Optional[str] = None,
 ) -> None:
     """写入一条检测历史（失败时仅打日志，不抛出给上层）。可选复制源图到归档目录。"""
     try:
@@ -311,10 +312,10 @@ def insert_ai_detection_history(
                 cur.execute(
                     """
                     INSERT INTO ai_detection_history
-                    (mode, task_id, original_filename, bbox, status, outcome_json)
-                    VALUES (%s, %s, %s, %s, %s, %s)
+                    (mode, task_id, original_filename, bbox, status, outcome_json, image_created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
                     """,
-                    (mode, task_id, original_filename, bbox_sql, status, out_sql),
+                    (mode, task_id, original_filename, bbox_sql, status, out_sql, image_created_at),
                 )
                 rid = cur.lastrowid
                 if (
@@ -492,7 +493,7 @@ def list_ai_detection_history(
 
             cur.execute(
                 f"""
-                SELECT id, created_at, mode, task_id, original_filename, bbox, status, outcome_json, stored_image, feedback_status, feedback_marked_at
+                SELECT id, created_at, image_created_at, mode, task_id, original_filename, bbox, status, outcome_json, stored_image, feedback_status, feedback_marked_at
                 FROM ai_detection_history
                 WHERE created_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL %s DAY)
                 {mode_clause}
@@ -508,6 +509,9 @@ def list_ai_detection_history(
                 created = item.get("created_at")
                 if created is not None and hasattr(created, "isoformat"):
                     item["created_at"] = created.isoformat(sep=" ", timespec="seconds")
+                img_created = item.get("image_created_at")
+                if img_created is not None and hasattr(img_created, "isoformat"):
+                    item["image_created_at"] = img_created.isoformat(sep=" ", timespec="seconds")
                 marked_at = item.get("feedback_marked_at")
                 if marked_at is not None and hasattr(marked_at, "isoformat"):
                     item["feedback_marked_at"] = marked_at.isoformat(sep=" ", timespec="seconds")
