@@ -700,6 +700,7 @@ class RuleCheckService:
         outcome: Dict[str, Any],
         tmp_path: Optional[str],
         task_id: Optional[str] = None,
+        image_created_at: Optional[str] = None,
     ) -> None:
         if not AI_RULE_CHECK_PERSIST:
             return
@@ -717,6 +718,7 @@ class RuleCheckService:
                 outcome=outcome,
                 source_image_path=source_image_path,
                 task_id=task_id,
+                image_created_at=image_created_at,
             ),
         )
 
@@ -728,6 +730,7 @@ class RuleCheckService:
         bboxes_list: Optional[List[List[int]]] = None,
         business_datetime: Optional[str] = None,
         task_id: Optional[str] = None,
+        image_created_at: Optional[str] = None,
     ) -> Dict[str, Any]:
         """FORGEGUARD_REPLACE_RULE_CHECKS=1 时，将规则检测请求转发到 ForgeGuard。"""
         import requests as _requests
@@ -857,6 +860,7 @@ class RuleCheckService:
                 ),
                 tmp_path=tmp_path,
                 task_id=task_id,
+                image_created_at=image_created_at,
             )
 
             return converted
@@ -895,6 +899,7 @@ class RuleCheckService:
         bboxes_list: Optional[List[List[int]]] = None,
         business_datetime: Optional[str] = None,
         task_id: Optional[str] = None,
+        image_created_at: Optional[str] = None,
     ) -> Dict[str, Any]:
         tmp_path: Optional[str] = None
         try:
@@ -902,6 +907,7 @@ class RuleCheckService:
                 return await RuleCheckService._process_via_forgeguard(
                     file, bbox_list=bbox_list, bboxes_list=bboxes_list,
                     business_datetime=business_datetime, task_id=task_id,
+                    image_created_at=image_created_at,
                 )
             tmp_path = await RuleCheckService._save_upload_to_temp(file)
             async with semaphore:
@@ -942,6 +948,7 @@ class RuleCheckService:
                 ),
                 tmp_path=tmp_path,
                 task_id=task_id,
+                image_created_at=image_created_at,
             )
             return data
         except ValueError as exc:
@@ -959,6 +966,7 @@ class RuleCheckService:
                 ),
                 tmp_path=None,
                 task_id=task_id,
+                image_created_at=image_created_at,
             )
             raise
         finally:
@@ -1025,6 +1033,7 @@ class RuleCheckService:
         *,
         bboxes_list: Optional[List[List[int]]] = None,
         task_id: Optional[str] = None,
+        image_created_at: Optional[str] = None,
     ) -> Dict[str, Any]:
         tmp_path: Optional[str] = None
         try:
@@ -1071,6 +1080,7 @@ class RuleCheckService:
                 outcome=build_pixel_overlap_outcome(data, bbox=bbox_list or (bboxes_list[0] if bboxes_list else []), bboxes=bboxes_list),
                 tmp_path=tmp_path,
                 task_id=task_id,
+                image_created_at=image_created_at,
             )
             return data
         except ValueError as exc:
@@ -1087,6 +1097,7 @@ class RuleCheckService:
                 ),
                 tmp_path=None,
                 task_id=task_id,
+                image_created_at=image_created_at,
             )
             raise
         finally:
@@ -1102,6 +1113,7 @@ class RuleCheckService:
         *,
         business_datetime: Optional[str] = None,
         task_id: Optional[str] = None,
+        image_created_at: Optional[str] = None,
     ) -> Dict[str, Any]:
         tmp_path: Optional[str] = None
         try:
@@ -1133,6 +1145,7 @@ class RuleCheckService:
                 outcome=build_timestamp_outcome(data, document_time=business_datetime),
                 tmp_path=tmp_path,
                 task_id=task_id,
+                image_created_at=image_created_at,
             )
             return data
         except ValueError as exc:
@@ -1148,6 +1161,7 @@ class RuleCheckService:
                 ),
                 tmp_path=None,
                 task_id=task_id,
+                image_created_at=image_created_at,
             )
             raise
         finally:
@@ -1311,6 +1325,7 @@ class DetectionDomainServiceV3:
         result: Optional[Dict[str, Any]],
         multi_results: Optional[List[Dict[str, Any]]] = None,
         persist_bbox: Any = None,
+        image_created_at: Optional[str] = None,
     ) -> None:
         linked_rule_checks: Optional[Dict[str, Any]] = None
         task = await self.registry.get_task(task_id)
@@ -1341,6 +1356,7 @@ class DetectionDomainServiceV3:
             multi_results=multi_results,
             source_image_path=image_path,
             linked_rule_checks=linked_rule_checks,
+            image_created_at=image_created_at,
         )
 
     async def execute_async(
@@ -1348,6 +1364,7 @@ class DetectionDomainServiceV3:
         task_id: str,
         image_path: str,
         bbox: Optional[BBoxDTO] = None,
+        image_created_at: Optional[str] = None,
     ) -> None:
         task = await self.registry.get_task(task_id)
         if not task or task.status == TaskStatusEnum.CANCELED:
@@ -1392,6 +1409,7 @@ class DetectionDomainServiceV3:
                     original_filename=history_filename,
                     bbox=bbox,
                     result=res_dict,
+                    image_created_at=image_created_at,
                 )
                 return
 
@@ -1416,6 +1434,7 @@ class DetectionDomainServiceV3:
                         result=document_override,
                         multi_results=[document_override],
                         persist_bbox={"auto_ocr": True, "note": "document_rule_override"},
+                        image_created_at=image_created_at,
                     )
                     return
 
@@ -1427,6 +1446,7 @@ class DetectionDomainServiceV3:
                     bbox=None,
                     result=empty_res,
                     persist_bbox={"auto_ocr": True, "note": "no_numeric_regions"},
+                    image_created_at=image_created_at,
                 )
                 return
 
@@ -1468,6 +1488,7 @@ class DetectionDomainServiceV3:
                 result=top_result,
                 multi_results=ordered_results,
                 persist_bbox={"auto_ocr": True, "box_count": len(ordered_results)},
+                image_created_at=image_created_at,
             )
 
         except Exception as exc:
@@ -1480,6 +1501,7 @@ class DetectionDomainServiceV3:
                 status="FAILED",
                 error_msg=str(exc),
                 source_image_path=image_path,
+                image_created_at=image_created_at,
             )
 
     async def generate_visualization(self, task_id: str) -> str:
@@ -1566,6 +1588,7 @@ class DetectionDomainServiceV3:
         error_msg: Optional[str] = None,
         source_image_path: Optional[str] = None,
         linked_rule_checks: Optional[Dict[str, Any]] = None,
+        image_created_at: Optional[str] = None,
     ) -> None:
         try:
             outcome: Dict[str, Any] = {}
@@ -1587,6 +1610,7 @@ class DetectionDomainServiceV3:
                     status=status,
                     outcome=outcome,
                     source_image_path=source_image_path,
+                    image_created_at=image_created_at,
                 ),
             )
         except Exception:
@@ -1693,6 +1717,11 @@ async def rule_checks_endpoint(
         None,
         description="可选。与主鉴伪 async_v3 任务关联的 UUID",
     ),
+    image_created_at: Optional[str] = Form(
+        None,
+        description="可选。图片创建时间，格式如 2026-05-28 11:32:00",
+        examples=["2026-05-28 11:32:00"],
+    ),
     engine: InferenceEngineAPI = Depends(get_engine),
     ocr_reader: Any = Depends(get_ocr_reader),
     semaphore: asyncio.Semaphore = Depends(get_ai_semaphore),
@@ -1719,6 +1748,7 @@ async def rule_checks_endpoint(
             bboxes_list=bboxes_list,
             business_datetime=document_time,
             task_id=task_id,
+            image_created_at=image_created_at,
         )
         return {"status": "success", "data": data}
     except ValueError as exc:
@@ -1751,6 +1781,10 @@ async def pixel_overlap_check_endpoint(
         examples=["[[120,80,400,140],[500,200,700,350]]"],
     ),
     task_id: Optional[str] = Form(None, description="可选。与主鉴伪 async_v3 任务关联的 UUID"),
+    image_created_at: Optional[str] = Form(
+        None,
+        description="可选。图片创建时间，格式如 2026-05-28 11:32:00",
+    ),
     engine: InferenceEngineAPI = Depends(get_engine),
     semaphore: asyncio.Semaphore = Depends(get_ai_semaphore),
 ):
@@ -1771,6 +1805,7 @@ async def pixel_overlap_check_endpoint(
     try:
         data = await RuleCheckService.process_pixel_overlap(
             file, bbox_list, engine, semaphore, bboxes_list=bboxes_list, task_id=task_id,
+            image_created_at=image_created_at,
         )
         return {"status": "success", "data": data}
     except ValueError as exc:
@@ -1797,6 +1832,10 @@ async def timestamp_check_endpoint(
         examples=["2026-05-28 11:32:00"],
     ),
     task_id: Optional[str] = Form(None, description="可选。与主鉴伪 async_v3 任务关联的 UUID"),
+    image_created_at: Optional[str] = Form(
+        None,
+        description="可选。图片创建时间，格式如 2026-05-28 11:32:00",
+    ),
     engine: InferenceEngineAPI = Depends(get_engine),
     ocr_reader: Any = Depends(get_ocr_reader),
     semaphore: asyncio.Semaphore = Depends(get_ai_semaphore),
@@ -1809,6 +1848,7 @@ async def timestamp_check_endpoint(
             ocr_reader,
             business_datetime=document_time,
             task_id=task_id,
+            image_created_at=image_created_at,
         )
         return {"status": "success", "data": data}
     except ValueError as exc:
@@ -1857,6 +1897,10 @@ async def detect_tampering_endpoint(
         description="检测框：JSON 数组 [x1,y1,x2,y2] 或逗号分隔的四个整数",
         examples=["[120,80,400,140]", "120,80,400,140"],
     ),
+    image_created_at: Optional[str] = Form(
+        None,
+        description="可选。图片创建时间，格式如 2026-05-28 11:32:00",
+    ),
     engine: InferenceEngineAPI = Depends(get_engine),
     ocr_reader: Any = Depends(get_ocr_reader),
     semaphore: asyncio.Semaphore = Depends(get_ai_semaphore),
@@ -1887,6 +1931,7 @@ async def detect_tampering_endpoint(
                     status="COMPLETED",
                     outcome={"result": res},
                     source_image_path=tmp_history_path,
+                    image_created_at=image_created_at,
                 ),
             )
         except Exception:
@@ -2232,6 +2277,10 @@ async def submit_detection(
         False,
         description="AI 鉴伪完成后自动执行规则检测，并写入同一 task_id 供辅助核查聚合",
     ),
+    image_created_at: Optional[str] = Form(
+        None,
+        description="可选。图片创建时间，格式如 2026-05-28 11:32:00",
+    ),
     registry: AbstractTaskRegistry = Depends(get_registry),
     semaphore: asyncio.Semaphore = Depends(get_ai_semaphore),
 ):
@@ -2267,7 +2316,7 @@ async def submit_detection(
 
     await registry.update_task(task_id, status=TaskStatusEnum.PENDING, with_rule_checks=with_rule_checks)
     service = DetectionDomainServiceV3(registry, semaphore)
-    background_tasks.add_task(service.execute_async, task_id, task.image_path, bbox_dto)
+    background_tasks.add_task(service.execute_async, task_id, task.image_path, bbox_dto, image_created_at)
     return {"status": "pending", "task_id": task_id}
 
 

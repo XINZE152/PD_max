@@ -302,6 +302,7 @@ def build_export_preview_item(row: Dict[str, Any], *, image_variant: ImageVarian
     return {
         "id": rid,
         "created_at": row.get("created_at"),
+        "image_created_at": row.get("image_created_at"),
         "mode": row.get("mode"),
         "task_id": row.get("task_id"),
         "original_filename": row.get("original_filename"),
@@ -520,6 +521,7 @@ def build_export_zip(
                 {
                     "id": rid,
                     "created_at": row.get("created_at"),
+                    "image_created_at": row.get("image_created_at"),
                     "mode": row.get("mode"),
                     "task_id": row.get("task_id"),
                     "original_filename": row.get("original_filename"),

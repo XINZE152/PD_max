@@ -593,7 +593,7 @@ def query_ai_detection_history_for_export(
     # feedback_status 在导出层按「本行 + 同 task_id 的 async_v3」合并后再筛，避免 rule_* 行筛错
 
     sql = f"""
-        SELECT id, created_at, mode, task_id, original_filename, bbox, status,
+        SELECT id, created_at, image_created_at, mode, task_id, original_filename, bbox, status,
                outcome_json, stored_image, feedback_status
         FROM ai_detection_history
         WHERE {" AND ".join(clauses)}
@@ -610,5 +610,8 @@ def query_ai_detection_history_for_export(
                 created = item.get("created_at")
                 if created is not None and hasattr(created, "isoformat"):
                     item["created_at"] = created.isoformat(sep=" ", timespec="seconds")
+                img_created = item.get("image_created_at")
+                if img_created is not None and hasattr(img_created, "isoformat"):
+                    item["image_created_at"] = img_created.isoformat(sep=" ", timespec="seconds")
                 rows_out.append(item)
     return rows_out
