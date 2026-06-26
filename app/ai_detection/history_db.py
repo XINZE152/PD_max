@@ -6,9 +6,10 @@ import json
 import logging
 import os
 import shutil
+import threading
 from decimal import Decimal
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from app.config import UPLOAD_DIR
@@ -291,6 +292,27 @@ def purge_ai_detection_history_older_than(days: Optional[int] = None) -> int:
             return int(cur.rowcount or 0)
 
 
+_batch_lock = threading.Lock()
+
+
+def _generate_batch(cur) -> str:
+    """生成当天批次号，格式 YYYYMMDD + 自增序号（如 202606261）。"""
+    tz = timezone(timedelta(hours=8))
+    today_str = datetime.now(tz).strftime("%Y%m%d")
+    with _batch_lock:
+        cur.execute(
+            "SELECT MAX(batch) FROM ai_detection_history WHERE batch LIKE %s",
+            (today_str + "%",),
+        )
+        row = cur.fetchone()
+        max_batch = row[0] if row and row[0] else None
+        if max_batch:
+            num = int(max_batch[len(today_str):]) + 1
+        else:
+            num = 1
+        return f"{today_str}{num}"
+
+
 def insert_ai_detection_history(
     *,
     mode: str,
@@ -309,13 +331,14 @@ def insert_ai_detection_history(
         out_sql = json.dumps(outcome, ensure_ascii=False)
         with get_conn() as conn:
             with conn.cursor() as cur:
+                batch = _generate_batch(cur)
                 cur.execute(
                     """
                     INSERT INTO ai_detection_history
-                    (mode, task_id, original_filename, bbox, status, outcome_json, image_created_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    (mode, task_id, original_filename, bbox, status, outcome_json, image_created_at, batch)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                     """,
-                    (mode, task_id, original_filename, bbox_sql, status, out_sql, image_created_at),
+                    (mode, task_id, original_filename, bbox_sql, status, out_sql, image_created_at, batch),
                 )
                 rid = cur.lastrowid
                 if (
@@ -493,7 +516,7 @@ def list_ai_detection_history(
 
             cur.execute(
                 f"""
-                SELECT id, created_at, image_created_at, mode, task_id, original_filename, bbox, status, outcome_json, stored_image, feedback_status, feedback_marked_at
+                SELECT id, created_at, image_created_at, batch, mode, task_id, original_filename, bbox, status, outcome_json, stored_image, feedback_status, feedback_marked_at
                 FROM ai_detection_history
                 WHERE created_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL %s DAY)
                 {mode_clause}
@@ -597,7 +620,7 @@ def query_ai_detection_history_for_export(
     # feedback_status 在导出层按「本行 + 同 task_id 的 async_v3」合并后再筛，避免 rule_* 行筛错
 
     sql = f"""
-        SELECT id, created_at, image_created_at, mode, task_id, original_filename, bbox, status,
+        SELECT id, created_at, image_created_at, batch, mode, task_id, original_filename, bbox, status,
                outcome_json, stored_image, feedback_status
         FROM ai_detection_history
         WHERE {" AND ".join(clauses)}

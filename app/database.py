@@ -391,6 +391,7 @@ TABLE_STATEMENTS = [
         id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间（UTC）',
         image_created_at DATETIME NULL COMMENT '图片创建时间（前端传入）',
+        batch VARCHAR(16) NULL COMMENT '批次号（后端自动生成，YYYYMMDD+序号）',
         mode VARCHAR(24) NOT NULL COMMENT 'sync_v1 | async_v3 | rule_checks | rule_pixel_overlap | rule_timestamp',
         task_id VARCHAR(64) NULL COMMENT '异步任务 UUID，同步为空',
         original_filename VARCHAR(512) NULL COMMENT '上传原始文件名',
