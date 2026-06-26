@@ -733,6 +733,7 @@ class RuleCheckService:
         business_datetime: Optional[str] = None,
         task_id: Optional[str] = None,
         image_created_at: Optional[str] = None,
+        batch: Optional[str] = None,
     ) -> Dict[str, Any]:
         """FORGEGUARD_REPLACE_RULE_CHECKS=1 时，将规则检测请求转发到 ForgeGuard。"""
         import requests as _requests
@@ -912,6 +913,7 @@ class RuleCheckService:
                     file, bbox_list=bbox_list, bboxes_list=bboxes_list,
                     business_datetime=business_datetime, task_id=task_id,
                     image_created_at=image_created_at,
+                    batch=batch,
                 )
             tmp_path = await RuleCheckService._save_upload_to_temp(file)
             async with semaphore:
