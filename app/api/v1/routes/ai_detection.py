@@ -2073,6 +2073,14 @@ class HistoryExportRequest(BaseModel):
         "primary",
         description="结论匹配：primary=按主结果 result；any=multi_results 任一条命中即保留",
     )
+    image_created_at_start: Optional[datetime] = Field(
+        None,
+        description="图片创建时间范围-起始（含），按 image_created_at 字段筛选",
+    )
+    image_created_at_end: Optional[datetime] = Field(
+        None,
+        description="图片创建时间范围-结束（含），按 image_created_at 字段筛选",
+    )
     image_variant: str = Field(
         "original",
         description="图片类型：original=原图，annotated=在原图上绘制检测框与结论（预览与导出均生效）",
@@ -2136,6 +2144,12 @@ def _parse_history_export_request(req: HistoryExportRequest) -> HistoryExportReq
         if st and st not in ("COMPLETED", "FAILED"):
             raise HTTPException(status_code=400, detail="status 须为 COMPLETED、FAILED 或不传")
         req.status = st or None  # type: ignore[assignment]
+    if (
+        req.image_created_at_start is not None
+        and req.image_created_at_end is not None
+        and req.image_created_at_end < req.image_created_at_start
+    ):
+        raise HTTPException(status_code=400, detail="image_created_at_end 不能早于 image_created_at_start")
     req.bbox_mode = bbox  # type: ignore[assignment]
     req.match_mode = match  # type: ignore[assignment]
     req.image_variant = variant  # type: ignore[assignment]
@@ -2166,6 +2180,8 @@ async def history_export_preview(req: HistoryExportRequest):
             match_mode=req.match_mode,  # type: ignore[arg-type]
             image_variant=req.image_variant,  # type: ignore[arg-type]
             feedback_status=req.feedback_status,
+            image_created_at_start=req.image_created_at_start,
+            image_created_at_end=req.image_created_at_end,
         ),
     )
     return {"status": "success", **data}
@@ -2196,6 +2212,8 @@ async def history_export_download(req: HistoryExportRequest):
             match_mode=req.match_mode,  # type: ignore[arg-type]
             image_variant=req.image_variant,  # type: ignore[arg-type]
             feedback_status=req.feedback_status,
+            image_created_at_start=req.image_created_at_start,
+            image_created_at_end=req.image_created_at_end,
         ),
     )
     if preview["total_matched"] == 0:
@@ -2223,6 +2241,8 @@ async def history_export_download(req: HistoryExportRequest):
                 match_mode=req.match_mode,  # type: ignore[arg-type]
                 image_variant=req.image_variant,  # type: ignore[arg-type]
                 feedback_status=req.feedback_status,
+                image_created_at_start=req.image_created_at_start,
+                image_created_at_end=req.image_created_at_end,
             ),
         )
     except ValueError as exc:

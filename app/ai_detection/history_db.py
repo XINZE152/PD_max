@@ -587,6 +587,8 @@ def query_ai_detection_history_for_export(
     modes: Optional[Sequence[str]] = None,
     status: Optional[str] = None,
     feedback_status: Optional[Sequence[str]] = None,
+    image_created_at_start: Optional[datetime] = None,
+    image_created_at_end: Optional[datetime] = None,
 ) -> List[Dict[str, Any]]:
     """
     导出查询（不触发保留期 purge）。
@@ -594,6 +596,7 @@ def query_ai_detection_history_for_export(
     - 否则用 start_time～end_time（含边界）。
     modes 为空时不按 mode 过滤；status 为空不过滤状态。
     feedback_status：correct / wrong / suspicious / unmarked；空表示不过滤。
+    image_created_at_start/end：按 image_created_at 字段筛选（可选）。
     """
     mode_list = [str(m).strip() for m in (modes or []) if str(m).strip()]
     status_val = str(status or "").strip()
@@ -616,6 +619,13 @@ def query_ai_detection_history_for_export(
         placeholders = ", ".join(["%s"] * len(mode_list))
         clauses.append(f"mode IN ({placeholders})")
         params.extend(mode_list)
+
+    if image_created_at_start is not None:
+        clauses.append("image_created_at >= %s")
+        params.append(image_created_at_start)
+    if image_created_at_end is not None:
+        clauses.append("image_created_at <= %s")
+        params.append(image_created_at_end)
 
     # feedback_status 在导出层按「本行 + 同 task_id 的 async_v3」合并后再筛，避免 rule_* 行筛错
 
