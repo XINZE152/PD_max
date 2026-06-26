@@ -347,15 +347,20 @@ def insert_ai_detection_history(
     outcome: Dict[str, Any],
     source_image_path: Optional[str] = None,
     image_created_at: Optional[str] = None,
+    batch: Optional[str] = None,
 ) -> None:
-    """写入一条检测历史（失败时仅打日志，不抛出给上层）。可选复制源图到归档目录。"""
+    """写入一条检测历史（失败时仅打日志，不抛出给上层）。可选复制源图到归档目录。
+
+    若提供 batch 则直接使用（同一批上传的多张图共享批次号），否则自动生成。
+    """
     try:
         _ensure_history_images_dir()
         bbox_sql = json.dumps(bbox, ensure_ascii=False) if bbox is not None else None
         out_sql = json.dumps(outcome, ensure_ascii=False)
         with get_conn() as conn:
             with conn.cursor() as cur:
-                batch = _generate_batch(cur)
+                if batch is None:
+                    batch = _generate_batch(cur)
                 has_img_created = _table_has_column("ai_detection_history", "image_created_at")
                 has_batch = _table_has_column("ai_detection_history", "batch")
                 columns = ["mode", "task_id", "original_filename", "bbox", "status", "outcome_json"]
