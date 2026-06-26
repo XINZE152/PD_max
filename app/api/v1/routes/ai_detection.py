@@ -2043,11 +2043,11 @@ class HistoryExportRequest(BaseModel):
     )
     start_time: Optional[datetime] = Field(
         None,
-        description="开始时间（含）；未传 retention_days 时必填",
+        description="开始时间（含，精确到分钟，如 2026-06-26T15:30）；未传 retention_days 时必填",
     )
     end_time: Optional[datetime] = Field(
         None,
-        description="结束时间（含）；未传 retention_days 时必填",
+        description="结束时间（含，精确到分钟，如 2026-06-26T18:45）；未传 retention_days 时必填",
     )
     detection_results: Optional[List[str]] = Field(
         None,
@@ -2073,13 +2073,9 @@ class HistoryExportRequest(BaseModel):
         "primary",
         description="结论匹配：primary=按主结果 result；any=multi_results 任一条命中即保留",
     )
-    image_created_at_start: Optional[datetime] = Field(
+    batch: Optional[str] = Field(
         None,
-        description="图片创建时间范围-起始（含），按 image_created_at 字段筛选",
-    )
-    image_created_at_end: Optional[datetime] = Field(
-        None,
-        description="图片创建时间范围-结束（含），按 image_created_at 字段筛选",
+        description="批次号筛选，如 20260626-001；不传表示全部",
     )
     image_variant: str = Field(
         "original",
@@ -2090,11 +2086,12 @@ class HistoryExportRequest(BaseModel):
         json_schema_extra={
             "examples": [
                 {
-                    "start_time": "2026-06-01T00:00:00",
-                    "end_time": "2026-06-17T23:59:59",
+                    "start_time": "2026-06-01T00:00",
+                    "end_time": "2026-06-17T23:59",
                     "detection_results": ["篡改", "可疑"],
                     "bbox_mode": "all",
                     "image_variant": "original",
+                    "batch": "20260617-001",
                 }
             ]
         }
@@ -2144,12 +2141,6 @@ def _parse_history_export_request(req: HistoryExportRequest) -> HistoryExportReq
         if st and st not in ("COMPLETED", "FAILED"):
             raise HTTPException(status_code=400, detail="status 须为 COMPLETED、FAILED 或不传")
         req.status = st or None  # type: ignore[assignment]
-    if (
-        req.image_created_at_start is not None
-        and req.image_created_at_end is not None
-        and req.image_created_at_end < req.image_created_at_start
-    ):
-        raise HTTPException(status_code=400, detail="image_created_at_end 不能早于 image_created_at_start")
     req.bbox_mode = bbox  # type: ignore[assignment]
     req.match_mode = match  # type: ignore[assignment]
     req.image_variant = variant  # type: ignore[assignment]
@@ -2180,8 +2171,7 @@ async def history_export_preview(req: HistoryExportRequest):
             match_mode=req.match_mode,  # type: ignore[arg-type]
             image_variant=req.image_variant,  # type: ignore[arg-type]
             feedback_status=req.feedback_status,
-            image_created_at_start=req.image_created_at_start,
-            image_created_at_end=req.image_created_at_end,
+            batch=req.batch,
         ),
     )
     return {"status": "success", **data}
@@ -2212,8 +2202,7 @@ async def history_export_download(req: HistoryExportRequest):
             match_mode=req.match_mode,  # type: ignore[arg-type]
             image_variant=req.image_variant,  # type: ignore[arg-type]
             feedback_status=req.feedback_status,
-            image_created_at_start=req.image_created_at_start,
-            image_created_at_end=req.image_created_at_end,
+            batch=req.batch,
         ),
     )
     if preview["total_matched"] == 0:
@@ -2241,8 +2230,7 @@ async def history_export_download(req: HistoryExportRequest):
                 match_mode=req.match_mode,  # type: ignore[arg-type]
                 image_variant=req.image_variant,  # type: ignore[arg-type]
                 feedback_status=req.feedback_status,
-                image_created_at_start=req.image_created_at_start,
-                image_created_at_end=req.image_created_at_end,
+                batch=req.batch,
             ),
         )
     except ValueError as exc:

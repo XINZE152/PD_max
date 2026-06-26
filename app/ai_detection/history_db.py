@@ -18,6 +18,28 @@ from app.ai_detection.rule_check_display import build_rule_check_public_summary,
 
 logger = logging.getLogger(__name__)
 
+_column_cache: Dict[str, Dict[str, bool]] = {}
+
+
+def _table_has_column(table: str, column: str) -> bool:
+    """检查表是否存在某列（结果缓存，避免重复查询 INFORMATION_SCHEMA）。"""
+    if table not in _column_cache:
+        cols: Dict[str, bool] = {}
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS "
+                        "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=%s",
+                        (table,),
+                    )
+                    for row in cur.fetchall():
+                        cols[str(row[0]).lower()] = True
+        except Exception:
+            logger.exception("查询表列信息失败 table=%s", table)
+        _column_cache[table] = cols
+    return _column_cache[table].get(column.lower(), False)
+
 HISTORY_RETENTION_DAYS = int(os.getenv("AI_DETECTION_HISTORY_DAYS", "7"))
 HISTORY_IMAGES_DIR = Path(UPLOAD_DIR) / "ai_detection_history_images"
 HISTORY_STORAGE_DIR = Path(UPLOAD_DIR) / "ai_detection_storage"
@@ -295,8 +317,10 @@ def purge_ai_detection_history_older_than(days: Optional[int] = None) -> int:
 _batch_lock = threading.Lock()
 
 
-def _generate_batch(cur) -> str:
-    """生成当天批次号，格式 YYYYMMDD + 自增序号（如 202606261）。"""
+def _generate_batch(cur) -> Optional[str]:
+    """生成当天批次号，格式 YYYYMMDD + 自增序号（如 202606261）；batch 列不存在时返回 None。"""
+    if not _table_has_column("ai_detection_history", "batch"):
+        return None
     tz = timezone(timedelta(hours=8))
     today_str = datetime.now(tz).strftime("%Y%m%d")
     with _batch_lock:
@@ -332,13 +356,20 @@ def insert_ai_detection_history(
         with get_conn() as conn:
             with conn.cursor() as cur:
                 batch = _generate_batch(cur)
+                has_img_created = _table_has_column("ai_detection_history", "image_created_at")
+                has_batch = _table_has_column("ai_detection_history", "batch")
+                columns = ["mode", "task_id", "original_filename", "bbox", "status", "outcome_json"]
+                values: List[Any] = [mode, task_id, original_filename, bbox_sql, status, out_sql]
+                if has_img_created:
+                    columns.append("image_created_at")
+                    values.append(image_created_at)
+                if has_batch:
+                    columns.append("batch")
+                    values.append(batch)
+                placeholders = ", ".join(["%s"] * len(values))
                 cur.execute(
-                    """
-                    INSERT INTO ai_detection_history
-                    (mode, task_id, original_filename, bbox, status, outcome_json, image_created_at, batch)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                    """,
-                    (mode, task_id, original_filename, bbox_sql, status, out_sql, image_created_at, batch),
+                    f"INSERT INTO ai_detection_history ({', '.join(columns)}) VALUES ({placeholders})",
+                    tuple(values),
                 )
                 rid = cur.lastrowid
                 if (
@@ -514,9 +545,18 @@ def list_ai_detection_history(
             )
             total = int(cur.fetchone()[0])
 
+            has_img_created = _table_has_column("ai_detection_history", "image_created_at")
+            has_batch = _table_has_column("ai_detection_history", "batch")
+            select_fields = [
+                "id", "created_at",
+                "image_created_at" if has_img_created else "NULL AS image_created_at",
+                "batch" if has_batch else "NULL AS batch",
+                "mode", "task_id", "original_filename", "bbox", "status",
+                "outcome_json", "stored_image", "feedback_status", "feedback_marked_at",
+            ]
             cur.execute(
                 f"""
-                SELECT id, created_at, image_created_at, batch, mode, task_id, original_filename, bbox, status, outcome_json, stored_image, feedback_status, feedback_marked_at
+                SELECT {', '.join(select_fields)}
                 FROM ai_detection_history
                 WHERE created_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL %s DAY)
                 {mode_clause}
@@ -587,8 +627,7 @@ def query_ai_detection_history_for_export(
     modes: Optional[Sequence[str]] = None,
     status: Optional[str] = None,
     feedback_status: Optional[Sequence[str]] = None,
-    image_created_at_start: Optional[datetime] = None,
-    image_created_at_end: Optional[datetime] = None,
+    batch: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     导出查询（不触发保留期 purge）。
@@ -596,7 +635,7 @@ def query_ai_detection_history_for_export(
     - 否则用 start_time～end_time（含边界）。
     modes 为空时不按 mode 过滤；status 为空不过滤状态。
     feedback_status：correct / wrong / suspicious / unmarked；空表示不过滤。
-    image_created_at_start/end：按 image_created_at 字段筛选（可选）。
+    batch：按批次号筛选（可选），如 20260626-001。
     """
     mode_list = [str(m).strip() for m in (modes or []) if str(m).strip()]
     status_val = str(status or "").strip()
@@ -620,18 +659,22 @@ def query_ai_detection_history_for_export(
         clauses.append(f"mode IN ({placeholders})")
         params.extend(mode_list)
 
-    if image_created_at_start is not None:
-        clauses.append("image_created_at >= %s")
-        params.append(image_created_at_start)
-    if image_created_at_end is not None:
-        clauses.append("image_created_at <= %s")
-        params.append(image_created_at_end)
+    if batch is not None and _table_has_column("ai_detection_history", "batch"):
+        clauses.append("batch = %s")
+        params.append(batch)
 
-    # feedback_status 在导出层按「本行 + 同 task_id 的 async_v3」合并后再筛，避免 rule_* 行筛错
+    has_img_created = _table_has_column("ai_detection_history", "image_created_at")
+    has_batch = _table_has_column("ai_detection_history", "batch")
+    select_fields = [
+        "id", "created_at",
+        "image_created_at" if has_img_created else "NULL AS image_created_at",
+        "batch" if has_batch else "NULL AS batch",
+        "mode", "task_id", "original_filename", "bbox", "status",
+        "outcome_json", "stored_image", "feedback_status",
+    ]
 
     sql = f"""
-        SELECT id, created_at, image_created_at, batch, mode, task_id, original_filename, bbox, status,
-               outcome_json, stored_image, feedback_status
+        SELECT {', '.join(select_fields)}
         FROM ai_detection_history
         WHERE {" AND ".join(clauses)}
         ORDER BY id DESC
