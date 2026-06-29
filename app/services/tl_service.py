@@ -2174,7 +2174,7 @@ class TLService:
                 logger.error(f"分页获取冶炼厂列表失败: {e}")
                 raise
         try:
-            conditions = ["is_active = 1"]
+            conditions = ["df.is_active = 1"]
             params: List[Any] = []
             if keyword is not None and str(keyword).strip():
                 conditions.append("name LIKE %s")

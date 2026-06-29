@@ -1872,7 +1872,7 @@ def smelter_list(
             conds.append("district = %s")
             params.append(str(district).strip())
         if status is not None:
-            conds.append("is_active = %s")
+            conds.append("df.is_active = %s")
             params.append(1 if int(status) == 1 else 0)
         if factory_type is not None and str(factory_type).strip():
             conds.append("df.factory_type_id IS NOT NULL AND ft.name = %s")

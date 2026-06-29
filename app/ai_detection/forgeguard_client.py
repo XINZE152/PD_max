@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 FORGEGUARD_BASE_URL = os.getenv("FORGEGUARD_BASE_URL", "http://127.0.0.1:8030").rstrip("/")
 FORGEGUARD_API_KEY = os.getenv("FORGEGUARD_API_KEY")
-FORGEGUARD_TIMEOUT = int(os.getenv("FORGEGUARD_TIMEOUT", "60"))
+FORGEGUARD_TIMEOUT = int(os.getenv("FORGEGUARD_TIMEOUT", "300"))
 
 _PREDICTION_MAP = {
     "forged": "篡改",
