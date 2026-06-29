@@ -634,15 +634,17 @@ class TLService:
         latitude: Optional[float] = None,
         *,
         use_xunrongbao: bool = False,
-        factory_type: Optional[str] = None,
+        factory_type_id: Optional[int] = None,
+        factory_type_name: Optional[str] = None,
     ) -> Dict[str, Any]:
         """全地址落库时经纬度由天地图解析；未传经度/纬度或只传其一由 maybe_geocode 处理（可回退为 NULL）。use_xunrongbao 写入循融宝发货开关。"""
         addr = _strip_optional_str(address)
-        ft = str(factory_type).strip() if factory_type is not None and str(factory_type).strip() else None
+        ft_name = str(factory_type_name).strip() if factory_type_name is not None and str(factory_type_name).strip() else None
         if _full_cn_site_address(province, city, district, addr):
             payload = {
                 "name": str(name).strip(),
-                "factory_type": ft,
+                "factory_type_id": factory_type_id,
+                "factory_type_name": ft_name,
                 "province": _strip_nonempty(province),
                 "city": _strip_nonempty(city),
                 "district": _strip_nonempty(district),
@@ -676,17 +678,35 @@ class TLService:
                         if is_active == 1:
                             return {"code": 200, "msg": "冶炼厂已存在", "冶炼厂id": smelter_id, "新建": False}
                         xrb = 1 if use_xunrongbao else 0
+                        # 解析冶炼厂类型
+                        ft_id = factory_type_id
+                        if ft_name:
+                            cur.execute(
+                                "SELECT id FROM dict_factory_types WHERE name = %s AND is_active = 1",
+                                (ft_name,),
+                            )
+                            ft_row = cur.fetchone()
+                            ft_id = int(ft_row[0]) if ft_row else None
                         cur.execute(
-                            "UPDATE dict_factories SET is_active = 1, use_xunrongbao = %s, factory_type = %s WHERE id = %s",
-                            (xrb, ft, smelter_id),
+                            "UPDATE dict_factories SET is_active = 1, use_xunrongbao = %s, "
+                            "factory_type_id = %s WHERE id = %s",
+                            (xrb, ft_id, smelter_id),
                         )
                         return {"code": 200, "msg": "冶炼厂已恢复启用", "冶炼厂id": smelter_id, "新建": False}
 
                     xrb = 1 if use_xunrongbao else 0
+                    ft_id = factory_type_id
+                    if ft_name:
+                        cur.execute(
+                            "SELECT id FROM dict_factory_types WHERE name = %s AND is_active = 1",
+                            (ft_name,),
+                        )
+                        ft_row = cur.fetchone()
+                        ft_id = int(ft_row[0]) if ft_row else None
                     cur.execute(
-                        "INSERT INTO dict_factories (name, address, factory_type, is_active, use_xunrongbao) "
+                        "INSERT INTO dict_factories (name, address, factory_type_id, is_active, use_xunrongbao) "
                         "VALUES (%s, %s, %s, 1, %s)",
-                        (name, addr, ft, xrb),
+                        (name, addr, ft_id, xrb),
                     )
                     return {"code": 200, "msg": "冶炼厂新建成功", "冶炼厂id": cur.lastrowid, "新建": True}
         except Exception as e:
@@ -1903,6 +1923,197 @@ class TLService:
             logger.error(f"删除库房类型失败: {e}")
             raise
 
+    # ==================== 接口1b：冶炼厂类型（类型-颜色）维护 ====================
+
+    def get_factory_types(
+        self,
+        keyword: Optional[str] = None,
+        include_inactive: bool = False,
+    ) -> List[Dict[str, Any]]:
+        try:
+            conditions: List[str] = []
+            params: List[Any] = []
+            if not include_inactive:
+                conditions.append("is_active = 1")
+            if keyword is not None and str(keyword).strip():
+                conditions.append("name LIKE %s")
+                params.append(f"%{str(keyword).strip()}%")
+            where_sql = " AND ".join(conditions) if conditions else "1=1"
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"SELECT id AS `类型id`, name AS `类型名`, color_config AS `颜色配置`, "
+                        f"is_active AS `is_active` "
+                        f"FROM dict_factory_types WHERE {where_sql} "
+                        "ORDER BY id",
+                        tuple(params),
+                    )
+                    columns = [d[0] for d in cur.description]
+                    out: List[Dict[str, Any]] = []
+                    for row in cur.fetchall():
+                        rec = dict(zip(columns, row))
+                        rec["颜色配置"] = _color_config_from_db(rec.get("颜色配置"))
+                        out.append(rec)
+                    return out
+        except Exception as e:
+            logger.error(f"获取冶炼厂类型列表失败: {e}")
+            raise
+
+    def add_factory_type(
+        self, name: str, color_config: Optional[Any] = None
+    ) -> Dict[str, Any]:
+        n = str(name).strip()
+        if not n:
+            raise ValueError("类型名不能为空")
+        if len(n) > 50:
+            raise ValueError("类型名长度不能超过 50 字符")
+        cc_json = _color_config_to_json_str(color_config) if color_config is not None else None
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT id, is_active FROM dict_factory_types WHERE name = %s",
+                        (n,),
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        tid, act = int(row[0]), row[1]
+                        if act == 1:
+                            return {
+                                "code": 200,
+                                "msg": "类型已存在",
+                                "类型id": tid,
+                                "新建": False,
+                            }
+                        if cc_json is None:
+                            cur.execute(
+                                "UPDATE dict_factory_types SET is_active = 1 WHERE id = %s",
+                                (tid,),
+                            )
+                        else:
+                            cur.execute(
+                                "UPDATE dict_factory_types SET is_active = 1, "
+                                "color_config = CAST(%s AS JSON) WHERE id = %s",
+                                (cc_json, tid),
+                            )
+                        return {
+                            "code": 200,
+                            "msg": "类型已恢复启用",
+                            "类型id": tid,
+                            "新建": False,
+                        }
+                    if cc_json is None:
+                        cur.execute(
+                            "INSERT INTO dict_factory_types (name, color_config, is_active) "
+                            "VALUES (%s, NULL, 1)",
+                            (n,),
+                        )
+                    else:
+                        cur.execute(
+                            "INSERT INTO dict_factory_types (name, color_config, is_active) "
+                            "VALUES (%s, CAST(%s AS JSON), 1)",
+                            (n, cc_json),
+                        )
+                    return {
+                        "code": 200,
+                        "msg": "冶炼厂类型新建成功",
+                        "类型id": cur.lastrowid,
+                        "新建": True,
+                    }
+        except ValueError:
+            raise
+        except Exception as e:
+            logger.error(f"新建冶炼厂类型失败: {e}")
+            raise
+
+    def update_factory_type(self, type_id: int, patch: Dict[str, Any]) -> Dict[str, Any]:
+        allowed = {"类型名", "颜色配置", "is_active"}
+        if not (set(patch.keys()) & allowed):
+            raise ValueError("至少需要提供一个待修改字段：类型名、颜色配置、is_active 之一")
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT id FROM dict_factory_types WHERE id = %s",
+                        (type_id,),
+                    )
+                    if not cur.fetchone():
+                        raise ValueError(f"冶炼厂类型 id={type_id} 不存在")
+
+                    updates: List[str] = []
+                    params: List[Any] = []
+
+                    if "类型名" in patch:
+                        nn = patch["类型名"]
+                        if nn is None or str(nn).strip() == "":
+                            raise ValueError("类型名不能为空")
+                        nn = str(nn).strip()
+                        cur.execute(
+                            "SELECT id FROM dict_factory_types WHERE name = %s AND id <> %s",
+                            (nn, type_id),
+                        )
+                        if cur.fetchone():
+                            raise ValueError(f"类型名「{nn}」已存在")
+                        updates.append("name = %s")
+                        params.append(nn)
+
+                    if "is_active" in patch and patch["is_active"] is not None:
+                        updates.append("is_active = %s")
+                        params.append(1 if patch["is_active"] else 0)
+
+                    if "颜色配置" in patch:
+                        cc = patch["颜色配置"]
+                        if cc is None:
+                            updates.append("color_config = NULL")
+                        else:
+                            updates.append("color_config = CAST(%s AS JSON)")
+                            params.append(_color_config_to_json_str(cc))
+
+                    if not updates:
+                        raise ValueError("没有有效的修改项")
+
+                    params.append(type_id)
+                    cur.execute(
+                        f"UPDATE dict_factory_types SET {', '.join(updates)} WHERE id = %s",
+                        tuple(params),
+                    )
+
+            return {"code": 200, "msg": "冶炼厂类型已更新"}
+        except ValueError:
+            raise
+        except Exception as e:
+            logger.error(f"更新冶炼厂类型失败: {e}")
+            raise
+
+    def delete_factory_type(self, type_id: int) -> Dict[str, Any]:
+        """软删除类型：相关冶炼厂的 factory_type_id 置空（颜色随类型失效）。"""
+        if type_id < 1:
+            raise ValueError("类型id 无效")
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT id FROM dict_factory_types WHERE id = %s AND is_active = 1",
+                        (type_id,),
+                    )
+                    if not cur.fetchone():
+                        raise ValueError(f"冶炼厂类型 id={type_id} 不存在或已停用")
+                    cur.execute(
+                        "UPDATE dict_factories SET factory_type_id = NULL "
+                        "WHERE factory_type_id = %s",
+                        (type_id,),
+                    )
+                    cur.execute(
+                        "UPDATE dict_factory_types SET is_active = 0 WHERE id = %s",
+                        (type_id,),
+                    )
+            return {"code": 200, "msg": "冶炼厂类型已删除"}
+        except ValueError:
+            raise
+        except Exception as e:
+            logger.error(f"删除冶炼厂类型失败: {e}")
+            raise
+
     # ==================== 接口2：获取冶炼厂列表 ====================
 
     _SM_SITE_PATCH_KEYS = frozenset({"省", "市", "区", "经度", "纬度"})
@@ -1912,7 +2123,8 @@ class TLService:
         return {
             "冶炼厂id": int(item["id"]),
             "冶炼厂": item["name"],
-            "冶炼厂类型": item.get("factory_type") or "",
+            "冶炼厂类型id": item.get("factory_type_id"),
+            "冶炼厂类型": item.get("factory_type_name") or "",
             "地址": item.get("address") or "",
             "省": item.get("province") or "",
             "市": item.get("city") or "",
@@ -1933,6 +2145,7 @@ class TLService:
         status: Optional[int] = None,
         factory_type: Optional[str] = None,
     ) -> Any:
+        """factory_type 为冶炼厂类型名筛选（可选），与库房类型名筛选用法一致。"""
         if page is not None:
             try:
                 pg = max(1, int(page))
@@ -1967,19 +2180,23 @@ class TLService:
                 conditions.append("name LIKE %s")
                 params.append(f"%{str(keyword).strip()}%")
             if factory_type is not None and str(factory_type).strip():
-                conditions.append("factory_type = %s")
+                conditions.append("ft.name = %s")
                 params.append(str(factory_type).strip())
             where_sql = " AND ".join(conditions)
             with get_conn() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
-                        f"SELECT id AS `冶炼厂id`, name AS `冶炼厂`, factory_type AS `冶炼厂类型`, "
-                        f"address AS `地址`, "
-                        f"province AS `省`, city AS `市`, district AS `区`, "
-                        f"longitude AS `经度`, latitude AS `纬度`, "
-                        f"COALESCE(use_xunrongbao, 0) AS `循融宝发货` "
-                        f"FROM dict_factories WHERE {where_sql} "
-                        "ORDER BY id",
+                        f"SELECT df.id AS `冶炼厂id`, df.name AS `冶炼厂`, "
+                        f"df.factory_type_id AS `冶炼厂类型id`, "
+                        f"COALESCE(ft.name, '') AS `冶炼厂类型`, "
+                        f"df.address AS `地址`, "
+                        f"df.province AS `省`, df.city AS `市`, df.district AS `区`, "
+                        f"df.longitude AS `经度`, df.latitude AS `纬度`, "
+                        f"COALESCE(df.use_xunrongbao, 0) AS `循融宝发货` "
+                        f"FROM dict_factories df "
+                        f"LEFT JOIN dict_factory_types ft ON df.factory_type_id = ft.id "
+                        f"WHERE {where_sql} "
+                        "ORDER BY df.id",
                         tuple(params),
                     )
                     columns = [desc[0] for desc in cur.description]
@@ -2069,15 +2286,19 @@ class TLService:
                 with conn.cursor() as cur:
                     if include_inactive:
                         cur.execute(
-                            "SELECT id, name, COALESCE(use_xunrongbao, 0), is_active, "
-                            "COALESCE(factory_type, '') AS factory_type "
-                            "FROM dict_factories ORDER BY id"
+                            "SELECT df.id, df.name, COALESCE(df.use_xunrongbao, 0), df.is_active, "
+                            "df.factory_type_id, COALESCE(ft.name, '') AS factory_type_name "
+                            "FROM dict_factories df "
+                            "LEFT JOIN dict_factory_types ft ON df.factory_type_id = ft.id "
+                            "ORDER BY df.id"
                         )
                     else:
                         cur.execute(
-                            "SELECT id, name, COALESCE(use_xunrongbao, 0), is_active, "
-                            "COALESCE(factory_type, '') AS factory_type "
-                            "FROM dict_factories WHERE is_active = 1 ORDER BY id"
+                            "SELECT df.id, df.name, COALESCE(df.use_xunrongbao, 0), df.is_active, "
+                            "df.factory_type_id, COALESCE(ft.name, '') AS factory_type_name "
+                            "FROM dict_factories df "
+                            "LEFT JOIN dict_factory_types ft ON df.factory_type_id = ft.id "
+                            "WHERE df.is_active = 1 ORDER BY df.id"
                         )
                     rows = cur.fetchall()
             # 从 DB 读取各冶炼厂最新循融宝加价
@@ -2102,7 +2323,8 @@ class TLService:
                         "冶炼厂": r[1],
                         "循融宝发货": bool(int(r[2])),
                         "is_active": bool(int(r[3])),
-                        "冶炼厂类型": r[4] or "",
+                        "冶炼厂类型id": r[4],
+                        "冶炼厂类型": r[5] or "",
                         "加价元每吨": premium_map.get(int(r[0])),
                     }
                     for r in rows
@@ -2187,9 +2409,11 @@ class TLService:
         out: Dict[str, Any] = {}
         if "循融宝发货" in patch and patch["循融宝发货"] is not None:
             out["use_xunrongbao"] = bool(patch["循融宝发货"])
-        if "冶炼厂类型" in patch:
-            ft = patch["冶炼厂类型"]
-            out["factory_type"] = str(ft).strip() if ft is not None and str(ft).strip() else None
+        if "冶炼厂类型id" in patch:
+            out["factory_type_id"] = patch["冶炼厂类型id"]
+        if "冶炼厂类型名" in patch:
+            ftn = patch["冶炼厂类型名"]
+            out["factory_type_name"] = str(ftn).strip() if ftn is not None and str(ftn).strip() else None
         if "冶炼厂名" in patch:
             raw = patch["冶炼厂名"]
             if raw is None or str(raw).strip() == "":
@@ -2216,11 +2440,11 @@ class TLService:
         return out
 
     def update_smelter(self, smelter_id: int, patch: Dict[str, Any]) -> Dict[str, Any]:
-        allowed = {"冶炼厂名", "冶炼厂类型", "is_active", "地址", "循融宝发货"} | self._SM_SITE_PATCH_KEYS
+        allowed = {"冶炼厂名", "冶炼厂类型id", "冶炼厂类型名", "is_active", "地址", "循融宝发货"} | self._SM_SITE_PATCH_KEYS
         keys = set(patch.keys()) & allowed
         if not keys:
             raise ValueError(
-                "至少需要提供一个待修改字段：冶炼厂名、冶炼厂类型、is_active、地址、循融宝发货、省、市、区、经度、纬度 之一"
+                "至少需要提供一个待修改字段：冶炼厂名、冶炼厂类型id/冶炼厂类型名、is_active、地址、循融宝发货、省、市、区、经度、纬度 之一"
             )
 
         use_site = bool(keys & self._SM_SITE_PATCH_KEYS)
@@ -2265,11 +2489,25 @@ class TLService:
                         updates.append("is_active = %s")
                         params.append(1 if patch["is_active"] else 0)
 
-                    if "冶炼厂类型" in patch:
-                        ft = patch["冶炼厂类型"]
-                        ft_val = str(ft).strip() if ft is not None and str(ft).strip() else None
-                        updates.append("factory_type = %s")
-                        params.append(ft_val)
+                    if "冶炼厂类型名" in patch or "冶炼厂类型id" in patch:
+                        ft_name = patch.get("冶炼厂类型名")
+                        ft_id = patch.get("冶炼厂类型id")
+                        if ft_name is not None and str(ft_name).strip():
+                            cur.execute(
+                                "SELECT id FROM dict_factory_types WHERE name = %s AND is_active = 1",
+                                (str(ft_name).strip(),),
+                            )
+                            ft_row = cur.fetchone()
+                            if ft_row:
+                                updates.append("factory_type_id = %s")
+                                params.append(int(ft_row[0]))
+                            else:
+                                raise ValueError(f"冶炼厂类型「{ft_name}」不存在或未启用")
+                        elif ft_id is not None and int(ft_id) >= 1:
+                            updates.append("factory_type_id = %s")
+                            params.append(int(ft_id))
+                        else:
+                            updates.append("factory_type_id = NULL")
 
                     if "地址" in patch:
                         addr = patch["地址"]
@@ -7355,6 +7593,7 @@ class TLService:
         base = (
             "FROM pd_smelter_calibration_prices p "
             "JOIN dict_factories df ON df.id = p.factory_id "
+            "LEFT JOIN dict_factory_types ft ON df.factory_type_id = ft.id "
             f"WHERE {where_sql}"
         )
         with get_conn() as conn:
@@ -7364,7 +7603,7 @@ class TLService:
                 cur.execute(
                     f"""
                     SELECT p.id, df.name, p.factory_id, p.calibration_price, p.price_date, p.created_at,
-                           COALESCE(df.factory_type, ''),
+                           df.factory_type_id, COALESCE(ft.name, ''),
                            CASE WHEN p.id = (
                                SELECT p2.id FROM pd_smelter_calibration_prices p2
                                WHERE p2.factory_id = p.factory_id
@@ -7386,8 +7625,9 @@ class TLService:
                             "标定价格": _cell_json(r[3]),
                             "定价日期": r[4].isoformat() if r[4] else None,
                             "上传时间": r[5].isoformat() if r[5] else None,
-                            "冶炼厂类型": r[6] or "",
-                            "是否当前冶炼厂最新": bool(r[7]),
+                            "冶炼厂类型id": r[6],
+                            "冶炼厂类型": r[7] or "",
+                            "是否当前冶炼厂最新": bool(r[8]),
                         }
                     )
         return {"code": 200, "data": {"total": total, "list": rows_out, "page": page, "page_size": page_size}}

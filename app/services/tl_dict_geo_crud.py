@@ -194,7 +194,8 @@ def _factory_row_api(row: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "id": int(row["id"]),
         "name": row["name"],
-        "factory_type": row.get("factory_type") or "",
+        "factory_type_id": row.get("factory_type_id"),
+        "factory_type_name": row.get("factory_type_name") or "",
         "province": row.get("province") or "",
         "city": row.get("city") or "",
         "district": row.get("district") or "",
@@ -211,6 +212,15 @@ def _factory_row_api(row: Dict[str, Any]) -> Dict[str, Any]:
 def _lookup_warehouse_type_id(cur, type_name: str) -> Optional[int]:
     cur.execute(
         "SELECT id FROM dict_warehouse_types WHERE name = %s AND is_active = 1",
+        (type_name.strip(),),
+    )
+    row = cur.fetchone()
+    return int(row["id"]) if row else None
+
+
+def _lookup_factory_type_id(cur, type_name: str) -> Optional[int]:
+    cur.execute(
+        "SELECT id FROM dict_factory_types WHERE name = %s AND is_active = 1",
         (type_name.strip(),),
     )
     row = cur.fetchone()
@@ -1581,7 +1591,8 @@ def smelter_create(payload: Dict[str, Any]) -> Dict[str, Any]:
     """新建冶炼厂：不写 color_config；经纬度默认不传则由天地图根据地址解析。"""
     try:
         name = str(payload.get("name") or "").strip()
-        factory_type = str(payload.get("factory_type") or "").strip() or None
+        factory_type_name = str(payload.get("factory_type_name") or "").strip() or None
+        factory_type_id = payload.get("factory_type_id")
         province = str(payload.get("province") or "").strip()
         city = str(payload.get("city") or "").strip()
         district = str(payload.get("district") or "").strip()
@@ -1625,13 +1636,22 @@ def smelter_create(payload: Dict[str, Any]) -> Dict[str, Any]:
                 if cur.fetchone():
                     return _err(CODE_DUP_NAME, "冶炼厂名称已存在")
 
+                # 解析类型：优先 ID，其次名称
+                ft_id = None
+                if factory_type_id is not None and int(factory_type_id) >= 1:
+                    ft_id = int(factory_type_id)
+                elif factory_type_name:
+                    ft_id = _lookup_factory_type_id(cur, factory_type_name)
+                    if ft_id is None:
+                        return _err(CODE_VALIDATION, "冶炼厂类型不存在或未启用，请先维护冶炼厂类型")
+
                 cur.execute(
-                    "INSERT INTO dict_factories (name, factory_type, province, city, district, address, "
+                    "INSERT INTO dict_factories (name, factory_type_id, province, city, district, address, "
                     "color_config, longitude, latitude, use_xunrongbao, is_active) "
                     "VALUES (%s,%s,%s,%s,%s,%s,NULL,%s,%s,%s,%s)",
                     (
                         name,
-                        factory_type,
+                        ft_id,
                         province,
                         city,
                         district,
@@ -1645,7 +1665,11 @@ def smelter_create(payload: Dict[str, Any]) -> Dict[str, Any]:
                 fid = cur.lastrowid
                 conn.commit()
 
-                cur.execute("SELECT * FROM dict_factories WHERE id = %s", (fid,))
+                cur.execute(
+                    "SELECT df.*, ft.name AS factory_type_name "
+                    "FROM dict_factories df "
+                    "LEFT JOIN dict_factory_types ft ON df.factory_type_id = ft.id "
+                    "WHERE df.id = %s", (fid,))
                 row = cur.fetchone()
         return _ok("创建成功", data=_factory_row_api(row))
     except pymysql.IntegrityError:
@@ -1682,7 +1706,10 @@ def smelter_update(factory_id: int, patch: Dict[str, Any]) -> Dict[str, Any]:
         with get_conn() as conn:
             with conn.cursor(DictCursor) as cur:
                 cur.execute(
-                    "SELECT * FROM dict_factories WHERE id = %s",
+                    "SELECT df.*, ft.name AS factory_type_name "
+                    "FROM dict_factories df "
+                    "LEFT JOIN dict_factory_types ft ON df.factory_type_id = ft.id "
+                    "WHERE df.id = %s",
                     (factory_id,),
                 )
                 row = cur.fetchone()
@@ -1690,7 +1717,8 @@ def smelter_update(factory_id: int, patch: Dict[str, Any]) -> Dict[str, Any]:
                     return _err(CODE_NOT_FOUND, "冶炼厂不存在")
 
                 name = patch.get("name")
-                factory_type = patch.get("factory_type")
+                factory_type_name = patch.get("factory_type_name")
+                factory_type_id = patch.get("factory_type_id")
                 province = patch.get("province")
                 city = patch.get("city")
                 district = patch.get("district")
@@ -1720,10 +1748,19 @@ def smelter_update(factory_id: int, patch: Dict[str, Any]) -> Dict[str, Any]:
                     updates.append("name = %s")
                     params.append(n)
 
-                if "factory_type" in patch:
-                    ft = str(factory_type).strip() if factory_type is not None else None
-                    updates.append("factory_type = %s")
-                    params.append(ft)
+                # 冶炼厂类型：优先名称→ID 解析，其次直接传 ID，可传 null 清空
+                if "factory_type_name" in patch or "factory_type_id" in patch:
+                    if factory_type_name is not None and str(factory_type_name).strip():
+                        ft_id = _lookup_factory_type_id(cur, str(factory_type_name).strip())
+                        if ft_id is None:
+                            return _err(CODE_VALIDATION, "冶炼厂类型不存在或未启用")
+                        updates.append("factory_type_id = %s")
+                        params.append(ft_id)
+                    elif factory_type_id is not None and int(factory_type_id) >= 1:
+                        updates.append("factory_type_id = %s")
+                        params.append(int(factory_type_id))
+                    else:
+                        updates.append("factory_type_id = NULL")
 
                 for fld, val, curv in (
                     ("province", province, p),
@@ -1772,7 +1809,10 @@ def smelter_update(factory_id: int, patch: Dict[str, Any]) -> Dict[str, Any]:
 
                 if not updates:
                     cur.execute(
-                        "SELECT * FROM dict_factories WHERE id = %s",
+                        "SELECT df.*, ft.name AS factory_type_name "
+                    "FROM dict_factories df "
+                    "LEFT JOIN dict_factory_types ft ON df.factory_type_id = ft.id "
+                    "WHERE df.id = %s",
                         (factory_id,),
                     )
                     nrow = cur.fetchone()
@@ -1786,7 +1826,10 @@ def smelter_update(factory_id: int, patch: Dict[str, Any]) -> Dict[str, Any]:
                 conn.commit()
 
                 cur.execute(
-                    "SELECT * FROM dict_factories WHERE id = %s",
+                    "SELECT df.*, ft.name AS factory_type_name "
+                    "FROM dict_factories df "
+                    "LEFT JOIN dict_factory_types ft ON df.factory_type_id = ft.id "
+                    "WHERE df.id = %s",
                     (factory_id,),
                 )
                 urow = cur.fetchone()
@@ -1832,7 +1875,7 @@ def smelter_list(
             conds.append("is_active = %s")
             params.append(1 if int(status) == 1 else 0)
         if factory_type is not None and str(factory_type).strip():
-            conds.append("factory_type = %s")
+            conds.append("df.factory_type_id IS NOT NULL AND ft.name = %s")
             params.append(str(factory_type).strip())
 
         where_sql = " AND ".join(conds)
@@ -1840,13 +1883,18 @@ def smelter_list(
         with get_conn() as conn:
             with conn.cursor(DictCursor) as cur:
                 cur.execute(
-                    f"SELECT COUNT(*) AS n FROM dict_factories WHERE {where_sql}",
+                    f"SELECT COUNT(*) AS n FROM dict_factories df "
+                    f"LEFT JOIN dict_factory_types ft ON df.factory_type_id = ft.id "
+                    f"WHERE {where_sql}",
                     tuple(params),
                 )
                 total = int(cur.fetchone()["n"])
                 cur.execute(
-                    f"SELECT * FROM dict_factories WHERE {where_sql} "
-                    f"ORDER BY id DESC LIMIT %s OFFSET %s",
+                    f"SELECT df.*, ft.name AS factory_type_name "
+                    f"FROM dict_factories df "
+                    f"LEFT JOIN dict_factory_types ft ON df.factory_type_id = ft.id "
+                    f"WHERE {where_sql} "
+                    f"ORDER BY df.id DESC LIMIT %s OFFSET %s",
                     tuple(params + [size, offset]),
                 )
                 rows = cur.fetchall()
@@ -1866,7 +1914,10 @@ def smelter_get(factory_id: int) -> Dict[str, Any]:
         with get_conn() as conn:
             with conn.cursor(DictCursor) as cur:
                 cur.execute(
-                    "SELECT * FROM dict_factories WHERE id = %s",
+                    "SELECT df.*, ft.name AS factory_type_name "
+                    "FROM dict_factories df "
+                    "LEFT JOIN dict_factory_types ft ON df.factory_type_id = ft.id "
+                    "WHERE df.id = %s",
                     (factory_id,),
                 )
                 row = cur.fetchone()

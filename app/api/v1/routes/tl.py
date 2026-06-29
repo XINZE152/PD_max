@@ -6,7 +6,8 @@ TL比价模块路由
   0. POST /tl/add_warehouse            - 添加仓库（省市区+详址齐全时经纬度默认由天地图解析）
   1. GET  /tl/get_warehouses           - 获取仓库列表（keyword；可选 page；size 最大 200）
   1a.  GET/POST/DELETE  /tl/get_warehouse_types, /add_warehouse_type, /update_warehouse_type, /delete_warehouse_type  - 库房类型与颜色
-  1b.POST /tl/update_warehouse         - 修改仓库信息
+  1b.  GET/POST/DELETE  /tl/get_factory_types, /add_factory_type, /update_factory_type, /delete_factory_type  - 冶炼厂类型与颜色
+  1c.POST /tl/update_warehouse         - 修改仓库信息
   1c.DELETE /tl/delete_warehouse        - 删除仓库（软删除）
   1c2.DELETE /tl/purge_warehouse        - 永久删除仓库（硬删除）
   1d.库房单向关联（有向图）：POST /tl/bind_warehouse_link、DELETE /tl/unbind_warehouse_link、
@@ -105,6 +106,8 @@ from app.models.tl import (
     WarehouseLinksBatchOutboundRequest,
     WarehouseLinksReplaceOutboundRequest,
     UpdateWarehouseTypeRequest,
+    AddFactoryTypeRequest,
+    UpdateFactoryTypeRequest,
     AddSmelterRequest,
     UploadVarietyRequest,
     UpdateSmelterRequest,
@@ -510,7 +513,72 @@ def delete_warehouse_type(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ===================== 接口1b：修改仓库 =====================
+# ===================== 接口1b：冶炼厂类型（类型-颜色）维护 =====================
+
+@router.get("/get_factory_types", summary="冶炼厂类型列表")
+def get_factory_types(
+    keyword: Optional[str] = Query(None, description="类型名模糊搜索（可选）"),
+    include_inactive: bool = Query(
+        False,
+        description="是否包含已停用的类型",
+    ),
+    service: TLService = Depends(get_tl_service),
+):
+    try:
+        data = service.get_factory_types(
+            keyword=keyword,
+            include_inactive=include_inactive,
+        )
+        return {"code": 200, "data": data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/add_factory_type", summary="新增冶炼厂类型")
+def add_factory_type(
+    body: AddFactoryTypeRequest,
+    service: TLService = Depends(get_tl_service),
+):
+    try:
+        return service.add_factory_type(
+            name=body.类型名,
+            color_config=body.颜色配置,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/update_factory_type", summary="修改冶炼厂类型")
+def update_factory_type(
+    body: UpdateFactoryTypeRequest,
+    service: TLService = Depends(get_tl_service),
+):
+    try:
+        patch = body.model_dump(exclude_unset=True)
+        type_id = patch.pop("类型id")
+        return service.update_factory_type(type_id=type_id, patch=patch)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/delete_factory_type", summary="删除冶炼厂类型（软删除）")
+def delete_factory_type(
+    type_id: int = Query(..., description="冶炼厂类型 id"),
+    service: TLService = Depends(get_tl_service),
+):
+    try:
+        return service.delete_factory_type(type_id=type_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ===================== 接口1c：修改仓库 =====================
 
 @router.post("/update_warehouse", summary="修改仓库信息")
 def update_warehouse(
@@ -875,7 +943,8 @@ def add_smelter(
             longitude=body.经度,
             latitude=body.纬度,
             use_xunrongbao=body.循融宝发货,
-            factory_type=body.冶炼厂类型,
+            factory_type_id=body.冶炼厂类型id,
+            factory_type_name=body.冶炼厂类型名,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
