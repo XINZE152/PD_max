@@ -211,6 +211,7 @@ TABLE_STATEMENTS = [
         longitude DECIMAL(11, 8) DEFAULT NULL COMMENT '经度',
         latitude DECIMAL(10, 8) DEFAULT NULL COMMENT '纬度',
         use_xunrongbao TINYINT(1) NOT NULL DEFAULT 0 COMMENT '是否循融宝发货（启用时每吨货物单价加价）',
+        factory_type VARCHAR(50) DEFAULT NULL COMMENT '冶炼厂类型',
         is_active TINYINT(1) DEFAULT 1 COMMENT '是否启用',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -1270,6 +1271,32 @@ def ensure_dict_factories_use_xunrongbao_column() -> None:
         connection.close()
 
 
+def ensure_dict_factories_factory_type_column() -> None:
+    """冶炼厂类型（仓库类型对应参数，用于冶炼厂分类筛选）。"""
+    config_dict = get_mysql_config()
+    connection = pymysql.connect(**config_dict)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SHOW TABLES LIKE 'dict_factories'")
+            if cursor.fetchone() is None:
+                return
+            cursor.execute(
+                "SELECT COUNT(*) FROM information_schema.columns "
+                "WHERE table_schema = DATABASE() AND table_name = 'dict_factories' "
+                "AND column_name = 'factory_type'"
+            )
+            if cursor.fetchone()[0] > 0:
+                return
+            cursor.execute(
+                "ALTER TABLE dict_factories ADD COLUMN factory_type VARCHAR(50) DEFAULT NULL "
+                "COMMENT '冶炼厂类型' AFTER use_xunrongbao"
+            )
+            logger.info("已为 dict_factories 添加 factory_type 列")
+        connection.commit()
+    finally:
+        connection.close()
+
+
 def ensure_dict_factories_geo_region_columns() -> None:
     """冶炼厂省市区、颜色、经纬度（与仓库一致，供天地图落库）。"""
     config_dict = get_mysql_config()
@@ -1681,6 +1708,10 @@ def create_tables() -> None:
         ensure_dict_factories_use_xunrongbao_column()
     except Exception:
         logger.exception("检查/添加 dict_factories.use_xunrongbao 失败")
+    try:
+        ensure_dict_factories_factory_type_column()
+    except Exception:
+        logger.exception("检查/添加 dict_factories.factory_type 失败")
     try:
         ensure_pd_xunrongbao_price_premiums_table()
     except Exception:

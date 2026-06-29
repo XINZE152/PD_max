@@ -194,6 +194,7 @@ def _factory_row_api(row: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "id": int(row["id"]),
         "name": row["name"],
+        "factory_type": row.get("factory_type") or "",
         "province": row.get("province") or "",
         "city": row.get("city") or "",
         "district": row.get("district") or "",
@@ -1580,6 +1581,7 @@ def smelter_create(payload: Dict[str, Any]) -> Dict[str, Any]:
     """新建冶炼厂：不写 color_config；经纬度默认不传则由天地图根据地址解析。"""
     try:
         name = str(payload.get("name") or "").strip()
+        factory_type = str(payload.get("factory_type") or "").strip() or None
         province = str(payload.get("province") or "").strip()
         city = str(payload.get("city") or "").strip()
         district = str(payload.get("district") or "").strip()
@@ -1624,11 +1626,12 @@ def smelter_create(payload: Dict[str, Any]) -> Dict[str, Any]:
                     return _err(CODE_DUP_NAME, "冶炼厂名称已存在")
 
                 cur.execute(
-                    "INSERT INTO dict_factories (name, province, city, district, address, "
+                    "INSERT INTO dict_factories (name, factory_type, province, city, district, address, "
                     "color_config, longitude, latitude, use_xunrongbao, is_active) "
-                    "VALUES (%s,%s,%s,%s,%s,NULL,%s,%s,%s,%s)",
+                    "VALUES (%s,%s,%s,%s,%s,%s,NULL,%s,%s,%s,%s)",
                     (
                         name,
+                        factory_type,
                         province,
                         city,
                         district,
@@ -1687,6 +1690,7 @@ def smelter_update(factory_id: int, patch: Dict[str, Any]) -> Dict[str, Any]:
                     return _err(CODE_NOT_FOUND, "冶炼厂不存在")
 
                 name = patch.get("name")
+                factory_type = patch.get("factory_type")
                 province = patch.get("province")
                 city = patch.get("city")
                 district = patch.get("district")
@@ -1715,6 +1719,11 @@ def smelter_update(factory_id: int, patch: Dict[str, Any]) -> Dict[str, Any]:
                         return _err(CODE_DUP_NAME, "冶炼厂名称已存在")
                     updates.append("name = %s")
                     params.append(n)
+
+                if "factory_type" in patch:
+                    ft = str(factory_type).strip() if factory_type is not None else None
+                    updates.append("factory_type = %s")
+                    params.append(ft)
 
                 for fld, val, curv in (
                     ("province", province, p),
@@ -1797,6 +1806,7 @@ def smelter_list(
     city: Optional[str] = None,
     district: Optional[str] = None,
     status: Optional[int] = None,
+    factory_type: Optional[str] = None,
 ) -> Dict[str, Any]:
     try:
         page = max(1, page)
@@ -1821,6 +1831,9 @@ def smelter_list(
         if status is not None:
             conds.append("is_active = %s")
             params.append(1 if int(status) == 1 else 0)
+        if factory_type is not None and str(factory_type).strip():
+            conds.append("factory_type = %s")
+            params.append(str(factory_type).strip())
 
         where_sql = " AND ".join(conds)
 

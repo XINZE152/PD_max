@@ -395,6 +395,7 @@ class UpdateWarehouseTypeRequest(BaseModel):
 class AddSmelterRequest(BaseModel):
     """新建冶炼厂（比价侧不设标记颜色；经纬度默认由天地图根据地址解析）"""
     冶炼厂名: str = Field(..., description="冶炼厂名称")
+    冶炼厂类型: Optional[str] = Field(None, description="冶炼厂类型（可选）")
     循融宝发货: bool = Field(
         False,
         description="是否循融宝发货；与修改冶炼厂中该字段含义一致，新建默认否",
@@ -433,6 +434,7 @@ class UpdateSmelterRequest(BaseModel):
     """修改冶炼厂（无颜色字段；改行政区/地址且未手传经纬度时重新天地图）"""
     冶炼厂id: int = Field(..., description="冶炼厂ID")
     冶炼厂名: Optional[str] = Field(None, description="冶炼厂名称（可选）")
+    冶炼厂类型: Optional[str] = Field(None, description="冶炼厂类型（可选）；传 null 可清空")
     is_active: Optional[bool] = Field(None, description="是否启用（可选）")
     循融宝发货: Optional[bool] = Field(
         None,

@@ -864,7 +864,7 @@ def add_smelter(
     body: AddSmelterRequest,
     service: TLService = Depends(get_tl_service),
 ):
-    """省市区+详址齐全时落库并无标记色；经度/纬度默认不传，由天地图解析（若同时传经度+纬度则用手写值）。可选传循融宝发货。"""
+    """省市区+详址齐全时落库并无标记色；经度/纬度默认不传，由天地图解析（若同时传经度+纬度则用手写值）。可选传循融宝发货、冶炼厂类型。"""
     try:
         return service.add_smelter(
             name=body.冶炼厂名,
@@ -875,6 +875,7 @@ def add_smelter(
             longitude=body.经度,
             latitude=body.纬度,
             use_xunrongbao=body.循融宝发货,
+            factory_type=body.冶炼厂类型,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -931,6 +932,7 @@ def get_smelters(
     city: Optional[str] = Query(None),
     district: Optional[str] = Query(None),
     status: Optional[int] = Query(None, description="1 启用 0 停用；分页时省略则默认仅启用"),
+    factory_type: Optional[str] = Query(None, description="冶炼厂类型筛选（可选）"),
     service: TLService = Depends(get_tl_service),
 ):
     """列表不含冶炼厂颜色字段；未传 page 为简易列表，传 page 为分页结构。"""
@@ -943,6 +945,7 @@ def get_smelters(
             city=city,
             district=district,
             status=status,
+            factory_type=factory_type,
         )
         return {"code": 200, "data": data}
     except Exception as e:

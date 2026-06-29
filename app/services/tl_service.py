@@ -634,12 +634,15 @@ class TLService:
         latitude: Optional[float] = None,
         *,
         use_xunrongbao: bool = False,
+        factory_type: Optional[str] = None,
     ) -> Dict[str, Any]:
         """全地址落库时经纬度由天地图解析；未传经度/纬度或只传其一由 maybe_geocode 处理（可回退为 NULL）。use_xunrongbao 写入循融宝发货开关。"""
         addr = _strip_optional_str(address)
+        ft = str(factory_type).strip() if factory_type is not None and str(factory_type).strip() else None
         if _full_cn_site_address(province, city, district, addr):
             payload = {
                 "name": str(name).strip(),
+                "factory_type": ft,
                 "province": _strip_nonempty(province),
                 "city": _strip_nonempty(city),
                 "district": _strip_nonempty(district),
@@ -674,16 +677,16 @@ class TLService:
                             return {"code": 200, "msg": "冶炼厂已存在", "冶炼厂id": smelter_id, "新建": False}
                         xrb = 1 if use_xunrongbao else 0
                         cur.execute(
-                            "UPDATE dict_factories SET is_active = 1, use_xunrongbao = %s WHERE id = %s",
-                            (xrb, smelter_id),
+                            "UPDATE dict_factories SET is_active = 1, use_xunrongbao = %s, factory_type = %s WHERE id = %s",
+                            (xrb, ft, smelter_id),
                         )
                         return {"code": 200, "msg": "冶炼厂已恢复启用", "冶炼厂id": smelter_id, "新建": False}
 
                     xrb = 1 if use_xunrongbao else 0
                     cur.execute(
-                        "INSERT INTO dict_factories (name, address, is_active, use_xunrongbao) "
-                        "VALUES (%s, %s, 1, %s)",
-                        (name, addr, xrb),
+                        "INSERT INTO dict_factories (name, address, factory_type, is_active, use_xunrongbao) "
+                        "VALUES (%s, %s, %s, 1, %s)",
+                        (name, addr, ft, xrb),
                     )
                     return {"code": 200, "msg": "冶炼厂新建成功", "冶炼厂id": cur.lastrowid, "新建": True}
         except Exception as e:
@@ -1909,6 +1912,7 @@ class TLService:
         return {
             "冶炼厂id": int(item["id"]),
             "冶炼厂": item["name"],
+            "冶炼厂类型": item.get("factory_type") or "",
             "地址": item.get("address") or "",
             "省": item.get("province") or "",
             "市": item.get("city") or "",
@@ -1927,6 +1931,7 @@ class TLService:
         city: Optional[str] = None,
         district: Optional[str] = None,
         status: Optional[int] = None,
+        factory_type: Optional[str] = None,
     ) -> Any:
         if page is not None:
             try:
@@ -1939,7 +1944,7 @@ class TLService:
                 )
                 eff_status = status if status is not None else 1
                 res = _raise_tl_geo_crud_result(
-                    sa_smelter_list(pg, sz, kw, province, city, district, eff_status)
+                    sa_smelter_list(pg, sz, kw, province, city, district, eff_status, factory_type)
                 )
                 payload = res["data"] or {}
                 items_raw = payload.get("list") or []
@@ -1961,11 +1966,15 @@ class TLService:
             if keyword is not None and str(keyword).strip():
                 conditions.append("name LIKE %s")
                 params.append(f"%{str(keyword).strip()}%")
+            if factory_type is not None and str(factory_type).strip():
+                conditions.append("factory_type = %s")
+                params.append(str(factory_type).strip())
             where_sql = " AND ".join(conditions)
             with get_conn() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
-                        f"SELECT id AS `冶炼厂id`, name AS `冶炼厂`, address AS `地址`, "
+                        f"SELECT id AS `冶炼厂id`, name AS `冶炼厂`, factory_type AS `冶炼厂类型`, "
+                        f"address AS `地址`, "
                         f"province AS `省`, city AS `市`, district AS `区`, "
                         f"longitude AS `经度`, latitude AS `纬度`, "
                         f"COALESCE(use_xunrongbao, 0) AS `循融宝发货` "
@@ -2060,12 +2069,14 @@ class TLService:
                 with conn.cursor() as cur:
                     if include_inactive:
                         cur.execute(
-                            "SELECT id, name, COALESCE(use_xunrongbao, 0), is_active "
+                            "SELECT id, name, COALESCE(use_xunrongbao, 0), is_active, "
+                            "COALESCE(factory_type, '') AS factory_type "
                             "FROM dict_factories ORDER BY id"
                         )
                     else:
                         cur.execute(
-                            "SELECT id, name, COALESCE(use_xunrongbao, 0), is_active "
+                            "SELECT id, name, COALESCE(use_xunrongbao, 0), is_active, "
+                            "COALESCE(factory_type, '') AS factory_type "
                             "FROM dict_factories WHERE is_active = 1 ORDER BY id"
                         )
                     rows = cur.fetchall()
@@ -2091,6 +2102,7 @@ class TLService:
                         "冶炼厂": r[1],
                         "循融宝发货": bool(int(r[2])),
                         "is_active": bool(int(r[3])),
+                        "冶炼厂类型": r[4] or "",
                         "加价元每吨": premium_map.get(int(r[0])),
                     }
                     for r in rows
@@ -2175,6 +2187,9 @@ class TLService:
         out: Dict[str, Any] = {}
         if "循融宝发货" in patch and patch["循融宝发货"] is not None:
             out["use_xunrongbao"] = bool(patch["循融宝发货"])
+        if "冶炼厂类型" in patch:
+            ft = patch["冶炼厂类型"]
+            out["factory_type"] = str(ft).strip() if ft is not None and str(ft).strip() else None
         if "冶炼厂名" in patch:
             raw = patch["冶炼厂名"]
             if raw is None or str(raw).strip() == "":
@@ -2201,11 +2216,11 @@ class TLService:
         return out
 
     def update_smelter(self, smelter_id: int, patch: Dict[str, Any]) -> Dict[str, Any]:
-        allowed = {"冶炼厂名", "is_active", "地址", "循融宝发货"} | self._SM_SITE_PATCH_KEYS
+        allowed = {"冶炼厂名", "冶炼厂类型", "is_active", "地址", "循融宝发货"} | self._SM_SITE_PATCH_KEYS
         keys = set(patch.keys()) & allowed
         if not keys:
             raise ValueError(
-                "至少需要提供一个待修改字段：冶炼厂名、is_active、地址、循融宝发货、省、市、区、经度、纬度 之一"
+                "至少需要提供一个待修改字段：冶炼厂名、冶炼厂类型、is_active、地址、循融宝发货、省、市、区、经度、纬度 之一"
             )
 
         use_site = bool(keys & self._SM_SITE_PATCH_KEYS)
@@ -2249,6 +2264,12 @@ class TLService:
                     if "is_active" in patch and patch["is_active"] is not None:
                         updates.append("is_active = %s")
                         params.append(1 if patch["is_active"] else 0)
+
+                    if "冶炼厂类型" in patch:
+                        ft = patch["冶炼厂类型"]
+                        ft_val = str(ft).strip() if ft is not None and str(ft).strip() else None
+                        updates.append("factory_type = %s")
+                        params.append(ft_val)
 
                     if "地址" in patch:
                         addr = patch["地址"]
@@ -7343,6 +7364,7 @@ class TLService:
                 cur.execute(
                     f"""
                     SELECT p.id, df.name, p.factory_id, p.calibration_price, p.price_date, p.created_at,
+                           COALESCE(df.factory_type, ''),
                            CASE WHEN p.id = (
                                SELECT p2.id FROM pd_smelter_calibration_prices p2
                                WHERE p2.factory_id = p.factory_id
@@ -7364,7 +7386,8 @@ class TLService:
                             "标定价格": _cell_json(r[3]),
                             "定价日期": r[4].isoformat() if r[4] else None,
                             "上传时间": r[5].isoformat() if r[5] else None,
-                            "是否当前冶炼厂最新": bool(r[6]),
+                            "冶炼厂类型": r[6] or "",
+                            "是否当前冶炼厂最新": bool(r[7]),
                         }
                     )
         return {"code": 200, "data": {"total": total, "list": rows_out, "page": page, "page_size": page_size}}
