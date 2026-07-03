@@ -25,13 +25,11 @@ from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPExcepti
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
-from PIL import Image, ImageDraw
 
 from app.ai_detection.amount_candidates import (
     build_amount_candidates,
     detect_certificate_document_override,
 )
-from app.ai_detection.core.utils import load_chinese_font
 from app.config import AI_RULE_CHECK_PERSIST, AI_RULE_CHECK_STORE_IMAGE, UPLOAD_DIR
 from app.ai_detection.easyocr_download_patch import patch_easyocr_download
 from app.ai_detection.history_export import (
@@ -56,7 +54,7 @@ from app.ai_detection.history_db import (
     normalize_history_original_filename,
     purge_ai_detection_history_older_than,
 )
-from app.ai_detection.ocr_utils import build_detection_bboxes_from_tokens, run_full_image_ocr
+from app.ai_detection.ocr_utils import build_key_field_rois_from_tokens, run_full_image_ocr
 from app.ai_detection.rule_check_display import build_rule_check_public_summary
 from app.ai_detection.rule_check_history import (
     MODE_RULE_CHECKS,
@@ -127,7 +125,7 @@ class TaskRecordDTO(BaseModel):
         None,
         description="用户上传时的原始文件名（用于历史展示；磁盘文件仍为 task_id.jpg）",
     )
-    bbox: Optional[BBoxDTO] = Field(None, description="用户指定的检测框；未传则后台自动 OCR 找数字区域")
+    bbox: Optional[BBoxDTO] = Field(None, description="用户指定的检测框；未传则后台自动 OCR 找金额、姓名、时间关键区域")
     result: Optional[Dict[str, Any]] = Field(
         None,
         description="单框检测结果：含 result / confidence / bbox / reason 等，见接口说明中的输出样例",
@@ -627,7 +625,8 @@ class DetectionService:
                 img_cv2, ocr_tokens = await run_in_threadpool(run_full_image_ocr, tmp_path, ocr_reader)
                 detection_bboxes: List[List[int]] = []
                 if img_cv2 is not None and ocr_tokens:
-                    detection_bboxes = build_detection_bboxes_from_tokens(ocr_tokens, img_cv2.shape)
+                    key_rois = build_key_field_rois_from_tokens(ocr_tokens, img_cv2.shape)
+                    detection_bboxes = [list(roi["bbox"]) for roi in key_rois if roi.get("bbox")]
                 result_str = await run_in_threadpool(
                     partial(
                         engine.predict,
@@ -1194,6 +1193,7 @@ class DetectionDomainServiceV3:
         self._cached_img_cv2: Optional[np.ndarray] = None
         self._cached_tokens: Optional[List[Any]] = None
         self._cached_candidates: Optional[List[Any]] = None
+        self._cached_key_rois: Optional[List[Dict[str, Any]]] = None
         self._ocr_reader: Optional[Any] = None
         self._cached_global_feat: Optional[np.ndarray] = None
 
@@ -1237,6 +1237,15 @@ class DetectionDomainServiceV3:
             return None
         return max(results, key=DetectionDomainServiceV3._result_sort_key)
 
+    @staticmethod
+    def _assign_region_numbers(results: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        numbered: List[Dict[str, Any]] = []
+        for index, item in enumerate(results, start=1):
+            copied = dict(item)
+            copied["region_no"] = index
+            numbered.append(copied)
+        return numbered
+
     async def _is_canceled(self, task_id: str) -> bool:
         task = await self.registry.get_task(task_id)
         return bool(not task or task.status == TaskStatusEnum.CANCELED)
@@ -1251,29 +1260,43 @@ class DetectionDomainServiceV3:
         self._cached_img_cv2 = img_cv2
         self._cached_tokens = tokens
         self._cached_candidates = build_amount_candidates(self._cached_tokens, img_cv2.shape)
+        self._cached_key_rois = build_key_field_rois_from_tokens(self._cached_tokens, img_cv2.shape)
         self._ocr_reader = ocr_reader
 
     def _predict_kwargs(self) -> Dict[str, Any]:
         detection_bboxes: List[List[int]] = []
-        if self._cached_candidates and self._cached_img_cv2 is not None:
-            detection_bboxes = [list(candidate.bbox) for candidate in self._cached_candidates]
+        if self._cached_key_rois and self._cached_img_cv2 is not None:
+            detection_bboxes = [list(roi["bbox"]) for roi in self._cached_key_rois if roi.get("bbox")]
         return {
             "detection_bboxes": detection_bboxes or None,
         }
 
     def _easyocr_auto_detect(self, image_path: str) -> List[BBoxDTO]:
         _ = image_path
-        if not self._cached_candidates:
+        if not self._cached_key_rois:
             return []
         return [
             BBoxDTO(
-                x1=int(candidate.bbox[0]),
-                y1=int(candidate.bbox[1]),
-                x2=int(candidate.bbox[2]),
-                y2=int(candidate.bbox[3]),
+                x1=int(roi["bbox"][0]),
+                y1=int(roi["bbox"][1]),
+                x2=int(roi["bbox"][2]),
+                y2=int(roi["bbox"][3]),
             )
-            for candidate in self._cached_candidates
+            for roi in self._cached_key_rois
+            if roi.get("bbox")
         ]
+
+    def _roi_metadata_for_bbox(self, bbox_xyxy: Sequence[int]) -> Dict[str, Any]:
+        target = [int(value) for value in bbox_xyxy[:4]]
+        for index, roi in enumerate(self._cached_key_rois or [], start=1):
+            if [int(value) for value in roi.get("bbox", [])[:4]] != target:
+                continue
+            return {
+                "region_no": index,
+                "field_type": roi.get("field_type"),
+                "field_label": roi.get("field_label") or roi.get("category"),
+            }
+        return {}
 
     def _document_rule_override(self, image_path: str) -> Optional[Dict[str, Any]]:
         if self._cached_img_cv2 is None or not self._cached_tokens:
@@ -1419,6 +1442,9 @@ class DetectionDomainServiceV3:
                     raise ValueError(res_dict.get("reason"))
 
                 res_dict["original_bbox"] = bbox_list
+                res_dict["region_no"] = 1
+                res_dict["field_type"] = "manual"
+                res_dict["field_label"] = "手动框选"
                 await self._finalize_completed_task(
                     task_id,
                     image_path,
@@ -1466,7 +1492,6 @@ class DetectionDomainServiceV3:
                 )
                 return
 
-            global_feat = self._cached_global_feat
             all_results = []
             for b in bboxes:
                 if await self._is_canceled(task_id):
@@ -1483,6 +1508,7 @@ class DetectionDomainServiceV3:
                     res_dict = json.loads(res_str)
                     if res_dict.get("result") != "错误":
                         res_dict["original_bbox"] = b_list
+                        res_dict.update(self._roi_metadata_for_bbox(b_list))
                         all_results.append(res_dict)
                 except Exception as exc:
                     logger.warning("Task %s single bbox failed: %s", task_id, exc)
@@ -1492,9 +1518,12 @@ class DetectionDomainServiceV3:
             if await self._is_canceled(task_id):
                 return
             if document_override and not any(item.get("result") == "篡改" for item in all_results):
+                document_override.setdefault("field_type", "amount")
+                document_override.setdefault("field_label", "金额")
                 all_results.append(document_override)
 
             ordered_results = sorted(all_results, key=self._result_sort_key, reverse=True)
+            ordered_results = self._assign_region_numbers(ordered_results)
             top_result = self._select_top_result(ordered_results)
             await self._finalize_completed_task(
                 task_id,
@@ -1542,54 +1571,14 @@ class DetectionDomainServiceV3:
                 raise ValueError("Task not completed.")
 
         vis_path = STORAGE_DIR / f"vis_{task_id}.jpg"
-        if vis_path.exists():
-            return str(vis_path)
 
         def draw_bboxes() -> None:
-            img_cv2 = cv2.imdecode(np.fromfile(image_path, dtype=np.uint8), cv2.IMREAD_COLOR)
-            if img_cv2 is None:
-                raise ValueError("无法读取任务原图")
-
-            img_pil = Image.fromarray(cv2.cvtColor(img_cv2, cv2.COLOR_BGR2RGB))
-            draw = ImageDraw.Draw(img_pil)
-            font = load_chinese_font(22)
-
-            results_to_draw = list(multi_results)
-            if result and not results_to_draw:
-                results_to_draw.append(result)
-
-            for res in results_to_draw:
-                original_b = res.get("original_bbox") or res.get("bbox", [0, 0, 10, 10])
-                x1, y1, x2, y2 = original_b[0], original_b[1], original_b[2], original_b[3]
-
-                status = res.get("result", "正常")
-                confidence = res.get("confidence", 0.0)
-
-                if status == "篡改":
-                    color, text_color = (255, 0, 0), (255, 255, 255)
-                    label = f"篡改 | 风险:{confidence:.1%}"
-                elif status == "可疑":
-                    color, text_color = (255, 165, 0), (0, 0, 0)
-                    label = f"可疑 | 风险:{confidence:.1%}"
-                else:
-                    color, text_color = (0, 255, 0), (0, 0, 0)
-                    label = f"正常 | 风险:{confidence:.1%}"
-
-                draw.rectangle([(x1, y1), (x2, y2)], outline=color, width=3)
-
-                text_bbox = draw.textbbox((0, 0), label, font=font)
-                text_width = text_bbox[2] - text_bbox[0]
-                text_height = text_bbox[3] - text_bbox[1]
-                label_bg_y1 = max(y1 - text_height - 6, 0)
-
-                draw.rectangle(
-                    [(x1, label_bg_y1), (min(x1 + text_width + 6, img_pil.width), max(y1, text_height + 6))],
-                    fill=color,
-                )
-                draw.text((x1 + 3, label_bg_y1 + 3), label, font=font, fill=text_color)
-
-            img_cv2_result = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
-            cv2.imencode(".jpg", img_cv2_result)[1].tofile(str(vis_path))
+            outcome: Dict[str, Any] = {}
+            if result is not None:
+                outcome["result"] = result
+            if multi_results:
+                outcome["multi_results"] = multi_results
+            vis_path.write_bytes(render_annotated_jpeg(Path(image_path), outcome))
 
         await run_in_threadpool(draw_bboxes)
         return str(vis_path)
@@ -2298,7 +2287,7 @@ async def history_export_download(req: HistoryExportRequest):
         "**输入（二选一）**\n"
         "1. 上传 **file**：新建任务，自动生成 `task_id` 并保存图片。\n"
         "2. 仅传 **task_id**：对已有任务重新触发排队（一般与上传二选一）。\n\n"
-        "可选 **bbox**：与 v1 相同格式；**不传**则使用 EasyOCR 自动框选图中疑似单号/金额等数字区域，"
+        "可选 **bbox**：与 v1 相同格式；**不传**则使用 EasyOCR 自动框选金额、姓名、时间关键区域，"
         "对每个框分别推理，结果在 `multi_results` 中。\n"
         "像素重叠、时间戳请并行调用 `POST .../api/v1/rule-checks` 或子接口。\n\n"
         "**输出示例（受理成功）**\n"
@@ -2396,7 +2385,10 @@ async def submit_detection(
         '      "confidence": 0.25,\n'
         '      "bbox": [10, 20, 100, 30],\n'
         '      "reason": "未检出明显篡改痕迹",\n'
-        '      "original_bbox": [10, 20, 110, 50]\n'
+        '      "original_bbox": [10, 20, 110, 50],\n'
+        '      "region_no": 1,\n'
+        '      "field_type": "amount",\n'
+        '      "field_label": "金额"\n'
         "    }\n"
         "  ],\n"
         '  "error_msg": null\n'
