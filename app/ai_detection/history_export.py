@@ -358,6 +358,8 @@ def build_export_preview_item(row: Dict[str, Any], *, image_variant: ImageVarian
     return {
         "id": rid,
         "created_at": row.get("created_at"),
+        "image_created_at": row.get("image_created_at"),
+        "batch": row.get("batch"),
         "mode": row.get("mode"),
         "task_id": row.get("task_id"),
         "original_filename": row.get("original_filename"),
@@ -378,12 +380,14 @@ def _fetch_export_rows(
     retention_days: Optional[int],
     modes: Optional[List[str]],
     status: Optional[str],
+    batch: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     if retention_days is not None:
         return query_ai_detection_history_for_export(
             retention_days=retention_days,
             modes=modes,
             status=status,
+            batch=batch,
         )
     assert start_time is not None and end_time is not None
     return query_ai_detection_history_for_export(
@@ -391,6 +395,7 @@ def _fetch_export_rows(
         end_time=end_time,
         modes=modes,
         status=status,
+        batch=batch,
     )
 
 
@@ -406,6 +411,7 @@ def preview_export(
     match_mode: MatchMode = "primary",
     image_variant: ImageVariant = "original",
     feedback_status: Optional[List[str]] = None,
+    batch: Optional[str] = None,
 ) -> Dict[str, Any]:
     rows = _fetch_export_rows(
         start_time=start_time,
@@ -413,6 +419,7 @@ def preview_export(
         retention_days=retention_days,
         modes=modes,
         status=status,
+        batch=batch,
     )
     task_ids = [str(r.get("task_id") or "").strip() for r in rows if r.get("task_id")]
     feedback_by_task = get_feedback_by_task_ids(task_ids)
@@ -453,8 +460,10 @@ def preview_export(
     if retention_days is not None:
         filters_applied["retention_days"] = retention_days
     else:
-        filters_applied["start_time"] = start_time.isoformat(sep=" ", timespec="seconds") if start_time else None
-        filters_applied["end_time"] = end_time.isoformat(sep=" ", timespec="seconds") if end_time else None
+        filters_applied["start_time"] = start_time.isoformat(sep=" ", timespec="minutes") if start_time else None
+        filters_applied["end_time"] = end_time.isoformat(sep=" ", timespec="minutes") if end_time else None
+    if batch:
+        filters_applied["batch"] = batch
     return {
         "total_matched": total,
         "with_image": with_image,
@@ -480,6 +489,7 @@ def _manifest_filters(
     feedback_status: Optional[List[str]],
     match_mode: MatchMode,
     image_variant: ImageVariant,
+    batch: Optional[str] = None,
 ) -> Dict[str, Any]:
     f: Dict[str, Any] = {
         "detection_results": detection_results or [],
@@ -494,9 +504,11 @@ def _manifest_filters(
         f["retention_days"] = retention_days
     else:
         if start_time:
-            f["start_time"] = start_time.isoformat(sep=" ", timespec="seconds")
+            f["start_time"] = start_time.isoformat(sep=" ", timespec="minutes")
         if end_time:
-            f["end_time"] = end_time.isoformat(sep=" ", timespec="seconds")
+            f["end_time"] = end_time.isoformat(sep=" ", timespec="minutes")
+    if batch:
+        f["batch"] = batch
     return f
 
 
@@ -512,6 +524,7 @@ def build_export_zip(
     match_mode: MatchMode = "primary",
     image_variant: ImageVariant = "original",
     feedback_status: Optional[List[str]] = None,
+    batch: Optional[str] = None,
 ) -> Tuple[bytes, str, Dict[str, Any]]:
     rows = _fetch_export_rows(
         start_time=start_time,
@@ -519,6 +532,7 @@ def build_export_zip(
         retention_days=retention_days,
         modes=modes,
         status=status,
+        batch=batch,
     )
     task_ids = [str(r.get("task_id") or "").strip() for r in rows if r.get("task_id")]
     feedback_by_task = get_feedback_by_task_ids(task_ids)
@@ -576,6 +590,8 @@ def build_export_zip(
                 {
                     "id": rid,
                     "created_at": row.get("created_at"),
+                    "image_created_at": row.get("image_created_at"),
+                    "batch": row.get("batch"),
                     "mode": row.get("mode"),
                     "task_id": row.get("task_id"),
                     "original_filename": row.get("original_filename"),
@@ -605,6 +621,7 @@ def build_export_zip(
                 feedback_status=feedback_status,
                 match_mode=match_mode,
                 image_variant=image_variant,
+                batch=batch,
             ),
             "records": manifest_records,
         }

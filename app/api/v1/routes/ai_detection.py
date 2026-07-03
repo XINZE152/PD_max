@@ -85,6 +85,7 @@ STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 MAX_CONCURRENT_AI_TASKS = int(os.getenv("AI_MAX_CONCURRENT_TASKS", "1"))
 GC_MAX_AGE_HOURS = int(os.getenv("AI_GC_MAX_AGE_HOURS", "24"))
 GC_INTERVAL_SECONDS = int(os.getenv("AI_GC_INTERVAL_SECONDS", "3600"))
+FORGEGUARD_REPLACE_RULE_CHECKS = os.getenv("FORGEGUARD_REPLACE_RULE_CHECKS", "").strip().lower() in ("1", "true", "yes")
 
 TASK_INTERRUPTED_MSG = (
     "检测任务已中断：后端进程曾退出并重新启动（常见于崩溃后自动拉起、部署或内存不足），"
@@ -698,6 +699,8 @@ class RuleCheckService:
         outcome: Dict[str, Any],
         tmp_path: Optional[str],
         task_id: Optional[str] = None,
+        image_created_at: Optional[str] = None,
+        batch: Optional[str] = None,
     ) -> None:
         if not AI_RULE_CHECK_PERSIST:
             return
@@ -715,8 +718,178 @@ class RuleCheckService:
                 outcome=outcome,
                 source_image_path=source_image_path,
                 task_id=task_id,
+                image_created_at=image_created_at,
+                batch=batch,
             ),
         )
+
+    @staticmethod
+    async def _process_via_forgeguard(
+        file: UploadFile,
+        *,
+        bbox_list: Optional[List[int]] = None,
+        bboxes_list: Optional[List[List[int]]] = None,
+        business_datetime: Optional[str] = None,
+        task_id: Optional[str] = None,
+        image_created_at: Optional[str] = None,
+        batch: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """FORGEGUARD_REPLACE_RULE_CHECKS=1 时，将规则检测请求转发到 ForgeGuard。"""
+        import requests as _requests
+
+        from app.ai_detection.forgeguard_client import (
+            FORGEGUARD_BASE_URL,
+            forgeguard_detect,
+            forgeguard_verify,
+        )
+
+        image_bytes = await file.read()
+        if not image_bytes:
+            raise ValueError("上传文件为空")
+        filename = file.filename or "image.jpg"
+
+        roi_bbox = bbox_list
+        detection_bboxes = bboxes_list
+        if roi_bbox is None and detection_bboxes:
+            roi_bbox = detection_bboxes[0]
+
+        tmp_path: Optional[str] = None
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
+                tmp.write(image_bytes)
+                tmp_path = tmp.name
+            if roi_bbox is not None:
+                # 有 bbox → /verify（区域验证 + 重叠分析）
+                raw = await run_in_threadpool(
+                    forgeguard_verify,
+                    image_bytes,
+                    roi_bbox=roi_bbox,
+                    detection_bboxes=detection_bboxes,
+                    filename=filename,
+                )
+                data = raw.get("data") or raw
+                htf = data.get("hard_tamper_flags") or {}
+                overlap = data.get("bbox_overlap_check") or {}
+
+                converted: Dict[str, Any] = {
+                    "pixel_overlap": {
+                        "pixel_overlap_score": data.get("confidence", 0),
+                        "alert": bool(htf.get("bbox_iou")) or data.get("result") in ("篡改", "可疑"),
+                        "hard_tamper": bool(htf.get("bbox_iou")),
+                        "bbox": data.get("bbox"),
+                        "reasons": [data.get("reason", "")] if data.get("reason") else [],
+                        "overlap_metrics": {},
+                    },
+                    "pixel_overlap_source": "forgeguard_verify",
+                    "suggested_rois": None,
+                    "timestamp": {
+                        "timestamp_check": {},
+                        "risk": data.get("confidence", 0),
+                        "reasons": [],
+                        "anomalies": [],
+                        "hard_tamper": False,
+                        "business_mismatch": False,
+                    },
+                    "hard_tamper_flags": {
+                        "pixel_overlap": bool(htf.get("bbox_iou")),
+                        "timestamp": False,
+                    },
+                    "reason": data.get("reason") or "未检出明显规则类异常",
+                    "forgeguard_overlap": overlap,
+                }
+            else:
+                # 无 bbox → /detect（整图三引擎检测）
+                raw = await run_in_threadpool(
+                    forgeguard_detect, image_bytes, filename=filename, technique="auto",
+                )
+                prediction = raw.get("prediction", "authentic")
+                confidence = float(raw.get("confidence", 0) or 0)
+                is_tampered = prediction == "forged"
+                is_suspicious = prediction == "uncertain"
+                regions = raw.get("forgery_regions") or []
+
+                converted = {
+                    "pixel_overlap": {
+                        "pixel_overlap_score": confidence,
+                        "alert": is_tampered or is_suspicious,
+                        "hard_tamper": is_tampered,
+                        "reasons": [f"ForgeGuard 整图: {prediction} (confidence={confidence:.2f})"],
+                        "overlap_metrics": {},
+                    },
+                    "pixel_overlap_source": "forgeguard_detect",
+                    "suggested_rois": [
+                        {
+                            "bbox": [r.get("x"), r.get("y"), r.get("w"), r.get("h")],
+                            "label": r.get("label", ""),
+                            "type": r.get("type", ""),
+                            "source": "forgeguard",
+                        }
+                        for r in regions
+                    ] if regions else None,
+                    "timestamp": {
+                        "timestamp_check": {},
+                        "risk": confidence,
+                        "reasons": [],
+                        "anomalies": [],
+                        "hard_tamper": False,
+                        "business_mismatch": False,
+                    },
+                    "hard_tamper_flags": {
+                        "pixel_overlap": is_tampered,
+                        "timestamp": False,
+                    },
+                    "reason": f"ForgeGuard 整图: {prediction} (confidence={confidence:.2f})",
+                    "forgeguard_detect": {
+                        "prediction": prediction,
+                        "confidence": confidence,
+                        "technique": raw.get("technique"),
+                        "votes_forged": raw.get("votes_forged"),
+                        "detectors": raw.get("detectors"),
+                    },
+                }
+
+            await RuleCheckService._persist_rule_check_history(
+                mode=MODE_RULE_CHECKS,
+                original_filename=file.filename,
+                bbox=bbox_list,
+                bboxes=bboxes_list,
+                status="COMPLETED",
+                outcome=build_rule_checks_outcome(
+                    converted,
+                    bbox=bbox_list,
+                    bboxes=bboxes_list,
+                    document_time=business_datetime,
+                ),
+                tmp_path=tmp_path,
+                task_id=task_id,
+                image_created_at=image_created_at,
+                batch=batch,
+            )
+
+            return converted
+
+        except _requests.ConnectionError:
+            raise ValueError(f"ForgeGuard 服务连接失败 ({FORGEGUARD_BASE_URL})，请确认服务已启动")
+        except _requests.Timeout:
+            raise ValueError(f"ForgeGuard 服务响应超时 ({FORGEGUARD_BASE_URL})")
+        except _requests.HTTPError as exc:
+            detail = str(exc)
+            try:
+                detail = str(exc.response.json() if exc.response is not None else str(exc))
+            except Exception:
+                pass
+            raise ValueError(f"ForgeGuard 返回错误: {detail}")
+        except ValueError:
+            raise
+        except Exception as exc:
+            logger.exception("forgeguard rule checks failed")
+            raise ValueError(f"ForgeGuard 检测异常: {exc}")
+        finally:
+            if tmp_path and os.path.isfile(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
 
     @staticmethod
     async def process_rule_checks(
@@ -729,9 +902,18 @@ class RuleCheckService:
         bboxes_list: Optional[List[List[int]]] = None,
         business_datetime: Optional[str] = None,
         task_id: Optional[str] = None,
+        image_created_at: Optional[str] = None,
+        batch: Optional[str] = None,
     ) -> Dict[str, Any]:
         tmp_path: Optional[str] = None
         try:
+            if FORGEGUARD_REPLACE_RULE_CHECKS:
+                return await RuleCheckService._process_via_forgeguard(
+                    file, bbox_list=bbox_list, bboxes_list=bboxes_list,
+                    business_datetime=business_datetime, task_id=task_id,
+                    image_created_at=image_created_at,
+                    batch=batch,
+                )
             tmp_path = await RuleCheckService._save_upload_to_temp(file)
             async with semaphore:
                 img_cv2, ocr_tokens = await run_in_threadpool(run_full_image_ocr, tmp_path, ocr_reader)
@@ -771,6 +953,8 @@ class RuleCheckService:
                 ),
                 tmp_path=tmp_path,
                 task_id=task_id,
+                image_created_at=image_created_at,
+                batch=batch,
             )
             return data
         except ValueError as exc:
@@ -788,6 +972,8 @@ class RuleCheckService:
                 ),
                 tmp_path=None,
                 task_id=task_id,
+                image_created_at=image_created_at,
+                batch=batch,
             )
             raise
         finally:
@@ -854,6 +1040,8 @@ class RuleCheckService:
         *,
         bboxes_list: Optional[List[List[int]]] = None,
         task_id: Optional[str] = None,
+        image_created_at: Optional[str] = None,
+        batch: Optional[str] = None,
     ) -> Dict[str, Any]:
         tmp_path: Optional[str] = None
         try:
@@ -900,6 +1088,8 @@ class RuleCheckService:
                 outcome=build_pixel_overlap_outcome(data, bbox=bbox_list or (bboxes_list[0] if bboxes_list else []), bboxes=bboxes_list),
                 tmp_path=tmp_path,
                 task_id=task_id,
+                image_created_at=image_created_at,
+                batch=batch,
             )
             return data
         except ValueError as exc:
@@ -916,6 +1106,8 @@ class RuleCheckService:
                 ),
                 tmp_path=None,
                 task_id=task_id,
+                image_created_at=image_created_at,
+                batch=batch,
             )
             raise
         finally:
@@ -931,6 +1123,8 @@ class RuleCheckService:
         *,
         business_datetime: Optional[str] = None,
         task_id: Optional[str] = None,
+        image_created_at: Optional[str] = None,
+        batch: Optional[str] = None,
     ) -> Dict[str, Any]:
         tmp_path: Optional[str] = None
         try:
@@ -962,6 +1156,8 @@ class RuleCheckService:
                 outcome=build_timestamp_outcome(data, document_time=business_datetime),
                 tmp_path=tmp_path,
                 task_id=task_id,
+                image_created_at=image_created_at,
+                batch=batch,
             )
             return data
         except ValueError as exc:
@@ -977,6 +1173,8 @@ class RuleCheckService:
                 ),
                 tmp_path=None,
                 task_id=task_id,
+                image_created_at=image_created_at,
+                batch=batch,
             )
             raise
         finally:
@@ -1164,6 +1362,8 @@ class DetectionDomainServiceV3:
         result: Optional[Dict[str, Any]],
         multi_results: Optional[List[Dict[str, Any]]] = None,
         persist_bbox: Any = None,
+        image_created_at: Optional[str] = None,
+        batch: Optional[str] = None,
     ) -> None:
         linked_rule_checks: Optional[Dict[str, Any]] = None
         task = await self.registry.get_task(task_id)
@@ -1194,6 +1394,7 @@ class DetectionDomainServiceV3:
             multi_results=multi_results,
             source_image_path=image_path,
             linked_rule_checks=linked_rule_checks,
+            image_created_at=image_created_at,
         )
 
     async def execute_async(
@@ -1201,6 +1402,8 @@ class DetectionDomainServiceV3:
         task_id: str,
         image_path: str,
         bbox: Optional[BBoxDTO] = None,
+        image_created_at: Optional[str] = None,
+        batch: Optional[str] = None,
     ) -> None:
         task = await self.registry.get_task(task_id)
         if not task or task.status == TaskStatusEnum.CANCELED:
@@ -1248,6 +1451,7 @@ class DetectionDomainServiceV3:
                     original_filename=history_filename,
                     bbox=bbox,
                     result=res_dict,
+                    image_created_at=image_created_at,
                 )
                 return
 
@@ -1258,18 +1462,33 @@ class DetectionDomainServiceV3:
             bboxes = self._deduplicate_bboxes(bboxes)
 
             if not bboxes:
-                empty_res = {
-                    "result": "无法检测",
-                    "confidence": 0.0,
-                    "reason": "未识别到金额、姓名、时间关键区域，无法自动检测",
-                }
+                async with self.semaphore:
+                    document_override = await run_in_threadpool(self._document_rule_override, image_path)
+                if await self._is_canceled(task_id):
+                    return
+
+                if document_override:
+                    await self._finalize_completed_task(
+                        task_id,
+                        image_path,
+                        original_filename=history_filename,
+                        bbox=None,
+                        result=document_override,
+                        multi_results=[document_override],
+                        persist_bbox={"auto_ocr": True, "note": "document_rule_override"},
+                        image_created_at=image_created_at,
+                    )
+                    return
+
+                empty_res = {"result": "正常", "confidence": 0.0, "reason": "未发现关键数值或单号区域"}
                 await self._finalize_completed_task(
                     task_id,
                     image_path,
                     original_filename=history_filename,
                     bbox=None,
                     result=empty_res,
-                    persist_bbox={"auto_ocr": True, "note": "no_key_field_regions"},
+                    persist_bbox={"auto_ocr": True, "note": "no_numeric_regions"},
+                    image_created_at=image_created_at,
                 )
                 return
 
@@ -1314,6 +1533,8 @@ class DetectionDomainServiceV3:
                 result=top_result,
                 multi_results=ordered_results,
                 persist_bbox={"auto_ocr": True, "box_count": len(ordered_results)},
+                image_created_at=image_created_at,
+                batch=batch,
             )
 
         except Exception as exc:
@@ -1326,6 +1547,8 @@ class DetectionDomainServiceV3:
                 status="FAILED",
                 error_msg=str(exc),
                 source_image_path=image_path,
+                image_created_at=image_created_at,
+                batch=batch,
             )
 
     async def generate_visualization(self, task_id: str) -> str:
@@ -1372,6 +1595,8 @@ class DetectionDomainServiceV3:
         error_msg: Optional[str] = None,
         source_image_path: Optional[str] = None,
         linked_rule_checks: Optional[Dict[str, Any]] = None,
+        image_created_at: Optional[str] = None,
+        batch: Optional[str] = None,
     ) -> None:
         try:
             outcome: Dict[str, Any] = {}
@@ -1393,6 +1618,8 @@ class DetectionDomainServiceV3:
                     status=status,
                     outcome=outcome,
                     source_image_path=source_image_path,
+                    image_created_at=image_created_at,
+                    batch=batch,
                 ),
             )
         except Exception:
@@ -1499,6 +1726,15 @@ async def rule_checks_endpoint(
         None,
         description="可选。与主鉴伪 async_v3 任务关联的 UUID",
     ),
+    image_created_at: Optional[str] = Form(
+        None,
+        description="可选。图片创建时间，格式如 2026-05-28 11:32:00",
+        examples=["2026-05-28 11:32:00"],
+    ),
+    batch: Optional[str] = Form(
+        None,
+        description="可选。批次号，同一批次上传的多张图片共享同一批次号；不传则自动生成",
+    ),
     engine: InferenceEngineAPI = Depends(get_engine),
     ocr_reader: Any = Depends(get_ocr_reader),
     semaphore: asyncio.Semaphore = Depends(get_ai_semaphore),
@@ -1525,6 +1761,8 @@ async def rule_checks_endpoint(
             bboxes_list=bboxes_list,
             business_datetime=document_time,
             task_id=task_id,
+            image_created_at=image_created_at,
+            batch=batch,
         )
         return {"status": "success", "data": data}
     except ValueError as exc:
@@ -1557,6 +1795,14 @@ async def pixel_overlap_check_endpoint(
         examples=["[[120,80,400,140],[500,200,700,350]]"],
     ),
     task_id: Optional[str] = Form(None, description="可选。与主鉴伪 async_v3 任务关联的 UUID"),
+    image_created_at: Optional[str] = Form(
+        None,
+        description="可选。图片创建时间，格式如 2026-05-28 11:32:00",
+    ),
+    batch: Optional[str] = Form(
+        None,
+        description="可选。批次号，同一批次上传的多张图片共享同一批次号；不传则自动生成",
+    ),
     engine: InferenceEngineAPI = Depends(get_engine),
     semaphore: asyncio.Semaphore = Depends(get_ai_semaphore),
 ):
@@ -1577,6 +1823,8 @@ async def pixel_overlap_check_endpoint(
     try:
         data = await RuleCheckService.process_pixel_overlap(
             file, bbox_list, engine, semaphore, bboxes_list=bboxes_list, task_id=task_id,
+            image_created_at=image_created_at,
+            batch=batch,
         )
         return {"status": "success", "data": data}
     except ValueError as exc:
@@ -1603,6 +1851,14 @@ async def timestamp_check_endpoint(
         examples=["2026-05-28 11:32:00"],
     ),
     task_id: Optional[str] = Form(None, description="可选。与主鉴伪 async_v3 任务关联的 UUID"),
+    image_created_at: Optional[str] = Form(
+        None,
+        description="可选。图片创建时间，格式如 2026-05-28 11:32:00",
+    ),
+    batch: Optional[str] = Form(
+        None,
+        description="可选。批次号，同一批次上传的多张图片共享同一批次号；不传则自动生成",
+    ),
     engine: InferenceEngineAPI = Depends(get_engine),
     ocr_reader: Any = Depends(get_ocr_reader),
     semaphore: asyncio.Semaphore = Depends(get_ai_semaphore),
@@ -1615,6 +1871,8 @@ async def timestamp_check_endpoint(
             ocr_reader,
             business_datetime=document_time,
             task_id=task_id,
+            image_created_at=image_created_at,
+            batch=batch,
         )
         return {"status": "success", "data": data}
     except ValueError as exc:
@@ -1663,6 +1921,14 @@ async def detect_tampering_endpoint(
         description="检测框：JSON 数组 [x1,y1,x2,y2] 或逗号分隔的四个整数",
         examples=["[120,80,400,140]", "120,80,400,140"],
     ),
+    image_created_at: Optional[str] = Form(
+        None,
+        description="可选。图片创建时间，格式如 2026-05-28 11:32:00",
+    ),
+    batch: Optional[str] = Form(
+        None,
+        description="可选。批次号，同一批次上传的多张图片共享同一批次号；不传则自动生成",
+    ),
     engine: InferenceEngineAPI = Depends(get_engine),
     ocr_reader: Any = Depends(get_ocr_reader),
     semaphore: asyncio.Semaphore = Depends(get_ai_semaphore),
@@ -1693,6 +1959,8 @@ async def detect_tampering_endpoint(
                     status="COMPLETED",
                     outcome={"result": res},
                     source_image_path=tmp_history_path,
+                    image_created_at=image_created_at,
+                    batch=batch,
                 ),
             )
         except Exception:
@@ -1804,11 +2072,11 @@ class HistoryExportRequest(BaseModel):
     )
     start_time: Optional[datetime] = Field(
         None,
-        description="开始时间（含）；未传 retention_days 时必填",
+        description="开始时间（含，精确到分钟，如 2026-06-26T15:30）；未传 retention_days 时必填",
     )
     end_time: Optional[datetime] = Field(
         None,
-        description="结束时间（含）；未传 retention_days 时必填",
+        description="结束时间（含，精确到分钟，如 2026-06-26T18:45）；未传 retention_days 时必填",
     )
     detection_results: Optional[List[str]] = Field(
         None,
@@ -1834,6 +2102,10 @@ class HistoryExportRequest(BaseModel):
         "primary",
         description="结论匹配：primary=按主结果 result；any=multi_results 任一条命中即保留",
     )
+    batch: Optional[str] = Field(
+        None,
+        description="批次号筛选，如 20260626-001；不传表示全部",
+    )
     image_variant: str = Field(
         "original",
         description="图片类型：original=原图，annotated=在原图上绘制检测框与结论（预览与导出均生效）",
@@ -1843,11 +2115,12 @@ class HistoryExportRequest(BaseModel):
         json_schema_extra={
             "examples": [
                 {
-                    "start_time": "2026-06-01T00:00:00",
-                    "end_time": "2026-06-17T23:59:59",
+                    "start_time": "2026-06-01T00:00",
+                    "end_time": "2026-06-17T23:59",
                     "detection_results": ["篡改", "可疑"],
                     "bbox_mode": "all",
                     "image_variant": "original",
+                    "batch": "20260617-001",
                 }
             ]
         }
@@ -1927,6 +2200,7 @@ async def history_export_preview(req: HistoryExportRequest):
             match_mode=req.match_mode,  # type: ignore[arg-type]
             image_variant=req.image_variant,  # type: ignore[arg-type]
             feedback_status=req.feedback_status,
+            batch=req.batch,
         ),
     )
     return {"status": "success", **data}
@@ -1957,6 +2231,7 @@ async def history_export_download(req: HistoryExportRequest):
             match_mode=req.match_mode,  # type: ignore[arg-type]
             image_variant=req.image_variant,  # type: ignore[arg-type]
             feedback_status=req.feedback_status,
+            batch=req.batch,
         ),
     )
     if preview["total_matched"] == 0:
@@ -1984,6 +2259,7 @@ async def history_export_download(req: HistoryExportRequest):
                 match_mode=req.match_mode,  # type: ignore[arg-type]
                 image_variant=req.image_variant,  # type: ignore[arg-type]
                 feedback_status=req.feedback_status,
+                batch=req.batch,
             ),
         )
     except ValueError as exc:
@@ -2038,6 +2314,14 @@ async def submit_detection(
         False,
         description="AI 鉴伪完成后自动执行规则检测，并写入同一 task_id 供辅助核查聚合",
     ),
+    image_created_at: Optional[str] = Form(
+        None,
+        description="可选。图片创建时间，格式如 2026-05-28 11:32:00",
+    ),
+    batch: Optional[str] = Form(
+        None,
+        description="可选。批次号，同一批次上传的多张图片共享同一批次号；不传则自动生成",
+    ),
     registry: AbstractTaskRegistry = Depends(get_registry),
     semaphore: asyncio.Semaphore = Depends(get_ai_semaphore),
 ):
@@ -2073,7 +2357,7 @@ async def submit_detection(
 
     await registry.update_task(task_id, status=TaskStatusEnum.PENDING, with_rule_checks=with_rule_checks)
     service = DetectionDomainServiceV3(registry, semaphore)
-    background_tasks.add_task(service.execute_async, task_id, task.image_path, bbox_dto)
+    background_tasks.add_task(service.execute_async, task_id, task.image_path, bbox_dto, image_created_at, batch)
     return {"status": "pending", "task_id": task_id}
 
 

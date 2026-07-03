@@ -158,6 +158,8 @@ def persist_rule_check_history(
     outcome: Dict[str, Any],
     source_image_path: Optional[str] = None,
     task_id: Optional[str] = None,
+    image_created_at: Optional[str] = None,
+    batch: Optional[str] = None,
 ) -> None:
     """写入 ai_detection_history；失败仅打日志，不抛出。
 
@@ -172,4 +174,6 @@ def persist_rule_check_history(
         status=status,
         outcome=outcome,
         source_image_path=source_image_path,
+        image_created_at=image_created_at,
+        batch=batch,
     )
