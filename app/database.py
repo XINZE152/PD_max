@@ -146,10 +146,12 @@ TABLE_STATEMENTS = [
         id INT AUTO_INCREMENT PRIMARY KEY COMMENT '库房类型ID',
         name VARCHAR(50) NOT NULL UNIQUE COMMENT '类型名称',
         color_config JSON DEFAULT NULL COMMENT '颜色配置（JSON），与类型唯一绑定',
+        category_id INT DEFAULT NULL COMMENT '大类ID',
         is_active TINYINT(1) DEFAULT 1 COMMENT '是否启用',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-        INDEX idx_wh_type_active (is_active)
+        INDEX idx_wh_type_active (is_active),
+        INDEX idx_wh_type_category (category_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='库房类型字典（类型-颜色一对一）';
     """,
     # 库房大类字典
@@ -173,7 +175,6 @@ TABLE_STATEMENTS = [
         district VARCHAR(64) DEFAULT NULL COMMENT '区县',
         address VARCHAR(500) DEFAULT NULL COMMENT '详细地址',
         warehouse_type_id INT DEFAULT NULL COMMENT '库房类型ID（类型颜色见 dict_warehouse_types）',
-        category_id INT DEFAULT NULL COMMENT '大类ID',
         color_config JSON DEFAULT NULL COMMENT '仓库独立颜色配置（JSON），可与库房类型颜色并存',
         longitude DECIMAL(11, 8) DEFAULT NULL COMMENT '经度',
         latitude DECIMAL(10, 8) DEFAULT NULL COMMENT '纬度',
@@ -189,10 +190,7 @@ TABLE_STATEMENTS = [
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         CONSTRAINT fk_wh_warehouse_type FOREIGN KEY (warehouse_type_id)
             REFERENCES dict_warehouse_types (id) ON UPDATE CASCADE ON DELETE SET NULL,
-        CONSTRAINT fk_wh_warehouse_category FOREIGN KEY (category_id)
-            REFERENCES dict_warehouse_categories (id) ON UPDATE CASCADE ON DELETE SET NULL,
         INDEX idx_wh_warehouse_type (warehouse_type_id),
-        INDEX idx_wh_category (category_id),
         INDEX idx_wh_geo_region (province, city, district)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='仓库字典表';
     """,
@@ -1850,7 +1848,7 @@ def create_tables() -> None:
 
 
 def ensure_warehouse_category_migration() -> None:
-    """库房大类表 + 仓库 category_id 列。"""
+    """库房大类表 + 库房类型表 category_id 列。"""
     config_dict = get_mysql_config()
     connection = pymysql.connect(**config_dict)
     try:
@@ -1868,47 +1866,31 @@ def ensure_warehouse_category_migration() -> None:
                 """
             )
 
-            cursor.execute("SHOW TABLES LIKE 'dict_warehouses'")
+            cursor.execute("SHOW TABLES LIKE 'dict_warehouse_types'")
             if cursor.fetchone() is None:
                 connection.commit()
                 return
 
-            def _has_cat_col(col: str) -> bool:
+            def _type_has_col(col: str) -> bool:
                 cursor.execute(
                     "SELECT COUNT(*) FROM information_schema.columns "
-                    "WHERE table_schema = DATABASE() AND table_name = 'dict_warehouses' "
+                    "WHERE table_schema = DATABASE() AND table_name = 'dict_warehouse_types' "
                     "AND column_name = %s",
                     (col,),
                 )
                 return cursor.fetchone()[0] > 0
 
-            def _has_cat_fk() -> bool:
+            if not _type_has_col("category_id"):
                 cursor.execute(
-                    "SELECT COUNT(*) FROM information_schema.TABLE_CONSTRAINTS "
-                    "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'dict_warehouses' "
-                    "AND CONSTRAINT_TYPE = 'FOREIGN KEY' AND CONSTRAINT_NAME = 'fk_wh_warehouse_category'"
+                    "ALTER TABLE dict_warehouse_types ADD COLUMN category_id INT DEFAULT NULL "
+                    "COMMENT '大类ID' AFTER color_config"
                 )
-                return cursor.fetchone()[0] > 0
+                logger.info("已为 dict_warehouse_types 添加 category_id 列")
 
-            if not _has_cat_col("category_id"):
+            if not _type_has_col("idx_wh_type_category"):
                 cursor.execute(
-                    "ALTER TABLE dict_warehouses ADD COLUMN category_id INT DEFAULT NULL "
-                    "COMMENT '大类ID' AFTER warehouse_type_id"
+                    "CREATE INDEX idx_wh_type_category ON dict_warehouse_types (category_id)"
                 )
-                logger.info("已为 dict_warehouses 添加 category_id 列")
-
-            if not _has_cat_col("idx_wh_category"):
-                cursor.execute(
-                    "CREATE INDEX idx_wh_category ON dict_warehouses (category_id)"
-                )
-
-            if not _has_cat_fk():
-                cursor.execute(
-                    "ALTER TABLE dict_warehouses ADD CONSTRAINT fk_wh_warehouse_category "
-                    "FOREIGN KEY (category_id) REFERENCES dict_warehouse_categories (id) "
-                    "ON UPDATE CASCADE ON DELETE SET NULL"
-                )
-                logger.info("已为 dict_warehouses 添加 fk_wh_warehouse_category 外键")
 
         connection.commit()
     finally:

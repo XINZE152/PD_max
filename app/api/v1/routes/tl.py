@@ -232,7 +232,6 @@ def add_warehouse(
             name=body.仓库名,
             address=body.地址,
             warehouse_type_id=body.仓库类型id,
-            warehouse_category_id=body.大类id,
             warehouse_color_config=body.仓库颜色配置,
             province=body.省,
             city=body.市,
@@ -433,13 +432,9 @@ def get_warehouses(
         None,
         description="1 启用 0 停用；分页时省略则默认仅启用",
     ),
-    category_id: Optional[int] = Query(
-        None,
-        description="库房大类 ID（可选）；筛选指定大类的仓库",
-    ),
     service: TLService = Depends(get_tl_service),
 ):
-    """未传 page 时返回全部启用仓库（含省市区与经纬度列）；传 page 时分页并支持省/市/区/status/大类 筛选。"""
+    """未传 page 时返回全部启用仓库（含省市区与经纬度列）；传 page 时分页并支持省/市/区/status 筛选。"""
     try:
         data = service.get_warehouses(
             keyword=keyword,
@@ -449,7 +444,6 @@ def get_warehouses(
             city=city,
             district=district,
             status=status,
-            warehouse_category_id=category_id,
         )
         return {"code": 200, "data": data}
     except Exception as e:
@@ -486,6 +480,7 @@ def add_warehouse_type(
         return service.add_warehouse_type(
             name=body.类型名,
             color_config=body.颜色配置,
+            category_id=body.大类id,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
