@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(e:/houduan/PD_max/.venv/Scripts/python.exe -c \"import ast; ast.parse\\(open\\(r'e:\\\\houduan\\\\PD_max\\\\app\\\\ai_detection\\\\rule_check_history.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
-      "Bash(git push *)"
+      "Bash(git push *)",
+      "Bash(e:/houduan/PD_max/.venv/Scripts/python.exe -c \"import ast; ast.parse\\(open\\(r'e:\\\\houduan\\\\PD_max\\\\app\\\\ai_detection\\\\history_db.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")"
     ]
   }
 }

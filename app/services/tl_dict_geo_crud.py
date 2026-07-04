@@ -169,6 +169,8 @@ def _warehouse_row_api(
         "id": int(row["id"]),
         "name": row["name"],
         "type": type_name or "",
+        "categoryId": row.get("category_id"),
+        "categoryName": row.get("category_name") or "",
         "province": row.get("province") or "",
         "city": row.get("city") or "",
         "district": row.get("district") or "",
@@ -225,6 +227,14 @@ def _lookup_factory_type_id(cur, type_name: str) -> Optional[int]:
     )
     row = cur.fetchone()
     return int(row["id"]) if row else None
+
+
+def _validate_warehouse_category_id(cur, category_id: int) -> bool:
+    cur.execute(
+        "SELECT id FROM dict_warehouse_categories WHERE id = %s AND is_active = 1",
+        (int(category_id),),
+    )
+    return cur.fetchone() is not None
 
 
 def warehouse_create(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -301,13 +311,19 @@ def warehouse_create(payload: Dict[str, Any]) -> Dict[str, Any]:
                 if cur.fetchone():
                     return _err(CODE_DUP_NAME, "仓库名称已存在")
 
+                cat_id = payload.get("category_id")
+                if cat_id is not None:
+                    cat_id = int(cat_id)
+                    if not _validate_warehouse_category_id(cur, cat_id):
+                        return _err(CODE_VALIDATION, "库房大类不存在或未启用")
+
                 cur.execute(
                     "INSERT INTO dict_warehouses (name, province, city, district, address, "
-                    "warehouse_type_id, color_config, longitude, latitude, "
+                    "warehouse_type_id, category_id, color_config, longitude, latitude, "
                     "contact_name, contact_phone, hazardous_waste_license_qty, "
                     "monthly_avg_receipt_ton, current_inventory_ton, receipt_price_per_ton, "
                     "freight_amount, is_active) "
-                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                     (
                         name,
                         province,
@@ -315,6 +331,7 @@ def warehouse_create(payload: Dict[str, Any]) -> Dict[str, Any]:
                         district,
                         address,
                         wt_id,
+                        cat_id,
                         cc_json,
                         rx_lon,
                         rx_lat,
@@ -432,6 +449,17 @@ def warehouse_update(wh_id: int, patch: Dict[str, Any]) -> Dict[str, Any]:
                             return _err(CODE_VALIDATION, "库房类型不存在或未启用")
                         updates.append("warehouse_type_id = %s")
                         params.append(new_wt_id)
+
+                if "category_id" in patch:
+                    cat_p = patch.get("category_id")
+                    if cat_p is None:
+                        updates.append("category_id = NULL")
+                    else:
+                        cat_id = int(cat_p)
+                        if not _validate_warehouse_category_id(cur, cat_id):
+                            return _err(CODE_VALIDATION, "库房大类不存在或未启用")
+                        updates.append("category_id = %s")
+                        params.append(cat_id)
 
                 if province is not None:
                     updates.append("province = %s")
@@ -566,6 +594,7 @@ def warehouse_list(
     city: Optional[str] = None,
     district: Optional[str] = None,
     status: Optional[int] = None,
+    category_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     try:
         page = max(1, page)
@@ -593,6 +622,9 @@ def warehouse_list(
         if status is not None:
             conds.append("dw.is_active = %s")
             params.append(1 if int(status) == 1 else 0)
+        if category_id is not None:
+            conds.append("dw.category_id = %s")
+            params.append(int(category_id))
 
         where_sql = " AND ".join(conds)
 
@@ -601,14 +633,17 @@ def warehouse_list(
                 cur.execute(
                     f"SELECT COUNT(*) AS n FROM dict_warehouses dw "
                     f"LEFT JOIN dict_warehouse_types wt ON dw.warehouse_type_id = wt.id "
+                    f"LEFT JOIN dict_warehouse_categories wc ON dw.category_id = wc.id "
                     f"WHERE {where_sql}",
                     tuple(params),
                 )
                 total = int(cur.fetchone()["n"])
 
                 cur.execute(
-                    f"SELECT dw.*, wt.name AS type_name FROM dict_warehouses dw "
+                    f"SELECT dw.*, wt.name AS type_name, wc.name AS category_name "
+                    f"FROM dict_warehouses dw "
                     f"LEFT JOIN dict_warehouse_types wt ON dw.warehouse_type_id = wt.id "
+                    f"LEFT JOIN dict_warehouse_categories wc ON dw.category_id = wc.id "
                     f"WHERE {where_sql} ORDER BY dw.id DESC LIMIT %s OFFSET %s",
                     tuple(params + [size, offset]),
                 )

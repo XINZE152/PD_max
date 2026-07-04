@@ -519,6 +519,7 @@ class TLService:
         name: str,
         address: Optional[str] = None,
         warehouse_type_id: Optional[int] = None,
+        warehouse_category_id: Optional[int] = None,
         warehouse_color_config: Optional[Any] = None,
         province: Optional[str] = None,
         city: Optional[str] = None,
@@ -548,6 +549,7 @@ class TLService:
             payload = {
                 "name": str(name).strip(),
                 "type": type_name,
+                "category_id": warehouse_category_id,
                 "province": _strip_nonempty(province),
                 "city": _strip_nonempty(city),
                 "district": _strip_nonempty(district),
@@ -601,6 +603,16 @@ class TLService:
                                 f"库房类型 id={warehouse_type_id} 不存在或未启用，"
                                 f"请先用 add_warehouse_type 维护类型"
                             )
+                    if warehouse_category_id is not None:
+                        cur.execute(
+                            "SELECT id FROM dict_warehouse_categories "
+                            "WHERE id = %s AND is_active = 1",
+                            (warehouse_category_id,),
+                        )
+                        if not cur.fetchone():
+                            raise ValueError(
+                                f"库房大类 id={warehouse_category_id} 不存在或未启用"
+                            )
                     cur.execute(
                         "SELECT id FROM dict_warehouses WHERE name = %s",
                         (name,),
@@ -610,9 +622,9 @@ class TLService:
                         return {"code": 200, "msg": "仓库已存在", "仓库id": row[0], "新建": False}
                     cur.execute(
                         "INSERT INTO dict_warehouses "
-                        "(name, address, warehouse_type_id, color_config, is_active) "
-                        "VALUES (%s, %s, %s, %s, 1)",
-                        (name, addr, warehouse_type_id, wh_cc_json),
+                        "(name, address, warehouse_type_id, category_id, color_config, is_active) "
+                        "VALUES (%s, %s, %s, %s, %s, 1)",
+                        (name, addr, warehouse_type_id, warehouse_category_id, wh_cc_json),
                     )
                     return {"code": 200, "msg": "仓库新建成功", "仓库id": cur.lastrowid, "新建": True}
         except ValueError:
@@ -768,6 +780,8 @@ class TLService:
             "运费": item.get("freightAmount"),
             "仓库类型id": wt_id,
             "类型": tname,
+            "大类id": item.get("categoryId"),
+            "大类": item.get("categoryName") or "",
             "库房类型颜色配置": None,
             "仓库颜色配置": wh_cc,
             "颜色配置": None,
@@ -1010,6 +1024,7 @@ class TLService:
         city: Optional[str] = None,
         district: Optional[str] = None,
         status: Optional[int] = None,
+        warehouse_category_id: Optional[int] = None,
     ) -> Any:
         if page is not None:
             try:
@@ -1022,7 +1037,7 @@ class TLService:
                 )
                 eff_status = status if status is not None else 1
                 res = _raise_tl_geo_crud_result(
-                    sa_wh_list(pg, sz, kw, None, province, city, district, eff_status)
+                    sa_wh_list(pg, sz, kw, None, province, city, district, eff_status, warehouse_category_id)
                 )
                 payload = res["data"] or {}
                 items_raw = payload.get("list") or []
@@ -1066,6 +1081,9 @@ class TLService:
             if kw:
                 conditions.append("(dw.name LIKE %s OR IFNULL(wt.name, '') LIKE %s)")
                 params.extend([f"%{kw}%", f"%{kw}%"])
+            if warehouse_category_id is not None:
+                conditions.append("dw.category_id = %s")
+                params.append(int(warehouse_category_id))
             where_sql = " AND ".join(conditions)
             with get_conn() as conn:
                 with conn.cursor() as cur:
@@ -1083,9 +1101,12 @@ class TLService:
                         f"dw.freight_amount AS `运费`, "
                         f"dw.warehouse_type_id AS `仓库类型id`, "
                         f"wt.name AS `类型`, wt.color_config AS `库房类型颜色配置`, "
-                        f"dw.color_config AS `仓库颜色配置` "
+                        f"dw.color_config AS `仓库颜色配置`, "
+                        f"dw.category_id AS `大类id`, "
+                        f"IFNULL(wc.name, '') AS `大类` "
                         f"FROM dict_warehouses dw "
                         f"LEFT JOIN dict_warehouse_types wt ON dw.warehouse_type_id = wt.id "
+                        f"LEFT JOIN dict_warehouse_categories wc ON dw.category_id = wc.id "
                         f"WHERE {where_sql} "
                         "ORDER BY dw.id",
                         tuple(params),
@@ -1203,13 +1224,19 @@ class TLService:
                         "仓库颜色配置须为 JSON，且包含 marker（或 hex）字段为六位十六进制色值，如 #3388FF"
                     )
                 out["color"] = hx
+        if "大类id" in patch:
+            cat_id = patch["大类id"]
+            if cat_id is None:
+                out["category_id"] = None
+            else:
+                out["category_id"] = int(cat_id)
         if "is_active" in patch and patch["is_active"] is not None:
             out["status"] = 1 if patch["is_active"] else 0
         return out
 
     def update_warehouse(self, warehouse_id: int, patch: Dict[str, Any]) -> Dict[str, Any]:
         allowed = (
-            {"仓库名", "is_active", "地址", "仓库类型id", "仓库颜色配置"}
+            {"仓库名", "is_active", "地址", "仓库类型id", "大类id", "仓库颜色配置"}
             | self._WH_SITE_PATCH_KEYS
             | self._WH_BUSINESS_PATCH_KEYS
         )
@@ -1296,6 +1323,22 @@ class TLService:
                             params.append(int(wtid))
                         else:
                             updates.append("warehouse_type_id = NULL")
+
+                    if "大类id" in patch:
+                        cat_id = patch["大类id"]
+                        if cat_id is not None:
+                            if int(cat_id) < 1:
+                                raise ValueError("大类id 无效")
+                            cur.execute(
+                                "SELECT id FROM dict_warehouse_categories WHERE id = %s AND is_active = 1",
+                                (int(cat_id),),
+                            )
+                            if not cur.fetchone():
+                                raise ValueError(f"库房大类 id={cat_id} 不存在或未启用")
+                            updates.append("category_id = %s")
+                            params.append(int(cat_id))
+                        else:
+                            updates.append("category_id = NULL")
 
                     if "仓库颜色配置" in patch:
                         cc = patch["仓库颜色配置"]
@@ -1921,6 +1964,170 @@ class TLService:
             raise
         except Exception as e:
             logger.error(f"删除库房类型失败: {e}")
+            raise
+
+    # ==================== 接口1a-2：库房大类维护 ====================
+
+    def get_warehouse_categories(
+        self,
+        keyword: Optional[str] = None,
+        include_inactive: bool = False,
+    ) -> List[Dict[str, Any]]:
+        try:
+            conditions: List[str] = []
+            params: List[Any] = []
+            if not include_inactive:
+                conditions.append("is_active = 1")
+            if keyword is not None and str(keyword).strip():
+                conditions.append("name LIKE %s")
+                params.append(f"%{str(keyword).strip()}%")
+            where_sql = " AND ".join(conditions) if conditions else "1=1"
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"SELECT id AS `大类id`, name AS `大类名`, "
+                        f"is_active AS `is_active` "
+                        f"FROM dict_warehouse_categories WHERE {where_sql} "
+                        "ORDER BY id",
+                        tuple(params),
+                    )
+                    columns = [d[0] for d in cur.description]
+                    out: List[Dict[str, Any]] = []
+                    for row in cur.fetchall():
+                        out.append(dict(zip(columns, row)))
+                    return out
+        except Exception as e:
+            logger.error(f"获取库房大类列表失败: {e}")
+            raise
+
+    def add_warehouse_category(self, name: str) -> Dict[str, Any]:
+        n = str(name).strip()
+        if not n:
+            raise ValueError("大类名不能为空")
+        if len(n) > 50:
+            raise ValueError("大类名长度不能超过 50 字符")
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT id, is_active FROM dict_warehouse_categories WHERE name = %s",
+                        (n,),
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        cid, act = int(row[0]), row[1]
+                        if act == 1:
+                            return {
+                                "code": 200,
+                                "msg": "大类已存在",
+                                "大类id": cid,
+                                "新建": False,
+                            }
+                        cur.execute(
+                            "UPDATE dict_warehouse_categories SET is_active = 1 WHERE id = %s",
+                            (cid,),
+                        )
+                        return {
+                            "code": 200,
+                            "msg": "大类已恢复启用",
+                            "大类id": cid,
+                            "新建": False,
+                        }
+                    cur.execute(
+                        "INSERT INTO dict_warehouse_categories (name, is_active) "
+                        "VALUES (%s, 1)",
+                        (n,),
+                    )
+                    return {
+                        "code": 200,
+                        "msg": "库房大类新建成功",
+                        "大类id": cur.lastrowid,
+                        "新建": True,
+                    }
+        except ValueError:
+            raise
+        except Exception as e:
+            logger.error(f"新建库房大类失败: {e}")
+            raise
+
+    def update_warehouse_category(self, category_id: int, patch: Dict[str, Any]) -> Dict[str, Any]:
+        allowed = {"大类名", "is_active"}
+        if not (set(patch.keys()) & allowed):
+            raise ValueError("至少需要提供一个待修改字段：大类名、is_active 之一")
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT id FROM dict_warehouse_categories WHERE id = %s",
+                        (category_id,),
+                    )
+                    if not cur.fetchone():
+                        raise ValueError(f"库房大类 id={category_id} 不存在")
+
+                    updates: List[str] = []
+                    params: List[Any] = []
+
+                    if "大类名" in patch:
+                        nn = patch["大类名"]
+                        if nn is None or str(nn).strip() == "":
+                            raise ValueError("大类名不能为空")
+                        nn = str(nn).strip()
+                        cur.execute(
+                            "SELECT id FROM dict_warehouse_categories WHERE name = %s AND id <> %s",
+                            (nn, category_id),
+                        )
+                        if cur.fetchone():
+                            raise ValueError(f"大类名「{nn}」已存在")
+                        updates.append("name = %s")
+                        params.append(nn)
+
+                    if "is_active" in patch and patch["is_active"] is not None:
+                        updates.append("is_active = %s")
+                        params.append(1 if patch["is_active"] else 0)
+
+                    if not updates:
+                        raise ValueError("没有有效的修改项")
+
+                    params.append(category_id)
+                    cur.execute(
+                        f"UPDATE dict_warehouse_categories SET {', '.join(updates)} WHERE id = %s",
+                        tuple(params),
+                    )
+
+            return {"code": 200, "msg": "库房大类已更新"}
+        except ValueError:
+            raise
+        except Exception as e:
+            logger.error(f"更新库房大类失败: {e}")
+            raise
+
+    def delete_warehouse_category(self, category_id: int) -> Dict[str, Any]:
+        """软删除大类：相关仓库的 category_id 置空。"""
+        if category_id < 1:
+            raise ValueError("大类id 无效")
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT id FROM dict_warehouse_categories WHERE id = %s AND is_active = 1",
+                        (category_id,),
+                    )
+                    if not cur.fetchone():
+                        raise ValueError(f"库房大类 id={category_id} 不存在或已停用")
+                    cur.execute(
+                        "UPDATE dict_warehouses SET category_id = NULL "
+                        "WHERE category_id = %s",
+                        (category_id,),
+                    )
+                    cur.execute(
+                        "UPDATE dict_warehouse_categories SET is_active = 0 WHERE id = %s",
+                        (category_id,),
+                    )
+            return {"code": 200, "msg": "库房大类已删除"}
+        except ValueError:
+            raise
+        except Exception as e:
+            logger.error(f"删除库房大类失败: {e}")
             raise
 
     # ==================== 接口1b：冶炼厂类型（类型-颜色）维护 ====================
