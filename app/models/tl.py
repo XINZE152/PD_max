@@ -237,6 +237,10 @@ class AddWarehouseRequest(BaseModel):
         None,
         description="库房类型 ID（可选）；类型颜色来自类型表的「颜色配置」",
     )
+    大类id: Optional[int] = Field(
+        None,
+        description="库房大类 ID（可选，覆盖值）；为空则取库房类型的默认大类",
+    )
     库房类型名: Optional[str] = Field(
         None,
         description="库房类型名称（可选）；若与省市区详址一并提供则走完整落库（含天地图经纬度），与仓库类型id二选一或同时传时优先名称",
@@ -340,6 +344,10 @@ class UpdateWarehouseRequest(BaseModel):
     仓库名: Optional[str] = Field(None, description="仓库名称（可选）")
     is_active: Optional[bool] = Field(None, description="是否启用（可选）")
     地址: Optional[str] = Field(None, description="地址（可选）")
+    大类id: Optional[int] = Field(
+        None,
+        description="库房大类 ID（可选，覆盖值）；为空则取库房类型的默认大类；传 null 可清除覆盖",
+    )
     仓库类型id: Optional[int] = Field(
         None,
         description="库房类型 ID（可选）；传 null 可取消类型关联（库房类型颜色随之不可用）",

@@ -175,6 +175,7 @@ TABLE_STATEMENTS = [
         district VARCHAR(64) DEFAULT NULL COMMENT '区县',
         address VARCHAR(500) DEFAULT NULL COMMENT '详细地址',
         warehouse_type_id INT DEFAULT NULL COMMENT '库房类型ID（类型颜色见 dict_warehouse_types）',
+        category_id INT DEFAULT NULL COMMENT '大类ID（覆盖值；为空则取库房类型的默认大类）',
         color_config JSON DEFAULT NULL COMMENT '仓库独立颜色配置（JSON），可与库房类型颜色并存',
         longitude DECIMAL(11, 8) DEFAULT NULL COMMENT '经度',
         latitude DECIMAL(10, 8) DEFAULT NULL COMMENT '纬度',
@@ -1891,6 +1892,31 @@ def ensure_warehouse_category_migration() -> None:
                 cursor.execute(
                     "CREATE INDEX idx_wh_type_category ON dict_warehouse_types (category_id)"
                 )
+
+            # 仓库表也加 category_id（覆盖值，为空时取类型的默认大类）
+            cursor.execute("SHOW TABLES LIKE 'dict_warehouses'")
+            if cursor.fetchone() is not None:
+
+                def _wh_has_col(col: str) -> bool:
+                    cursor.execute(
+                        "SELECT COUNT(*) FROM information_schema.columns "
+                        "WHERE table_schema = DATABASE() AND table_name = 'dict_warehouses' "
+                        "AND column_name = %s",
+                        (col,),
+                    )
+                    return cursor.fetchone()[0] > 0
+
+                if not _wh_has_col("category_id"):
+                    cursor.execute(
+                        "ALTER TABLE dict_warehouses ADD COLUMN category_id INT DEFAULT NULL "
+                        "COMMENT '大类ID（覆盖值；为空则取库房类型的默认大类）' AFTER warehouse_type_id"
+                    )
+                    logger.info("已为 dict_warehouses 添加 category_id 列")
+
+                if not _wh_has_col("idx_wh_category"):
+                    cursor.execute(
+                        "CREATE INDEX idx_wh_category ON dict_warehouses (category_id)"
+                    )
 
         connection.commit()
     finally:

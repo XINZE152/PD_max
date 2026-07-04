@@ -232,6 +232,7 @@ def add_warehouse(
             name=body.仓库名,
             address=body.地址,
             warehouse_type_id=body.仓库类型id,
+            warehouse_category_id=body.大类id,
             warehouse_color_config=body.仓库颜色配置,
             province=body.省,
             city=body.市,

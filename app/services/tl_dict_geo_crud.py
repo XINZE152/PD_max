@@ -301,13 +301,17 @@ def warehouse_create(payload: Dict[str, Any]) -> Dict[str, Any]:
                 if cur.fetchone():
                     return _err(CODE_DUP_NAME, "仓库名称已存在")
 
+                cat_id_val = payload.get("category_id")
+                if cat_id_val is not None:
+                    cat_id_val = int(cat_id_val)
+
                 cur.execute(
                     "INSERT INTO dict_warehouses (name, province, city, district, address, "
-                    "warehouse_type_id, color_config, longitude, latitude, "
+                    "warehouse_type_id, category_id, color_config, longitude, latitude, "
                     "contact_name, contact_phone, hazardous_waste_license_qty, "
                     "monthly_avg_receipt_ton, current_inventory_ton, receipt_price_per_ton, "
                     "freight_amount, is_active) "
-                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                     (
                         name,
                         province,
@@ -315,6 +319,7 @@ def warehouse_create(payload: Dict[str, Any]) -> Dict[str, Any]:
                         district,
                         address,
                         wt_id,
+                        cat_id_val,
                         cc_json,
                         rx_lon,
                         rx_lat,
@@ -432,6 +437,14 @@ def warehouse_update(wh_id: int, patch: Dict[str, Any]) -> Dict[str, Any]:
                             return _err(CODE_VALIDATION, "库房类型不存在或未启用")
                         updates.append("warehouse_type_id = %s")
                         params.append(new_wt_id)
+
+                if "category_id" in patch:
+                    cat_p = patch.get("category_id")
+                    if cat_p is None:
+                        updates.append("category_id = NULL")
+                    else:
+                        updates.append("category_id = %s")
+                        params.append(int(cat_p))
 
                 if province is not None:
                     updates.append("province = %s")
