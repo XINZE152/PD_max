@@ -7,9 +7,14 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from app.ai_detection.amount_candidates import (
     AmountCandidate,
+    DATE_PATTERN,
+    MASKED_ACCOUNT_PATTERN,
     OCRToken,
+    ORDER_PATTERN,
+    TIME_PATTERN,
     bbox_iou,
     build_amount_candidates,
+    looks_like_clock_time,
 )
 from app.ai_detection.semantic_checker import find_labeled_field_bbox
 
@@ -29,11 +34,42 @@ HIGH_RISK_FIELD_LABELS = (
 # 建议检测区域分类定义：(标签关键词元组, 分类名, 展示优先级)
 SUGGESTED_ROI_CATEGORIES = [
     (("转账金额", "交易金额", "金额", "小写", "大写"), "金额", 1),
-    (("收款账号", "付款账号", "收款方账户", "付款方账户", "对方账户"), "账号", 2),
+    (("收款人", "付款人", "收款方", "付款方", "姓名", "微信昵称", "微信号"), "姓名", 2),
     (("申请时间", "交易时间", "转账时间", "收款时间", "交易日期"), "时间", 3),
-    (("转账单号", "订单号", "交易单号", "电子凭证号", "业务单号"), "单号", 4),
-    (("收款人", "付款人", "收款方", "付款方", "姓名", "微信昵称", "微信号"), "姓名/昵称", 5),
 ]
+
+KEY_FIELD_ROI_CATEGORIES = [
+    (("转账金额", "交易金额", "金额", "小写", "大写"), "amount", "金额", 1),
+    (("收款人", "付款人", "收款方", "付款方", "姓名", "微信昵称", "微信号"), "name", "姓名", 2),
+    (("申请时间", "交易时间", "转账时间", "收款时间", "交易日期"), "time", "时间", 3),
+]
+
+
+def _is_reliable_amount_candidate(candidate: AmountCandidate) -> bool:
+    """过滤普通数字、账号和单号，只保留有明确金额证据的候选。"""
+    text = (candidate.clean_text or "").strip()
+    if not text:
+        return False
+
+    compact_digits = text.replace(",", "")
+    flags = set(str(candidate.match_flags or "").split("|"))
+    has_target_keyword = "target_keyword" in flags
+    has_currency_hint = "currency_hint" in flags or any(ch in text for ch in ("¥", "￥", "元"))
+    has_signed_amount = "signed_or_currency" in flags or text.startswith(("+", "-", "¥", "￥"))
+    has_decimal_amount = bool(re.search(r"\d[\d,]*[.:]\d{2}(?:元)?$", text))
+    has_grouped_amount = bool(re.fullmatch(r"[+\-]?(?:[¥￥])?\d{1,3}(?:,\d{3})+(?:[.:]\d{2})?(?:元)?", text))
+    amount_evidence = has_target_keyword or has_currency_hint or has_signed_amount or has_decimal_amount or has_grouped_amount
+
+    if DATE_PATTERN.search(text) or TIME_PATTERN.fullmatch(text) or looks_like_clock_time(text):
+        return False
+    if MASKED_ACCOUNT_PATTERN.search(text):
+        return False
+    if ORDER_PATTERN.fullmatch(compact_digits) and not amount_evidence:
+        return False
+    if re.fullmatch(r"\d{5,}", compact_digits) and not amount_evidence:
+        return False
+
+    return amount_evidence
 
 
 def _dedupe_rois(
@@ -54,6 +90,101 @@ def _dedupe_rois(
             continue
         kept.append(item)
     return kept
+
+
+def _add_key_field_roi(
+    rois: List[Dict[str, Any]],
+    seen_bboxes: List[Tuple[int, int, int, int]],
+    bbox_xyxy: Sequence[int],
+    *,
+    field_type: str,
+    field_label: str,
+    priority: int,
+    text: str,
+    source: str,
+    iou_threshold: float = 0.80,
+) -> None:
+    if len(bbox_xyxy) < 4:
+        return
+    bbox_tuple = tuple(int(v) for v in bbox_xyxy[:4])
+    if bbox_tuple[2] <= bbox_tuple[0] or bbox_tuple[3] <= bbox_tuple[1]:
+        return
+    if any(bbox_iou(bbox_tuple, seen) >= iou_threshold for seen in seen_bboxes):
+        return
+    seen_bboxes.append(bbox_tuple)
+    rois.append(
+        {
+            "bbox": [int(v) for v in bbox_tuple],
+            "field_type": field_type,
+            "field_label": field_label,
+            "label": text or field_label,
+            "category": field_label,
+            "priority": priority,
+            "source": source,
+        }
+    )
+
+
+def find_key_field_rois(
+    tokens: Sequence[OCRToken],
+    image_shape: Tuple[int, int, int],
+    *,
+    business_rules: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """定位 v3 自动鉴伪使用的关键字段区域：金额、姓名、时间。"""
+    rules = business_rules or {}
+    max_rois = max(1, int(rules.get("key_field_rois_max", 24)))
+    min_amount_score = float(rules.get("auto_pixel_rescan_min_amount_score", 0.35))
+    image_h = image_shape[0] if image_shape else 0
+
+    rois: List[Dict[str, Any]] = []
+    seen_bboxes: List[Tuple[int, int, int, int]] = []
+
+    for labels, field_type, field_label, priority in KEY_FIELD_ROI_CATEGORIES:
+        for label_text in labels:
+            bbox = find_labeled_field_bbox(tokens, label_text)
+            if bbox is None:
+                continue
+            _add_key_field_roi(
+                rois,
+                seen_bboxes,
+                bbox,
+                field_type=field_type,
+                field_label=field_label,
+                priority=priority,
+                text=label_text,
+                source="ocr_labeled_field",
+            )
+
+    for candidate in build_amount_candidates(tokens, image_shape):
+        if float(candidate.amount_score) < min_amount_score:
+            continue
+        if not _is_reliable_amount_candidate(candidate):
+            continue
+        text = (candidate.clean_text or "").strip()
+        if text:
+            digit_count = len(re.findall(r"\d", text))
+            if digit_count == 0 or digit_count / max(len(text), 1) < 0.20:
+                continue
+            if re.search(r"[一-鿿]", text):
+                continue
+            if candidate.bbox[1] < image_h * 0.07:
+                continue
+            if re.fullmatch(r"\d{4}", text):
+                continue
+        _add_key_field_roi(
+            rois,
+            seen_bboxes,
+            candidate.bbox,
+            field_type="amount",
+            field_label="金额",
+            priority=6,
+            text=candidate.clean_text[:32] or "金额",
+            source=f"amount_{candidate.source}",
+        )
+
+    rois.sort(key=lambda row: (int(row.get("priority") or 99), row.get("bbox", [0, 0, 0, 0])[1], row.get("bbox", [0, 0, 0, 0])[0]))
+    return rois[:max_rois]
 
 
 def find_high_risk_pixel_rois(
@@ -138,7 +269,7 @@ def find_suggested_rois(
     business_rules: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """
-    未传 bbox 时，用 OCR 定位建议检测区域（金额/账号/时间/单号/姓名），
+    未传 bbox 时，用 OCR 定位建议检测区域（金额/姓名/时间），
     供前端展示让用户勾选后再做像素重叠检测。
 
     返回按 priority 升序排列的 ROI 列表，每项含 bbox/分类标签/OCR 文本。
@@ -166,7 +297,7 @@ def find_suggested_rois(
             "source": source,
         })
 
-    # 1. 按标签定位字段值区域（金额/账号/时间/单号/姓名）
+    # 1. 按标签定位字段值区域（金额/姓名/时间）
     for labels, category, priority in SUGGESTED_ROI_CATEGORIES:
         for label_text in labels:
             bbox = find_labeled_field_bbox(tokens, label_text)
@@ -178,6 +309,8 @@ def find_suggested_rois(
     image_h, image_w = image_shape[:2]
     for candidate in amount_candidates:
         if float(candidate.amount_score) < min_amount_score:
+            continue
+        if not _is_reliable_amount_candidate(candidate):
             continue
         text = (candidate.clean_text or "").strip()
         if text:
@@ -200,7 +333,7 @@ def find_suggested_rois(
                 continue
         _add_roi(
             [int(v) for v in candidate.bbox],
-            candidate.clean_text[:32] or "数字区域",
+            candidate.clean_text[:32] or "金额候选",
             "金额候选",
             6,
             source=f"amount_{candidate.source}",

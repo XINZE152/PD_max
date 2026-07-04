@@ -227,6 +227,59 @@ def _xyxy_from_result(res: Dict[str, Any]) -> Optional[List[int]]:
     return None
 
 
+def _result_region_no(res: Dict[str, Any], fallback: int) -> int:
+    try:
+        n = int(res.get("region_no") or fallback)
+    except (TypeError, ValueError):
+        n = fallback
+    return max(1, n)
+
+
+def _result_field_label(res: Dict[str, Any]) -> str:
+    raw = str(res.get("field_label") or "").strip()
+    if raw:
+        return raw
+    field_type = str(res.get("field_type") or "").strip()
+    if field_type == "amount":
+        return "金额"
+    if field_type == "name":
+        return "姓名"
+    if field_type == "time":
+        return "时间"
+    if field_type == "manual":
+        return "手动框选"
+    return "区域"
+
+
+def _draw_region_number(
+    draw: ImageDraw.ImageDraw,
+    *,
+    x1: int,
+    y1: int,
+    x2: int,
+    y2: int,
+    number: int,
+    color: Tuple[int, int, int],
+    font: Any,
+) -> None:
+    text = str(number)
+    text_bbox = draw.textbbox((0, 0), text, font=font)
+    text_w = text_bbox[2] - text_bbox[0]
+    text_h = text_bbox[3] - text_bbox[1]
+    size = max(28, text_w + 14, text_h + 10)
+    nx1 = max(0, min(x1 + 3, x2 - size))
+    ny1 = max(0, min(y1 + 3, y2 - size))
+    nx2 = nx1 + size
+    ny2 = ny1 + size
+    draw.rounded_rectangle([(nx1, ny1), (nx2, ny2)], radius=6, fill=color, outline=(255, 255, 255), width=2)
+    draw.text(
+        (nx1 + (size - text_w) / 2, ny1 + (size - text_h) / 2 - 1),
+        text,
+        font=font,
+        fill=(255, 255, 255),
+    )
+
+
 def render_annotated_jpeg(image_path: Path, outcome: Dict[str, Any]) -> bytes:
     img_cv2 = cv2.imdecode(np.fromfile(str(image_path), dtype=np.uint8), cv2.IMREAD_COLOR)
     if img_cv2 is None:
@@ -245,25 +298,28 @@ def render_annotated_jpeg(image_path: Path, outcome: Dict[str, Any]) -> bytes:
         if not results_to_draw:
             results_to_draw.append(inner)
 
-    for res in results_to_draw:
+    for index, res in enumerate(results_to_draw, start=1):
         xyxy = _xyxy_from_result(res)
         if not xyxy:
             continue
         x1, y1, x2, y2 = xyxy
         status = str(res.get("result", "正常"))
         confidence = float(res.get("confidence", 0.0) or 0.0)
+        region_no = _result_region_no(res, index)
+        field_label = _result_field_label(res)
 
         if status == "篡改":
             color, text_color = (255, 0, 0), (255, 255, 255)
-            label = f"篡改 | 风险:{confidence:.1%}"
+            label = f"#{region_no} {field_label} | 篡改 | 风险:{confidence:.1%}"
         elif status == "可疑":
             color, text_color = (255, 165, 0), (0, 0, 0)
-            label = f"可疑 | 风险:{confidence:.1%}"
+            label = f"#{region_no} {field_label} | 可疑 | 风险:{confidence:.1%}"
         else:
             color, text_color = (0, 255, 0), (0, 0, 0)
-            label = f"正常 | 风险:{confidence:.1%}"
+            label = f"#{region_no} {field_label} | {status} | 风险:{confidence:.1%}"
 
         draw.rectangle([(x1, y1), (x2, y2)], outline=color, width=3)
+        _draw_region_number(draw, x1=x1, y1=y1, x2=x2, y2=y2, number=region_no, color=color, font=font)
         text_bbox = draw.textbbox((0, 0), label, font=font)
         text_width = text_bbox[2] - text_bbox[0]
         text_height = text_bbox[3] - text_bbox[1]
