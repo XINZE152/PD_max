@@ -1888,7 +1888,16 @@ def ensure_warehouse_category_migration() -> None:
                 )
                 logger.info("已为 dict_warehouse_types 添加 category_id 列")
 
-            if not _type_has_col("idx_wh_type_category"):
+            def _type_has_idx(idx: str) -> bool:
+                cursor.execute(
+                    "SELECT COUNT(*) FROM information_schema.statistics "
+                    "WHERE table_schema = DATABASE() AND table_name = 'dict_warehouse_types' "
+                    "AND index_name = %s",
+                    (idx,),
+                )
+                return cursor.fetchone()[0] > 0
+
+            if not _type_has_idx("idx_wh_type_category"):
                 cursor.execute(
                     "CREATE INDEX idx_wh_type_category ON dict_warehouse_types (category_id)"
                 )
@@ -1913,7 +1922,16 @@ def ensure_warehouse_category_migration() -> None:
                     )
                     logger.info("已为 dict_warehouses 添加 category_id 列")
 
-                if not _wh_has_col("idx_wh_category"):
+                def _wh_has_idx(idx: str) -> bool:
+                    cursor.execute(
+                        "SELECT COUNT(*) FROM information_schema.statistics "
+                        "WHERE table_schema = DATABASE() AND table_name = 'dict_warehouses' "
+                        "AND index_name = %s",
+                        (idx,),
+                    )
+                    return cursor.fetchone()[0] > 0
+
+                if not _wh_has_idx("idx_wh_category"):
                     cursor.execute(
                         "CREATE INDEX idx_wh_category ON dict_warehouses (category_id)"
                     )
