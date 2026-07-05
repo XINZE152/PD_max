@@ -74,6 +74,9 @@ from app.services.tl_dict_geo_crud import (
     warehouse_link_bind as sa_wh_link_bind,
     warehouse_link_unbind as sa_wh_link_unbind,
     warehouse_link_update_tier_price_spread as sa_wh_link_update_tier,
+    warehouse_link_update_remark as sa_wh_link_update_remark,
+    warehouse_link_update_ai_analysis as sa_wh_link_update_ai_analysis,
+    warehouse_links_all_active as sa_wh_links_all_active,
     warehouse_links_inbound as sa_wh_links_inbound,
     warehouse_links_outbound as sa_wh_links_outbound,
     warehouse_links_replace_outbound as sa_wh_links_replace_outbound,
@@ -419,6 +422,36 @@ def _marker_hex_from_wh_color_config(cc: Any) -> Optional[str]:
             if _MARKER_HEX_RE.match(hs):
                 return hs
     return None
+
+
+def _build_ai_analysis_prompt(
+    src_name: str,
+    tgt_name: str,
+    src_city: str,
+    tgt_city: str,
+    dist_km: Optional[float],
+    src_price: Any,
+    tgt_price: Any,
+    price_diff: Any,
+) -> str:
+    """构建库房关联边 AI 分析的 prompt，输出格式固定。"""
+    dist_str = f"{dist_km}公里" if dist_km is not None else "未知"
+    src_price_str = f"{float(src_price):.0f}元/吨" if src_price is not None else "暂无报价"
+    tgt_price_str = f"{float(tgt_price):.0f}元/吨" if tgt_price is not None else "暂无报价"
+    diff_str = f"{float(price_diff):+.0f}元/吨" if price_diff is not None else "未知"
+
+    return (
+        f"你是一个废铅酸蓄电池回收物流分析专家。请分析以下两个库房之间的关联：\n"
+        f"源库房：{src_name}（{src_city}），收货价：{src_price_str}\n"
+        f"对标库房：{tgt_name}（{tgt_city}），收货价：{tgt_price_str}\n"
+        f"两库房直线距离：{dist_str}\n"
+        f"收货价差（源−对标）：{diff_str}\n\n"
+        f"请按以下固定格式输出分析结果，每部分约60-80字：\n"
+        f"【距离评估】分析两库房之间的物流距离是否合理，对运输成本和时效的影响。\n"
+        f"【价差分析】结合两地收货价差，判断货物从源库房流向对标库房的经济性。\n"
+        f"【综合建议】基于距离和价格信息，给出该关联边的优化建议或风险提示。\n\n"
+        f"要求：严格按上述三段格式输出，每段字数控制在60-80字，总字数约200字。"
+    )
 
 
 def _raise_tl_geo_crud_result(res: Dict[str, Any]) -> Dict[str, Any]:
@@ -1545,6 +1578,27 @@ class TLService:
             },
         }
 
+    def update_warehouse_link_remark(
+        self,
+        from_wh_id: int,
+        to_wh_id: int,
+        remark: Optional[str],
+    ) -> Dict[str, Any]:
+        """修改库房关联边的备注。"""
+        res = _raise_tl_geo_crud_result(
+            warehouse_link_update_remark(from_wh_id, to_wh_id, remark)
+        )
+        data = res.get("data") or {}
+        return {
+            "code": 200,
+            "msg": str(res.get("msg") or "修改成功"),
+            "data": {
+                "源库房id": data.get("fromWarehouseId"),
+                "对标库房id": data.get("toWarehouseId"),
+                "备注": data.get("remark", ""),
+            },
+        }
+
     def unbind_warehouse_link(self, from_wh_id: int, to_wh_id: int) -> Dict[str, Any]:
         """删除出边。"""
         _raise_tl_geo_crud_result(sa_wh_link_unbind(from_wh_id, to_wh_id))
@@ -1590,6 +1644,9 @@ class TLService:
                     "创建时间": it.get("createTime"),
                     "距离千米": it.get("distanceKm"),
                     "阶梯价差": it.get("tierPriceSpread"),
+                    "备注": it.get("remark") or "",
+                    "AI分析": it.get("aiAnalysis") or "",
+                    "上次分析时间": it.get("lastAnalysisAt") or "",
                     "对标库房": row,
                 }
             )
@@ -1642,6 +1699,9 @@ class TLService:
                     "创建时间": it.get("createTime"),
                     "距离千米": it.get("distanceKm"),
                     "阶梯价差": it.get("tierPriceSpread"),
+                    "备注": it.get("remark") or "",
+                    "AI分析": it.get("aiAnalysis") or "",
+                    "上次分析时间": it.get("lastAnalysisAt") or "",
                     "源库房": row,
                 }
             )
@@ -1727,6 +1787,9 @@ class TLService:
                 "创建时间": it.get("createTime"),
                 "距离千米": it.get("distanceKm"),
                 "阶梯价差": it.get("tierPriceSpread"),
+                "备注": it.get("remark") or "",
+                "AI分析": it.get("aiAnalysis") or "",
+                "上次分析时间": it.get("lastAnalysisAt") or "",
                 "源库房": src_tl,
                 "对标库房": tgt_tl,
             }
@@ -1849,6 +1912,80 @@ class TLService:
                 "删除边数": int(data.get("deleted") or 0),
             },
         }
+
+    # ==================== AI 分析 ====================
+
+    def run_warehouse_link_ai_analysis(self) -> Dict[str, Any]:
+        """对所有库房关联边执行 AI 分析（由定时任务触发）。"""
+        from app import config as app_config
+        from app.services.llm_client import chat_completions_create, create_llm_client
+
+        links = sa_wh_links_all_active()
+        if not links:
+            return {"code": 200, "msg": "无活跃关联边，跳过 AI 分析", "analyzed": 0}
+
+        client = create_llm_client()
+        model = app_config.LLM_MODEL
+        analyzed = 0
+        failed = 0
+
+        for link in links:
+            try:
+                link_id = int(link["link_id"])
+                src_name = link["sf_name"]
+                tgt_name = link["st_name"]
+                src_city = f"{link.get('sf_province') or ''}{link.get('sf_city') or ''}"
+                tgt_city = f"{link.get('st_province') or ''}{link.get('st_city') or ''}"
+                src_price = link.get("sf_price_per_ton")
+                tgt_price = link.get("st_price_per_ton")
+
+                # 计算距离
+                dist_km: Optional[float] = None
+                try:
+                    sln = link.get("sf_longitude")
+                    sla = link.get("sf_latitude")
+                    tln = link.get("st_longitude")
+                    tla = link.get("st_latitude")
+                    if sln is not None and sla is not None and tln is not None and tla is not None:
+                        from app.services.tl_dict_geo_crud import _haversine_km
+                        dist_km = round(_haversine_km(float(sln), float(sla), float(tln), float(tla)), 1)
+                except Exception:
+                    pass
+
+                price_diff = None
+                if src_price is not None and tgt_price is not None:
+                    try:
+                        price_diff = round(float(src_price) - float(tgt_price), 0)
+                    except Exception:
+                        pass
+
+                prompt = _build_ai_analysis_prompt(
+                    src_name=str(src_name),
+                    tgt_name=str(tgt_name),
+                    src_city=src_city.strip(),
+                    tgt_city=tgt_city.strip(),
+                    dist_km=dist_km,
+                    src_price=src_price,
+                    tgt_price=tgt_price,
+                    price_diff=price_diff,
+                )
+
+                response = chat_completions_create(
+                    client,
+                    model=model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.7,
+                    max_tokens=400,
+                )
+                analysis_text = response.choices[0].message.content.strip()
+
+                sa_wh_link_update_ai_analysis(link_id, analysis_text)
+                analyzed += 1
+            except Exception:
+                logger.exception(f"AI 分析失败 link_id={link.get('link_id')}")
+                failed += 1
+
+        return {"code": 200, "msg": f"AI 分析完成", "analyzed": analyzed, "failed": failed}
 
     # ==================== 库房类型维护（类型与颜色一对一）====================
 

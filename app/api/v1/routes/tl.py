@@ -103,6 +103,7 @@ from app.models.tl import (
     UpdateWarehouseRequest,
     WarehouseLinkBindRequest,
     WarehouseLinkUpdateTierRequest,
+    UpdateWarehouseLinkRemarkRequest,
     WarehouseLinksBatchOutboundRequest,
     WarehouseLinksReplaceOutboundRequest,
     UpdateWarehouseTypeRequest,
@@ -970,6 +971,38 @@ def update_warehouse_link_tier(
         raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.put("/update_warehouse_link_remark", summary="修改库房关联边上的备注")
+def update_warehouse_link_remark(
+    body: UpdateWarehouseLinkRemarkRequest,
+    service: TLService = Depends(get_tl_service),
+):
+    """修改源库房→对标库房边上的备注；传 null 清空备注。"""
+    try:
+        return service.update_warehouse_link_remark(
+            body.源库房id,
+            body.对标库房id,
+            body.备注,
+        )
+    except ValueError as e:
+        raise _tl_value_error_http(e)
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/run_warehouse_link_ai_analysis", summary="手动触发库房关联AI分析")
+def run_warehouse_link_ai_analysis(
+    service: TLService = Depends(get_tl_service),
+):
+    """对所有活跃库房关联边逐一调大模型分析，结果写入 ai_analysis 字段。"""
+    try:
+        return service.run_warehouse_link_ai_analysis()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 
 @router.put("/replace_warehouse_links_outbound", summary="替换库房全部出边（覆盖式修改）")

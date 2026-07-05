@@ -338,6 +338,16 @@ class WarehouseLinksBatchOutboundRequest(BaseModel):
     )
 
 
+class UpdateWarehouseLinkRemarkRequest(BaseModel):
+    """修改库房关联边上的备注"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    源库房id: int = Field(..., ge=1)
+    对标库房id: int = Field(..., ge=1)
+    备注: Optional[str] = Field(None, description="备注内容；传 null 清空备注")
+
+
 class UpdateWarehouseRequest(BaseModel):
     """修改仓库请求体"""
     仓库id: int = Field(..., description="仓库ID")

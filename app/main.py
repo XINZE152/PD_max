@@ -230,6 +230,48 @@ async def on_startup():
             "库房送货统计定时聚合已关闭（WAREHOUSE_DELIVERY_STATS_SCHEDULE_ENABLED=0）"
         )
 
+    if app_config.WAREHOUSE_LINK_AI_ANALYSIS_SCHEDULE_ENABLED:
+        from apscheduler.schedulers.background import BackgroundScheduler
+        from apscheduler.triggers.cron import CronTrigger
+
+        def _run_warehouse_link_ai_analysis_sync() -> None:
+            """供 APScheduler 调用的同步入口。"""
+            from app.services.tl_service import TLService
+
+            try:
+                svc = TLService()
+                result = svc.run_warehouse_link_ai_analysis()
+                logger.info(
+                    "库房关联AI分析定时完成: analyzed=%s failed=%s",
+                    result.get("analyzed"),
+                    result.get("failed"),
+                )
+            except Exception:
+                logger.exception("库房关联AI分析定时任务异常")
+
+        lai_sched = BackgroundScheduler(timezone="Asia/Shanghai")
+        lai_sched.add_job(
+            func=_run_warehouse_link_ai_analysis_sync,
+            trigger=CronTrigger(
+                hour=app_config.WAREHOUSE_LINK_AI_ANALYSIS_SCHEDULE_HOUR,
+                minute=app_config.WAREHOUSE_LINK_AI_ANALYSIS_SCHEDULE_MINUTE,
+            ),
+            id="warehouse_link_ai_analysis",
+            replace_existing=True,
+        )
+        lai_sched.start()
+        app.state.warehouse_link_ai_analysis_scheduler = lai_sched
+        logger.info(
+            "库房关联AI分析定时任务已启用：cron %02d:%02d",
+            app_config.WAREHOUSE_LINK_AI_ANALYSIS_SCHEDULE_HOUR,
+            app_config.WAREHOUSE_LINK_AI_ANALYSIS_SCHEDULE_MINUTE,
+        )
+    else:
+        app.state.warehouse_link_ai_analysis_scheduler = None
+        logger.info(
+            "库房关联AI分析定时任务已关闭（WAREHOUSE_LINK_AI_ANALYSIS_SCHEDULE_ENABLED=0）"
+        )
+
 
 @app.on_event("shutdown")
 async def on_shutdown():
@@ -243,6 +285,9 @@ async def on_shutdown():
     wds_sched = getattr(app.state, "warehouse_delivery_stats_scheduler", None)
     if wds_sched is not None:
         wds_sched.shutdown(wait=False)
+    lai_sched = getattr(app.state, "warehouse_link_ai_analysis_scheduler", None)
+    if lai_sched is not None:
+        lai_sched.shutdown(wait=False)
     if app_config.INTELLIGENT_PREDICTION_ENABLED:
         sched = getattr(app.state, "ip_prediction_scheduler", None)
         if sched is not None:

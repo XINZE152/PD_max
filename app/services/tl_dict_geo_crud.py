@@ -694,6 +694,9 @@ def _link_out_item(
         "createTime": _fmt_ts(created_at),
         "distanceKm": dist_km,
         "tierPriceSpread": _parse_tier_price_spread(tier_raw),
+        "remark": target_row.get("remark") or "",
+        "aiAnalysis": target_row.get("ai_analysis") or "",
+        "lastAnalysisAt": _fmt_ts(target_row.get("last_analysis_at")),
         "target": tw,
     }
 
@@ -736,6 +739,9 @@ def _link_in_item(
         "createTime": _fmt_ts(created_at),
         "distanceKm": dist_km,
         "tierPriceSpread": _parse_tier_price_spread(tier_raw),
+        "remark": source_row.get("remark") or "",
+        "aiAnalysis": source_row.get("ai_analysis") or "",
+        "lastAnalysisAt": _fmt_ts(source_row.get("last_analysis_at")),
         "source": sw,
     }
 
@@ -877,6 +883,84 @@ def warehouse_link_update_tier_price_spread(
         return _err(CODE_DB, f"数据库操作异常: {e}")
 
 
+def warehouse_link_update_remark(
+    from_wh_id: int,
+    to_wh_id: int,
+    remark: Optional[str],
+) -> Dict[str, Any]:
+    """修改库房关联边的备注。"""
+    try:
+        if from_wh_id < 1 or to_wh_id < 1:
+            return _err(CODE_VALIDATION, "库房 id 无效")
+
+        with get_conn() as conn:
+            with conn.cursor(DictCursor) as cur:
+                cur.execute(
+                    "UPDATE dict_warehouse_links SET remark = %s "
+                    "WHERE from_warehouse_id = %s AND to_warehouse_id = %s",
+                    (remark or None, from_wh_id, to_wh_id),
+                )
+                if cur.rowcount == 0:
+                    return _err(CODE_NOT_FOUND, "关联不存在")
+                conn.commit()
+        return _ok("备注修改成功", data={"fromWarehouseId": from_wh_id, "toWarehouseId": to_wh_id, "remark": remark or ""})
+    except Exception as e:
+        logger.exception("修改库房关联备注失败")
+        return _err(CODE_DB, f"数据库操作异常: {e}")
+
+
+def warehouse_link_update_ai_analysis(
+    link_id: int,
+    ai_analysis: str,
+) -> Dict[str, Any]:
+    """更新单条库房关联边的 AI 分析结果（同时更新分析时间）。"""
+    try:
+        if link_id < 1:
+            return _err(CODE_VALIDATION, "关联 id 无效")
+
+        with get_conn() as conn:
+            with conn.cursor(DictCursor) as cur:
+                cur.execute(
+                    "UPDATE dict_warehouse_links SET ai_analysis = %s, last_analysis_at = NOW() "
+                    "WHERE id = %s",
+                    (ai_analysis, link_id),
+                )
+                if cur.rowcount == 0:
+                    return _err(CODE_NOT_FOUND, "关联不存在")
+                conn.commit()
+        return _ok("AI分析已更新", data={"linkId": link_id})
+    except Exception as e:
+        logger.exception("更新库房关联AI分析失败")
+        return _err(CODE_DB, f"数据库操作异常: {e}")
+
+
+def warehouse_links_all_active() -> List[Dict[str, Any]]:
+    """获取全部活跃库房关联边（含源/对标库房摘要），供 AI 分析定时任务使用。"""
+    try:
+        with get_conn() as conn:
+            with conn.cursor(DictCursor) as cur:
+                cur.execute(
+                    "SELECT l.id AS link_id, l.from_warehouse_id, l.to_warehouse_id, "
+                    "l.tier_price_spread, l.remark, l.ai_analysis, l.last_analysis_at, "
+                    "wf.id AS sf_id, wf.name AS sf_name, wf.province AS sf_province, "
+                    "wf.city AS sf_city, wf.district AS sf_district, "
+                    "wf.longitude AS sf_longitude, wf.latitude AS sf_latitude, "
+                    "wf.receipt_price_per_ton AS sf_price_per_ton, "
+                    "wt.id AS st_id, wt.name AS st_name, wt.province AS st_province, "
+                    "wt.city AS st_city, wt.district AS st_district, "
+                    "wt.longitude AS st_longitude, wt.latitude AS st_latitude, "
+                    "wt.receipt_price_per_ton AS st_price_per_ton "
+                    "FROM dict_warehouse_links l "
+                    "JOIN dict_warehouses wf ON wf.id = l.from_warehouse_id AND wf.is_active = 1 "
+                    "JOIN dict_warehouses wt ON wt.id = l.to_warehouse_id AND wt.is_active = 1 "
+                    "ORDER BY l.id"
+                )
+                return cur.fetchall()
+    except Exception as e:
+        logger.exception("查询全部库房关联边失败")
+        return []
+
+
 def warehouse_links_outbound(
     warehouse_id: int,
     page: int = 1,
@@ -901,6 +985,7 @@ def warehouse_links_outbound(
                 cur.execute(
                     "SELECT l.id AS link_id, l.from_warehouse_id, l.to_warehouse_id, "
                     "l.created_at AS link_created_at, l.tier_price_spread AS tier_price_spread, "
+                    "l.remark, l.ai_analysis, l.last_analysis_at, "
                     "dwf.longitude AS from_longitude, dwf.latitude AS from_latitude, "
                     "dw.id AS wh_id, dw.name AS wh_name, dw.province, dw.city, dw.district, "
                     "dw.address, dw.warehouse_type_id, dw.color_config, "
@@ -939,6 +1024,9 @@ def warehouse_links_outbound(
                 "hazardous_waste_license_qty": r.get("hazardous_waste_license_qty"),
                 "monthly_avg_receipt_ton": r.get("monthly_avg_receipt_ton"),
                 "freight_amount": r.get("freight_amount"),
+                "remark": r.get("remark") or "",
+                "ai_analysis": r.get("ai_analysis") or "",
+                "last_analysis_at": r.get("last_analysis_at"),
             }
             items.append(
                 _link_out_item(
@@ -987,6 +1075,7 @@ def warehouse_links_inbound(
                 cur.execute(
                     "SELECT l.id AS link_id, l.from_warehouse_id, l.to_warehouse_id, "
                     "l.created_at AS link_created_at, l.tier_price_spread AS tier_price_spread, "
+                    "l.remark, l.ai_analysis, l.last_analysis_at, "
                     "dw_to.longitude AS to_longitude, dw_to.latitude AS to_latitude, "
                     "dw.id AS wh_id, dw.name AS wh_name, dw.province, dw.city, dw.district, "
                     "dw.address, dw.warehouse_type_id, dw.color_config, "
@@ -1025,6 +1114,9 @@ def warehouse_links_inbound(
                 "hazardous_waste_license_qty": r.get("hazardous_waste_license_qty"),
                 "monthly_avg_receipt_ton": r.get("monthly_avg_receipt_ton"),
                 "freight_amount": r.get("freight_amount"),
+                "remark": r.get("remark") or "",
+                "ai_analysis": r.get("ai_analysis") or "",
+                "last_analysis_at": r.get("last_analysis_at"),
             }
             items.append(
                 _link_in_item(
@@ -1134,6 +1226,7 @@ def warehouse_links_list_all(
                 cur.execute(
                     "SELECT l.id AS link_id, l.created_at AS link_created_at, "
                     "l.tier_price_spread AS tier_price_spread, "
+                    "l.remark, l.ai_analysis, l.last_analysis_at, "
                     "l.from_warehouse_id, l.to_warehouse_id, "
                     "wf.id AS sf_id, wf.name AS sf_name, wf.province AS sf_province, "
                     "wf.city AS sf_city, wf.district AS sf_district, wf.address AS sf_address, "
@@ -1194,6 +1287,9 @@ def warehouse_links_list_all(
                     "createTime": _fmt_ts(r.get("link_created_at")),
                     "distanceKm": dist_km,
                     "tierPriceSpread": _parse_tier_price_spread(r.get("tier_price_spread")),
+                    "remark": r.get("remark") or "",
+                    "aiAnalysis": r.get("ai_analysis") or "",
+                    "lastAnalysisAt": _fmt_ts(r.get("last_analysis_at")),
                     "source": _warehouse_row_api(
                         _wh_side_row(r, "sf"),
                         r.get("sf_type_name"),
@@ -1300,6 +1396,7 @@ def warehouse_links_realtime_spread_list(
                 cur.execute(
                     "SELECT l.id AS link_id, l.created_at AS link_created_at, "
                     "l.tier_price_spread AS tier_price_spread, "
+                    "l.remark, l.ai_analysis, l.last_analysis_at, "
                     "l.from_warehouse_id, l.to_warehouse_id, "
                     "wcrp_f.price_per_ton AS from_warehouse_price, "
                     "wcrp_t.price_per_ton AS to_warehouse_price, "
@@ -1367,6 +1464,9 @@ def warehouse_links_realtime_spread_list(
                     "createTime": _fmt_ts(r.get("link_created_at")),
                     "distanceKm": dist_km,
                     "tierPriceSpread": _parse_tier_price_spread(r.get("tier_price_spread")),
+                    "remark": r.get("remark") or "",
+                    "aiAnalysis": r.get("ai_analysis") or "",
+                    "lastAnalysisAt": _fmt_ts(r.get("last_analysis_at")),
                     "fromWarehousePrice": float(fp) if fp is not None else None,
                     "toWarehousePrice": float(tp) if tp is not None else None,
                     "realtimeSpread": realtime_spread,

@@ -202,6 +202,9 @@ TABLE_STATEMENTS = [
         from_warehouse_id INT NOT NULL COMMENT '源库房（出边起点）',
         to_warehouse_id INT NOT NULL COMMENT '对标库房（单向指向终点）',
         tier_price_spread JSON DEFAULT NULL COMMENT '阶梯价差（JSON，可按距离区间维护价差）',
+        remark TEXT DEFAULT NULL COMMENT '备注（手动编辑）',
+        ai_analysis TEXT DEFAULT NULL COMMENT 'AI分析（每天0点大模型自动生成）',
+        last_analysis_at TIMESTAMP NULL DEFAULT NULL COMMENT '上次AI分析时间',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
         UNIQUE KEY uk_wh_link_from_to (from_warehouse_id, to_warehouse_id),
         INDEX idx_wh_link_from (from_warehouse_id),
@@ -1819,6 +1822,10 @@ def create_tables() -> None:
     except Exception:
         logger.exception("检查/添加 dict_warehouse_links.tier_price_spread 失败")
     try:
+        ensure_dict_warehouse_links_remark_ai_columns()
+    except Exception:
+        logger.exception("检查/添加 dict_warehouse_links.remark/ai_analysis 失败")
+    try:
         ensure_pd_pricing_benchmark_tables()
     except Exception:
         logger.exception("检查/创建 pd_* 对标定价相关表失败")
@@ -2280,6 +2287,50 @@ def ensure_dict_warehouse_links_tier_price_spread_column() -> None:
                     "COMMENT '阶梯价差（JSON）' AFTER to_warehouse_id"
                 )
                 logger.info("已为 dict_warehouse_links 添加 tier_price_spread")
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def ensure_dict_warehouse_links_remark_ai_columns() -> None:
+    """库房关联边：备注 + AI 分析。"""
+    config_dict = get_mysql_config()
+    connection = pymysql.connect(**config_dict)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SHOW TABLES LIKE 'dict_warehouse_links'")
+            if cursor.fetchone() is None:
+                return
+
+            def _has_col(col: str) -> bool:
+                cursor.execute(
+                    "SELECT COUNT(*) FROM information_schema.columns "
+                    "WHERE table_schema = DATABASE() AND table_name = 'dict_warehouse_links' "
+                    "AND column_name = %s",
+                    (col,),
+                )
+                return cursor.fetchone()[0] > 0
+
+            if not _has_col("remark"):
+                cursor.execute(
+                    "ALTER TABLE dict_warehouse_links ADD COLUMN remark TEXT DEFAULT NULL "
+                    "COMMENT '备注（手动编辑）' AFTER tier_price_spread"
+                )
+                logger.info("已为 dict_warehouse_links 添加 remark 列")
+
+            if not _has_col("ai_analysis"):
+                cursor.execute(
+                    "ALTER TABLE dict_warehouse_links ADD COLUMN ai_analysis TEXT DEFAULT NULL "
+                    "COMMENT 'AI分析（每天0点大模型自动生成）' AFTER remark"
+                )
+                logger.info("已为 dict_warehouse_links 添加 ai_analysis 列")
+
+            if not _has_col("last_analysis_at"):
+                cursor.execute(
+                    "ALTER TABLE dict_warehouse_links ADD COLUMN last_analysis_at "
+                    "TIMESTAMP NULL DEFAULT NULL COMMENT '上次AI分析时间' AFTER ai_analysis"
+                )
+                logger.info("已为 dict_warehouse_links 添加 last_analysis_at 列")
         connection.commit()
     finally:
         connection.close()
