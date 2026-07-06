@@ -1601,7 +1601,7 @@ class TLService:
     ) -> Dict[str, Any]:
         """修改库房关联边的备注。"""
         res = _raise_tl_geo_crud_result(
-            warehouse_link_update_remark(from_wh_id, to_wh_id, remark)
+            sa_wh_link_update_remark(from_wh_id, to_wh_id, remark)
         )
         data = res.get("data") or {}
         return {
