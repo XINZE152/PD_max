@@ -433,6 +433,7 @@ def _build_ai_analysis_prompt(
     src_price: Any,
     tgt_price: Any,
     price_diff: Any,
+    tier_price_spread: Any = None,
 ) -> str:
     """构建库房关联边 AI 分析的 prompt，输出格式固定。"""
     dist_str = f"{dist_km}公里" if dist_km is not None else "未知"
@@ -440,17 +441,31 @@ def _build_ai_analysis_prompt(
     tgt_price_str = f"{float(tgt_price):.0f}元/吨" if tgt_price is not None else "暂无报价"
     diff_str = f"{float(price_diff):+.0f}元/吨" if price_diff is not None else "未知"
 
+    # 阶梯价差
+    tier_str = "无"
+    if tier_price_spread is not None:
+        if isinstance(tier_price_spread, str):
+            tier_str = tier_price_spread
+        else:
+            import json as _json
+            try:
+                tier_str = _json.dumps(tier_price_spread, ensure_ascii=False)
+            except Exception:
+                tier_str = str(tier_price_spread)
+
     return (
         f"你是一个废铅酸蓄电池回收物流分析专家。请分析以下两个库房之间的关联：\n"
         f"源库房：{src_name}（{src_city}），收货价：{src_price_str}\n"
         f"对标库房：{tgt_name}（{tgt_city}），收货价：{tgt_price_str}\n"
         f"两库房直线距离：{dist_str}\n"
-        f"收货价差（源−对标）：{diff_str}\n\n"
+        f"收货价差（源−对标）：{diff_str}\n"
+        f"阶梯价差配置：{tier_str}\n\n"
         f"请按以下固定格式输出分析结果，每部分约60-80字：\n"
         f"【距离评估】分析两库房之间的物流距离是否合理，对运输成本和时效的影响。\n"
         f"【价差分析】结合两地收货价差，判断货物从源库房流向对标库房的经济性。\n"
-        f"【综合建议】基于距离和价格信息，给出该关联边的优化建议或风险提示。\n\n"
-        f"要求：严格按上述三段格式输出，每段字数控制在60-80字，总字数约200字。"
+        f"【综合建议】基于距离、价格和阶梯价差信息，给出该关联边的优化建议或风险提示。\n\n"
+        f"要求在综合建议末尾加一句总结，格式为：「综合来看，此路线阶梯价差为xxx。」\n"
+        f"每段字数控制在60-80字，总字数约200-250字。"
     )
 
 
@@ -1968,6 +1983,7 @@ class TLService:
                     src_price=src_price,
                     tgt_price=tgt_price,
                     price_diff=price_diff,
+                    tier_price_spread=link.get("tier_price_spread"),
                 )
 
                 response = chat_completions_create(
