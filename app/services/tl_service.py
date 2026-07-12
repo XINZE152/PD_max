@@ -290,13 +290,54 @@ def _cell_json(v: Any) -> Any:
     return v
 
 
+def _suggest_similar_names(query: str, candidates: List[str], limit: int = 3) -> List[str]:
+    """当精确匹配和模糊匹配都失败时，给出名称相近的候选，帮助用户排查拼写差异。"""
+    q = query.strip()
+    if len(q) < 2:
+        return []
+    scored: List[Tuple[int, str]] = []
+    for name in candidates:
+        n = (name or "").strip()
+        if len(n) < 2:
+            continue
+        # 较短一侧 >= 4 字符才计分（与 _match_factory 保持一致）
+        if min(len(q), len(n)) >= 4:
+            if n in q or q in n:
+                scored.append((0, n))
+                continue
+        # 共享前缀/后缀
+        if len(q) >= 3 and len(n) >= 3:
+            if q[:3] == n[:3]:
+                scored.append((2, n))
+                continue
+            if q[-3:] == n[-3:]:
+                scored.append((3, n))
+                continue
+        # 至少共享一个 >= 2 字的关键词
+        for i in range(len(q) - 1):
+            chunk = q[i : i + 2]
+            if len(chunk) >= 2 and chunk in n:
+                scored.append((4, n))
+                break
+    scored.sort(key=lambda x: x[0])
+    seen: set[str] = set()
+    out: List[str] = []
+    for _, name in scored:
+        if name not in seen:
+            seen.add(name)
+            out.append(name)
+        if len(out) >= limit:
+            break
+    return out
+
+
 def _compact_dict_name(s: str) -> str:
     """去掉首尾与中间空白（含全角空格），用于库房名称宽松比较。"""
     return re.sub(r"[\s\u3000]+", "", (s or "").strip())
 
 
 def _rank_warehouse_name_match(query: str, dict_name: str) -> Tuple[int, int]:
-    """分数越小越好；第二项用于同档排序。"""
+    """分数越小越好；第二项用于同档排序。子串匹配要求较短一侧长度 >= 4。"""
     q, n = query.strip(), dict_name.strip()
     if not q:
         return (99, 0)
@@ -305,9 +346,9 @@ def _rank_warehouse_name_match(query: str, dict_name: str) -> Tuple[int, int]:
     qc, nc = _compact_dict_name(q), _compact_dict_name(n)
     if qc and nc == qc:
         return (1, 0)
-    if n and n in q:
+    if n and n in q and len(n) >= 4:
         return (2, -len(n))
-    if q and q in n:
+    if q and q in n and len(q) >= 4:
         return (3, len(n))
     return (9, len(n))
 
@@ -4065,15 +4106,30 @@ class TLService:
 
     # ==================== 接口5：上传价格表（OCR解析） ====================
 
+    @staticmethod
+    def _min_substring_ok(a: str, b: str) -> bool:
+        """双向子串匹配的前置检查：较短一侧长度须 >= 4，避免「浙江」误匹配「浙江天能」。"""
+        return min(len(a.strip()), len(b.strip())) >= 4
+
     def _match_factory(
         self, ocr_name: str, factory_list: List[Tuple[int, str]]
     ) -> Optional[int]:
         """将 OCR 识别出的工厂名匹配到 dict_factories 中的冶炼厂，返回 factory_id"""
         if not ocr_name or ocr_name == "未知工厂":
             return None
+        ocr = ocr_name.strip()
+        if len(ocr) < 2:
+            return None
+        # 优先精确匹配（忽略首尾空白）
         for fid, fname in factory_list:
-            # 双向包含匹配
-            if fname in ocr_name or ocr_name in fname:
+            if fname.strip() == ocr:
+                return fid
+        # 双向包含匹配：较短一侧长度须 >= 4，避免短片段误匹配
+        for fid, fname in factory_list:
+            fn = fname.strip()
+            if not self._min_substring_ok(ocr, fn):
+                continue
+            if fn in ocr or ocr in fn:
                 return fid
         return None
 
@@ -4083,8 +4139,19 @@ class TLService:
         """将 OCR 识别出的品类名匹配到 dict_categories，返回 (category_id, row_id)"""
         if not ocr_cat:
             return None
+        cat = ocr_cat.strip()
+        if len(cat) < 2:
+            return None
+        # 优先精确匹配（忽略首尾空白）
         for row_id, cat_id, cname in category_list:
-            if cname in ocr_cat or ocr_cat in cname:
+            if cname.strip() == cat:
+                return (cat_id, row_id)
+        # 双向包含匹配：较短一侧长度须 >= 4
+        for row_id, cat_id, cname in category_list:
+            cn = cname.strip()
+            if not self._min_substring_ok(cat, cn):
+                continue
+            if cn in cat or cat in cn:
                 return (cat_id, row_id)
         return None
 
@@ -4800,7 +4867,7 @@ class TLService:
                     active_cat_name_rows = cur.fetchall()
 
                     for item in items:
-                        # 1. 冶炼厂：须已在字典中存在且名称与库中完全一致；禁止确认写入时静默新建
+                        # 1. 冶炼厂：须已在字典中存在；优先精确匹配，精确失败时回退模糊匹配
                         if item.get("冶炼厂id") is None:
                             factory_name = str(item.get("冶炼厂名") or "").strip()
                             if not factory_name:
@@ -4811,12 +4878,53 @@ class TLService:
                             )
                             row = cur.fetchone()
                             if not row:
-                                raise ValueError(
-                                    f"冶炼厂「{factory_name}」在系统中不存在，或与字典中的名称不完全一致"
-                                    f"（须与「冶炼厂」管理中的名称一字不差，例如全称「安徽鲁控环保有限公司」）。"
-                                    f"请修正名称或先在字典中新增该冶炼厂。"
+                                # 精确匹配失败，尝试模糊匹配（子串匹配要求较短侧 >= 4 字符）
+                                cur.execute(
+                                    "SELECT id, name, is_active FROM dict_factories"
                                 )
-                            fid_row, active = int(row[0]), row[1]
+                                all_factories = [
+                                    (int(r[0]), str(r[1]), r[2]) for r in cur.fetchall()
+                                ]
+                                factory_list = [(f[0], f[1]) for f in all_factories]
+                                matched_id = self._match_factory(
+                                    factory_name, factory_list
+                                )
+                                if matched_id is not None:
+                                    # 检查匹配到的冶炼厂是否启用
+                                    matched_active = next(
+                                        (f[2] for f in all_factories if f[0] == matched_id),
+                                        None,
+                                    )
+                                    if matched_active is not None and int(matched_active) != 1:
+                                        matched_name = next(
+                                            (f[1] for f in all_factories if f[0] == matched_id),
+                                            f"id={matched_id}",
+                                        )
+                                        raise ValueError(
+                                            f"冶炼厂「{factory_name}」模糊匹配到「{matched_name}」，"
+                                            f"但该冶炼厂已停用，请先在冶炼厂管理中启用后再写入报价。"
+                                        )
+                                    fid_row = matched_id
+                                    active = matched_active
+                                else:
+                                    # 模糊也未命中，尝试给出相近候选
+                                    suggestions = _suggest_similar_names(
+                                        factory_name,
+                                        [f[1] for f in all_factories],
+                                    )
+                                    hint = ""
+                                    if suggestions:
+                                        hint = (
+                                            f" 您是否要输入：{'、'.join(suggestions[:3])}？"
+                                        )
+                                    raise ValueError(
+                                        f"冶炼厂「{factory_name}」在系统中不存在，或与字典中的名称不完全一致"
+                                        f"（须与「冶炼厂」管理中的名称一字不差，例如全称「安徽鲁控环保有限公司」）。"
+                                        f"{hint}"
+                                        f"请修正名称或先在字典中新增该冶炼厂。"
+                                    )
+                            else:
+                                fid_row, active = int(row[0]), row[1]
                             if active is not None and int(active) != 1:
                                 raise ValueError(
                                     f"冶炼厂「{factory_name}」已停用，请先在冶炼厂管理中启用后再写入报价。"
@@ -8737,11 +8845,12 @@ class TLService:
                 return row
         return None
 
-    def _load_warehouse_match_indexes(self, cur) -> Tuple[Dict[str, int], Dict[str, List[int]], Dict[int, str]]:
+    def _load_warehouse_match_indexes(self, cur) -> Tuple[Dict[str, int], Dict[str, List[int]], Dict[int, str], Dict[int, str]]:
         cur.execute("SELECT id, name, province FROM dict_warehouses")
         exact: Dict[str, int] = {}
         canon: Dict[str, List[int]] = {}
         provinces: Dict[int, str] = {}
+        wh_names: Dict[int, str] = {}
         for wid, name, province in cur.fetchall():
             n = (name or "").strip()
             if not n:
@@ -8751,7 +8860,8 @@ class TLService:
             ck = canonical_warehouse_key(n)
             canon.setdefault(ck, []).append(int(wid))
             provinces[int(wid)] = (province or "").strip()
-        return exact, canon, provinces
+            wh_names[int(wid)] = n
+        return exact, canon, provinces, wh_names
 
     def _match_warehouse_id(
         self,
@@ -8993,7 +9103,7 @@ class TLService:
 
         with get_conn() as conn:
             with conn.cursor() as cur:
-                exact, canon, wh_provinces = self._load_warehouse_match_indexes(cur)
+                exact, canon, wh_provinces, wh_names = self._load_warehouse_match_indexes(cur)
 
                 for wh_name, raw in merged.items():
                     wid, how = self._match_warehouse_id(wh_name, exact, canon)
@@ -9003,8 +9113,11 @@ class TLService:
                     if how == "ambiguous":
                         stats["skipped_ambiguous_wh"] += 1
                         ck = canonical_warehouse_key(wh_name)
+                        ambiguous_ids = canon.get(ck, [])
+                        ambiguous_names = [wh_names.get(wid, f"id={wid}") for wid in ambiguous_ids]
                         errors.append(
-                            f"「{wh_name}」名称歧义，对应多库房 id：{canon.get(ck, [])}"
+                            f"「{wh_name}」名称歧义，匹配到 {len(ambiguous_ids)} 个库房：{ambiguous_names}"
+                            f"（请使用字典中的完整名称以确保精确匹配）"
                         )
                         continue
                     assert wid is not None
@@ -9779,7 +9892,7 @@ class TLService:
             conn.autocommit(False)
             try:
                 with conn.cursor() as cur:
-                    exact, canon, _provinces = self._load_warehouse_match_indexes(cur)
+                    exact, canon, _provinces, _wh_names = self._load_warehouse_match_indexes(cur)
                     fuzzy_wh = self._load_warehouse_fuzzy_candidates(cur)
                     for row in parsed_rows:
                         try:
@@ -10285,7 +10398,7 @@ class TLService:
             conn.autocommit(False)
             try:
                 with conn.cursor() as cur:
-                    exact, canon, _provinces = self._load_warehouse_match_indexes(cur)
+                    exact, canon, _provinces, _wh_names = self._load_warehouse_match_indexes(cur)
                     fuzzy_wh = self._load_warehouse_fuzzy_candidates(cur)
                     ev_cat_id = self._resolve_ev_battery_category_id(cur)
                     for row in parsed_rows:

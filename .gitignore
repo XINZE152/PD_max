@@ -23,6 +23,7 @@ app/ai_detection/feedback/*
 
 # 4. IDE 与系统配置文件
 .vscode/
+.claude/
 .idea/
 .DS_Store   
 uploads/
