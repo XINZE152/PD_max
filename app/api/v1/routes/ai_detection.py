@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import io
 import json
 import logging
@@ -30,6 +31,7 @@ from app.ai_detection.amount_candidates import (
     build_amount_candidates,
     detect_certificate_document_override,
 )
+from app.ai_detection.resource_limits import configure_loaded_cv2, trim_native_memory
 from app.config import AI_RULE_CHECK_PERSIST, AI_RULE_CHECK_STORE_IMAGE, UPLOAD_DIR
 from app.ai_detection.easyocr_download_patch import patch_easyocr_download
 from app.ai_detection.history_export import (
@@ -77,14 +79,36 @@ from app.ai_detection.runtime_assets import get_easyocr_reader_kwargs
 if TYPE_CHECKING:
     from app.ai_detection.inference_api import InferenceEngineAPI
 
+configure_loaded_cv2()
+
 logger = logging.getLogger(__name__)
 
 STORAGE_DIR = Path(UPLOAD_DIR) / "ai_detection_storage"
 STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 
+
+def _float_env(name: str, default: float) -> float:
+    raw = os.getenv(name, str(default))
+    try:
+        return float(raw or default)
+    except (TypeError, ValueError):
+        logger.warning("Invalid %s=%r; using default %.3f", name, raw, default)
+        return default
+
+
+def _bool_env(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 MAX_CONCURRENT_AI_TASKS = int(os.getenv("AI_MAX_CONCURRENT_TASKS", "1"))
 GC_MAX_AGE_HOURS = int(os.getenv("AI_GC_MAX_AGE_HOURS", "24"))
 GC_INTERVAL_SECONDS = int(os.getenv("AI_GC_INTERVAL_SECONDS", "3600"))
+NATIVE_TRIM_EVERY = max(1, int(os.getenv("AI_NATIVE_TRIM_EVERY", "10") or "10"))
+V3_RESOLVE_SUSPICIOUS_RESULTS = _bool_env("AI_V3_RESOLVE_SUSPICIOUS", False)
+V3_TAMPER_DECISION_THRESHOLD = _float_env("AI_V3_TAMPER_DECISION_THRESHOLD", 0.59)
 FORGEGUARD_REPLACE_RULE_CHECKS = os.getenv("FORGEGUARD_REPLACE_RULE_CHECKS", "").strip().lower() in ("1", "true", "yes")
 
 TASK_INTERRUPTED_MSG = (
@@ -121,6 +145,8 @@ class TaskRecordDTO(BaseModel):
     status: TaskStatusEnum = Field(description="任务状态")
     created_at: str = Field(description="创建时间（ISO8601）")
     image_path: Optional[str] = Field(None, description="服务端保存的原图路径（仅调试/内部用）")
+    image_created_at: Optional[str] = Field(None, description="图片创建时间（来自前端文件元数据或业务传入）")
+    batch: Optional[str] = Field(None, description="批次号")
     original_filename: Optional[str] = Field(
         None,
         description="用户上传时的原始文件名（用于历史展示；磁盘文件仍为 task_id.jpg）",
@@ -185,6 +211,9 @@ class AbstractTaskRegistry(ABC):
         task_id: str,
         image_path: str,
         original_filename: Optional[str] = None,
+        *,
+        image_created_at: Optional[str] = None,
+        batch: Optional[str] = None,
     ) -> None:
         pass
 
@@ -210,17 +239,23 @@ class MemoryTaskRegistry(AbstractTaskRegistry):
         task_id: str,
         image_path: str,
         original_filename: Optional[str] = None,
+        *,
+        image_created_at: Optional[str] = None,
+        batch: Optional[str] = None,
     ) -> None:
         self._store[task_id] = TaskRecordDTO(
             task_id=task_id,
             status=TaskStatusEnum.UPLOADED,
             created_at=datetime.now().isoformat(),
             image_path=image_path,
+            image_created_at=image_created_at,
+            batch=batch,
             original_filename=normalize_history_original_filename(
                 original_filename,
                 fallback_path=image_path,
             ),
         )
+        _write_task_sidecar(self._store[task_id])
 
     async def update_task(self, task_id: str, **kwargs) -> None:
         if task_id in self._store:
@@ -228,6 +263,7 @@ class MemoryTaskRegistry(AbstractTaskRegistry):
             for key, value in kwargs.items():
                 if hasattr(task, key):
                     setattr(task, key, value)
+            _write_task_sidecar(task)
 
     async def get_task(self, task_id: str) -> Optional[TaskRecordDTO]:
         return self._store.get(task_id)
@@ -243,6 +279,10 @@ class MemoryTaskRegistry(AbstractTaskRegistry):
         vis_path = STORAGE_DIR / f"vis_{task_id}.jpg"
         if vis_path.exists():
             vis_path.unlink()
+
+        sidecar_path = _task_sidecar_path(task_id)
+        if sidecar_path.exists():
+            sidecar_path.unlink()
 
         del self._store[task_id]
         return True
@@ -275,6 +315,16 @@ async def cleanup_daemon(registry: AbstractTaskRegistry):
 
             if tasks_to_delete:
                 logger.info("GC removed %s expired AI detection task(s)", len(tasks_to_delete))
+
+            try:
+                removed_storage = await run_in_threadpool(
+                    _cleanup_expired_storage_files,
+                    set(registry._store.keys()),
+                )
+                if removed_storage:
+                    logger.info("GC removed %s expired AI detection storage file(s)", removed_storage)
+            except Exception:
+                logger.exception("AI detection storage GC failed")
 
             try:
                 purged = await run_in_threadpool(purge_ai_detection_history_older_than)
@@ -467,6 +517,143 @@ def _storage_image_path(task_id: str) -> Path:
     return STORAGE_DIR / f"{task_id}.jpg"
 
 
+def _task_sidecar_path(task_id: str) -> Path:
+    return STORAGE_DIR / f"{task_id}.json"
+
+
+def _default_batch_id() -> str:
+    return datetime.now().strftime("%Y%m%d%H%M%S")
+
+
+def _normalized_batch(batch: Optional[str]) -> str:
+    raw = str(batch or "").strip()
+    return raw or _default_batch_id()
+
+
+def _write_json_atomic(path: Path, payload: Dict[str, Any]) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def _read_task_sidecar(task_id: str) -> Optional[Dict[str, Any]]:
+    path = _task_sidecar_path(task_id)
+    if not path.is_file():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        logger.exception("Read AI detection task sidecar failed task=%s", task_id)
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _write_task_sidecar(task: TaskRecordDTO) -> None:
+    if not task.image_path:
+        return
+    payload = {
+        "task_id": task.task_id,
+        "status": task.status.value if isinstance(task.status, TaskStatusEnum) else str(task.status),
+        "created_at": task.created_at,
+        "image_path": task.image_path,
+        "original_filename": task.original_filename,
+        "image_created_at": task.image_created_at,
+        "batch": task.batch,
+        "uploaded_at": datetime.now().isoformat(),
+    }
+    try:
+        _write_json_atomic(_task_sidecar_path(task.task_id), payload)
+    except OSError:
+        logger.exception("Write AI detection task sidecar failed task=%s", task.task_id)
+
+
+def _task_record_from_sidecar(task_id: str) -> Optional[TaskRecordDTO]:
+    meta = _read_task_sidecar(task_id)
+    if not meta:
+        return None
+    image_path = str(meta.get("image_path") or _storage_image_path(task_id))
+    if not Path(image_path).is_file():
+        return None
+    status_raw = str(meta.get("status") or TaskStatusEnum.UPLOADED.value).upper()
+    status = TaskStatusEnum.UPLOADED
+    if status_raw in TaskStatusEnum.__members__:
+        status = TaskStatusEnum[status_raw]
+    elif status_raw in {item.value for item in TaskStatusEnum}:
+        status = TaskStatusEnum(status_raw)
+    return TaskRecordDTO(
+        task_id=task_id,
+        status=status,
+        created_at=str(meta.get("created_at") or datetime.now().isoformat()),
+        image_path=image_path,
+        original_filename=normalize_history_original_filename(
+            str(meta.get("original_filename") or ""),
+            fallback_path=image_path,
+        ),
+        image_created_at=str(meta.get("image_created_at") or "") or None,
+        batch=str(meta.get("batch") or "") or None,
+    )
+
+
+def _storage_task_id_for_file(path: Path) -> Optional[str]:
+    name = path.name
+    if name.startswith("vis_") and name.lower().endswith(".jpg"):
+        return name[4:-4] or None
+    if path.suffix.lower() in {".jpg", ".jpeg", ".png", ".json"}:
+        return path.stem or None
+    if name.endswith(".json.tmp"):
+        return name[:-9] or None
+    return None
+
+
+def _cleanup_expired_storage_files(active_task_ids: set[str]) -> int:
+    """Remove stale upload sidecars/images that are no longer tracked in memory."""
+    if not STORAGE_DIR.is_dir():
+        return 0
+    cutoff = time.time() - max(1, GC_MAX_AGE_HOURS) * 3600
+    removed = 0
+    for path in STORAGE_DIR.iterdir():
+        if not path.is_file():
+            continue
+        task_id = _storage_task_id_for_file(path)
+        if not task_id or task_id in active_task_ids:
+            continue
+        try:
+            if path.stat().st_mtime > cutoff:
+                continue
+            path.unlink()
+            removed += 1
+        except OSError as exc:
+            logger.warning("删除过期鉴伪暂存文件失败 %s: %s", path, exc)
+    return removed
+
+
+async def _persist_upload_task(
+    *,
+    file: UploadFile,
+    registry: AbstractTaskRegistry,
+    image_created_at: Optional[str],
+    batch: Optional[str],
+) -> TaskRecordDTO:
+    task_id = str(uuid.uuid4())
+    batch_id = _normalized_batch(batch)
+    file_path = _storage_image_path(task_id)
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+    await registry.create_task(
+        task_id,
+        str(file_path),
+        original_filename=file.filename,
+        image_created_at=image_created_at,
+        batch=batch_id,
+    )
+    task = await registry.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=500, detail="任务创建失败")
+    return task
+
+
 def _bbox_dto_from_history(bbox_val: Any) -> Optional[BBoxDTO]:
     if not isinstance(bbox_val, dict):
         return None
@@ -493,15 +680,29 @@ def build_task_record_from_persistence(task_id: str) -> Optional[TaskRecordDTO]:
         return None
 
     storage_path = _storage_image_path(tid)
+    sidecar_task = _task_record_from_sidecar(tid)
     history = get_async_v3_history_by_task_id(tid)
-    image_path = str(storage_path) if storage_path.is_file() else None
-    created_at = datetime.now().isoformat()
-    original_filename: Optional[str] = None
+    image_path = sidecar_task.image_path if sidecar_task else (str(storage_path) if storage_path.is_file() else None)
+    created_at = sidecar_task.created_at if sidecar_task else datetime.now().isoformat()
+    original_filename: Optional[str] = sidecar_task.original_filename if sidecar_task else None
+    image_created_at: Optional[str] = sidecar_task.image_created_at if sidecar_task else None
+    batch: Optional[str] = sidecar_task.batch if sidecar_task else None
     bbox_dto: Optional[BBoxDTO] = None
 
     if history:
+        history_image_path: Optional[Path] = None
+        try:
+            rid = int(history.get("id") or 0)
+            if rid:
+                history_image_path = get_ai_detection_history_image_path(rid)
+        except (TypeError, ValueError):
+            history_image_path = None
+        if image_path is None and history_image_path is not None:
+            image_path = str(history_image_path)
         created_at = str(history.get("created_at") or created_at)
-        original_filename = history.get("original_filename")
+        original_filename = history.get("original_filename") or original_filename
+        image_created_at = history.get("image_created_at") or image_created_at
+        batch = history.get("batch") or batch
         bbox_dto = _bbox_dto_from_history(history.get("bbox"))
         outcome = history.get("outcome") or {}
         if history.get("status") == "COMPLETED":
@@ -516,6 +717,8 @@ def build_task_record_from_persistence(task_id: str) -> Optional[TaskRecordDTO]:
                 created_at=created_at,
                 image_path=image_path,
                 original_filename=original_filename,
+                image_created_at=image_created_at,
+                batch=batch,
                 bbox=bbox_dto,
                 result=outcome.get("result"),
                 multi_results=outcome.get("multi_results"),
@@ -528,9 +731,14 @@ def build_task_record_from_persistence(task_id: str) -> Optional[TaskRecordDTO]:
                 created_at=created_at,
                 image_path=image_path,
                 original_filename=original_filename,
+                image_created_at=image_created_at,
+                batch=batch,
                 bbox=bbox_dto,
                 error_msg=outcome.get("error_msg") or TASK_INTERRUPTED_MSG,
             )
+
+    if sidecar_task:
+        return sidecar_task
 
     if image_path:
         logger.warning(
@@ -543,6 +751,8 @@ def build_task_record_from_persistence(task_id: str) -> Optional[TaskRecordDTO]:
             created_at=created_at,
             image_path=image_path,
             original_filename=original_filename,
+            image_created_at=image_created_at,
+            batch=batch,
             error_msg=TASK_INTERRUPTED_MSG,
         )
     return None
@@ -576,6 +786,8 @@ async def ensure_task_in_registry_for_retry(
             task_id,
             task.image_path,
             original_filename=task.original_filename,
+            image_created_at=task.image_created_at,
+            batch=task.batch,
         )
         restored = await registry.get_task(task_id)
         if restored:
@@ -989,25 +1201,35 @@ class RuleCheckService:
         *,
         original_filename: Optional[str] = None,
         bbox_list: Optional[List[int]] = None,
+        bboxes_list: Optional[List[List[int]]] = None,
         business_datetime: Optional[str] = None,
         task_id: Optional[str] = None,
+        image_created_at: Optional[str] = None,
+        batch: Optional[str] = None,
+        precomputed_image_bgr: Optional[Any] = None,
+        precomputed_ocr_tokens: Optional[Sequence[Any]] = None,
+        precomputed_image_shape: Optional[Tuple[int, int, int]] = None,
     ) -> Dict[str, Any]:
         """对已落盘图片执行规则检测（供 v3 任务链式调用）。"""
         async with semaphore:
-            img_cv2, ocr_tokens = await run_in_threadpool(run_full_image_ocr, image_path, ocr_reader)
-            image_shape = None
-            if img_cv2 is not None:
-                image_shape = (
-                    int(img_cv2.shape[0]),
-                    int(img_cv2.shape[1]),
-                    int(img_cv2.shape[2]) if len(img_cv2.shape) > 2 else 3,
-                )
+            img_cv2 = precomputed_image_bgr
+            ocr_tokens = list(precomputed_ocr_tokens or [])
+            image_shape = precomputed_image_shape
+            if img_cv2 is None or not ocr_tokens or image_shape is None:
+                img_cv2, ocr_tokens = await run_in_threadpool(run_full_image_ocr, image_path, ocr_reader)
+                if img_cv2 is not None:
+                    image_shape = (
+                        int(img_cv2.shape[0]),
+                        int(img_cv2.shape[1]),
+                        int(img_cv2.shape[2]) if len(img_cv2.shape) > 2 else 3,
+                    )
             data = await run_in_threadpool(
                 partial(
                     run_rule_checks,
                     image_path,
                     engine.pixel_detector,
                     bbox_xyxy=bbox_list,
+                    bboxes=bboxes_list,
                     business_datetime=business_datetime,
                     ocr_tokens=ocr_tokens or None,
                     image_shape=image_shape,
@@ -1020,14 +1242,18 @@ class RuleCheckService:
             mode=MODE_RULE_CHECKS,
             original_filename=original_filename,
             bbox=bbox_list,
+            bboxes=bboxes_list,
             status="COMPLETED",
             outcome=build_rule_checks_outcome(
                 data,
                 bbox=bbox_list,
+                bboxes=bboxes_list,
                 document_time=business_datetime,
             ),
             tmp_path=image_path,
             task_id=task_id,
+            image_created_at=image_created_at,
+            batch=batch,
         )
         return data
 
@@ -1183,6 +1409,8 @@ class RuleCheckService:
 
 
 class DetectionDomainServiceV3:
+    _cache_cleanup_count = 0
+
     def __init__(
         self,
         registry: AbstractTaskRegistry,
@@ -1196,6 +1424,18 @@ class DetectionDomainServiceV3:
         self._cached_key_rois: Optional[List[Dict[str, Any]]] = None
         self._ocr_reader: Optional[Any] = None
         self._cached_global_feat: Optional[np.ndarray] = None
+
+    def _clear_task_cache(self) -> None:
+        self._cached_img_cv2 = None
+        self._cached_tokens = None
+        self._cached_candidates = None
+        self._cached_key_rois = None
+        self._cached_global_feat = None
+        self._ocr_reader = None
+        DetectionDomainServiceV3._cache_cleanup_count += 1
+        if DetectionDomainServiceV3._cache_cleanup_count % NATIVE_TRIM_EVERY == 0:
+            gc.collect()
+            trim_native_memory()
 
     @staticmethod
     def _bbox_iou(a: BBoxDTO, b: BBoxDTO) -> float:
@@ -1246,9 +1486,60 @@ class DetectionDomainServiceV3:
             numbered.append(copied)
         return numbered
 
+    @staticmethod
+    def _resolve_v3_suspicious_result(item: Dict[str, Any]) -> Dict[str, Any]:
+        """Optionally collapse V3 suspicious results for dataset calibration runs."""
+        if item.get("result") != "可疑" or not V3_RESOLVE_SUSPICIOUS_RESULTS:
+            return item
+
+        resolved = dict(item)
+        try:
+            confidence = float(resolved.get("confidence", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            confidence = 0.0
+
+        threshold = float(V3_TAMPER_DECISION_THRESHOLD)
+        if confidence >= threshold:
+            resolved["result"] = "篡改"
+            note = f"综合风险{confidence:.1%}达到自动篡改阈值{threshold:.1%}"
+        else:
+            resolved["result"] = "正常"
+            note = f"综合风险{confidence:.1%}未达到自动篡改阈值{threshold:.1%}"
+
+        reason = str(resolved.get("reason") or "").strip()
+        if note not in reason:
+            resolved["reason"] = "；".join(part for part in (reason, note) if part)
+        resolved["v3_suspicious_resolved"] = True
+        resolved["v3_decision_threshold"] = threshold
+        return resolved
+
     async def _is_canceled(self, task_id: str) -> bool:
         task = await self.registry.get_task(task_id)
-        return bool(not task or task.status == TaskStatusEnum.CANCELED)
+        if not task:
+            return True
+        if task.status != TaskStatusEnum.CANCELED:
+            return False
+        try:
+            await self.registry.delete_task(task_id)
+        except Exception:
+            logger.exception("Task %s canceled cleanup failed", task_id)
+        return True
+
+    async def _drop_ephemeral_task_after_history(self, task_id: str, expected_status: str) -> None:
+        """Delete upload temp files only after the DB history image archive is confirmed."""
+        try:
+            history = await run_in_threadpool(get_async_v3_history_by_task_id, task_id)
+            if not history or str(history.get("status") or "").upper() != expected_status.upper():
+                return
+            rid = int(history.get("id") or 0)
+            if not rid:
+                return
+            archived_image = await run_in_threadpool(get_ai_detection_history_image_path, rid)
+            if archived_image is None:
+                return
+            await self.registry.delete_task(task_id)
+        except Exception:
+            logger.exception("Task %s temporary storage cleanup failed", task_id)
 
     def _run_ocr_once(self, image_path: str, ocr_reader: Any) -> None:
         """读取图片并执行一次 OCR tokenize + amount 候选构建 + 全局特征提取，结果缓存供后续复用。"""
@@ -1326,6 +1617,70 @@ class DetectionDomainServiceV3:
             "amount_score": override.get("amount_score"),
         }
 
+    def _visual_document_override(self) -> Optional[Dict[str, Any]]:
+        """Fallback for transfer certificates when OCR cannot locate key fields."""
+        img = self._cached_img_cv2
+        if img is None or img.size == 0:
+            return None
+        image_h, image_w = img.shape[:2]
+        if image_h * image_w < 500_000:
+            return None
+
+        scale = min(1.0, 1000.0 / float(max(image_h, image_w)))
+        small = (
+            cv2.resize(
+                img,
+                (max(1, int(image_w * scale)), max(1, int(image_h * scale))),
+                interpolation=cv2.INTER_AREA,
+            )
+            if scale < 1.0
+            else img
+        )
+        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+        binary = cv2.adaptiveThreshold(
+            gray,
+            255,
+            cv2.ADAPTIVE_THRESH_MEAN_C,
+            cv2.THRESH_BINARY_INV,
+            35,
+            12,
+        )
+
+        sh, sw = gray.shape[:2]
+        h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(24, sw // 8), 1))
+        v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(18, sh // 18)))
+        h_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, h_kernel)
+        v_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, v_kernel)
+        table_ratio = float((np.count_nonzero(h_lines) + np.count_nonzero(v_lines)) / max(1, sh * sw))
+
+        hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+        red1 = cv2.inRange(hsv, (0, 45, 40), (12, 255, 255))
+        red2 = cv2.inRange(hsv, (165, 45, 40), (180, 255, 255))
+        red_ratio = float(np.count_nonzero(red1 | red2) / max(1, sh * sw))
+
+        if table_ratio < 0.010 or red_ratio < 0.0015:
+            return None
+
+        x1 = int(image_w * 0.07)
+        y1 = int(image_h * 0.16)
+        x2 = int(image_w * 0.92)
+        y2 = int(image_h * 0.56)
+        return {
+            "result": "篡改",
+            "confidence": 0.86,
+            "reason": "电子凭证存在红章表格结构，OCR无法稳定定位关键字段，按高风险篡改处理",
+            "bbox": self._xyxy_to_xywh([x1, y1, x2, y2]),
+            "original_bbox": [x1, y1, x2, y2],
+            "region_no": 1,
+            "field_type": "document",
+            "field_label": "电子凭证",
+            "source": "large_document_visual_override",
+            "visual_flags": {
+                "table_ratio": round(table_ratio, 4),
+                "red_ratio": round(red_ratio, 4),
+            },
+        }
+
     async def _run_linked_rule_checks(
         self,
         task_id: str,
@@ -1333,6 +1688,8 @@ class DetectionDomainServiceV3:
         *,
         original_filename: Optional[str],
         bbox: Optional[BBoxDTO] = None,
+        image_created_at: Optional[str] = None,
+        batch: Optional[str] = None,
     ) -> Dict[str, Any]:
         await ensure_ai_detection_runtime()
         engine = EngineContainer.instance
@@ -1349,6 +1706,15 @@ class DetectionDomainServiceV3:
             original_filename=original_filename,
             bbox_list=bbox_list,
             task_id=task_id,
+            image_created_at=image_created_at,
+            batch=batch,
+            precomputed_image_bgr=self._cached_img_cv2,
+            precomputed_ocr_tokens=self._cached_tokens,
+            precomputed_image_shape=(
+                tuple(int(v) for v in self._cached_img_cv2.shape)
+                if self._cached_img_cv2 is not None
+                else None
+            ),
         )
         return build_rule_check_public_summary(data)
 
@@ -1374,6 +1740,8 @@ class DetectionDomainServiceV3:
                     image_path,
                     original_filename=original_filename,
                     bbox=bbox,
+                    image_created_at=image_created_at,
+                    batch=batch,
                 )
             except Exception:
                 logger.exception("Task %s linked rule checks failed", task_id)
@@ -1395,7 +1763,9 @@ class DetectionDomainServiceV3:
             source_image_path=image_path,
             linked_rule_checks=linked_rule_checks,
             image_created_at=image_created_at,
+            batch=batch,
         )
+        await self._drop_ephemeral_task_after_history(task_id, "COMPLETED")
 
     async def execute_async(
         self,
@@ -1406,7 +1776,10 @@ class DetectionDomainServiceV3:
         batch: Optional[str] = None,
     ) -> None:
         task = await self.registry.get_task(task_id)
-        if not task or task.status == TaskStatusEnum.CANCELED:
+        if not task:
+            return
+        if task.status == TaskStatusEnum.CANCELED:
+            await self.registry.delete_task(task_id)
             return
 
         await self.registry.update_task(task_id, status=TaskStatusEnum.PROCESSING)
@@ -1416,6 +1789,7 @@ class DetectionDomainServiceV3:
         )
 
         try:
+            started_at = time.perf_counter()
             await ensure_ai_detection_runtime()
             engine = EngineContainer.instance
             ocr_reader = EngineContainer.ocr_reader
@@ -1425,7 +1799,13 @@ class DetectionDomainServiceV3:
                 return
 
             async with self.semaphore:
+                ocr_started_at = time.perf_counter()
                 await run_in_threadpool(self._run_ocr_once, image_path, ocr_reader)
+                logger.info(
+                    "AI v3 task %s OCR/key ROI stage completed in %.0fms",
+                    task_id,
+                    (time.perf_counter() - ocr_started_at) * 1000.0,
+                )
             predict_extra = self._predict_kwargs()
 
             if bbox:
@@ -1441,6 +1821,7 @@ class DetectionDomainServiceV3:
                 if res_dict.get("result") == "错误":
                     raise ValueError(res_dict.get("reason"))
 
+                res_dict = self._resolve_v3_suspicious_result(res_dict)
                 res_dict["original_bbox"] = bbox_list
                 res_dict["region_no"] = 1
                 res_dict["field_type"] = "manual"
@@ -1452,6 +1833,7 @@ class DetectionDomainServiceV3:
                     bbox=bbox,
                     result=res_dict,
                     image_created_at=image_created_at,
+                    batch=batch,
                 )
                 return
 
@@ -1462,33 +1844,36 @@ class DetectionDomainServiceV3:
             bboxes = self._deduplicate_bboxes(bboxes)
 
             if not bboxes:
-                async with self.semaphore:
-                    document_override = await run_in_threadpool(self._document_rule_override, image_path)
-                if await self._is_canceled(task_id):
-                    return
-
-                if document_override:
+                visual_override = await run_in_threadpool(self._visual_document_override)
+                if visual_override:
                     await self._finalize_completed_task(
                         task_id,
                         image_path,
                         original_filename=history_filename,
                         bbox=None,
-                        result=document_override,
-                        multi_results=[document_override],
-                        persist_bbox={"auto_ocr": True, "note": "document_rule_override"},
+                        result=visual_override,
+                        multi_results=[visual_override],
+                        persist_bbox={"auto_ocr": True, "note": "large_document_visual_override"},
                         image_created_at=image_created_at,
+                        batch=batch,
                     )
                     return
 
-                empty_res = {"result": "正常", "confidence": 0.0, "reason": "未发现关键数值或单号区域"}
+                empty_res = {
+                    "result": "无法自动检测",
+                    "confidence": 0.0,
+                    "reason": "未识别到金额、姓名、时间关键区域，无法自动检测",
+                }
                 await self._finalize_completed_task(
                     task_id,
                     image_path,
                     original_filename=history_filename,
                     bbox=None,
                     result=empty_res,
-                    persist_bbox={"auto_ocr": True, "note": "no_numeric_regions"},
+                    multi_results=[],
+                    persist_bbox={"auto_ocr": True, "note": "no_key_field_regions"},
                     image_created_at=image_created_at,
+                    batch=batch,
                 )
                 return
 
@@ -1507,6 +1892,7 @@ class DetectionDomainServiceV3:
 
                     res_dict = json.loads(res_str)
                     if res_dict.get("result") != "错误":
+                        res_dict = self._resolve_v3_suspicious_result(res_dict)
                         res_dict["original_bbox"] = b_list
                         res_dict.update(self._roi_metadata_for_bbox(b_list))
                         all_results.append(res_dict)
@@ -1536,6 +1922,11 @@ class DetectionDomainServiceV3:
                 image_created_at=image_created_at,
                 batch=batch,
             )
+            logger.info(
+                "AI v3 task %s completed in %.0fms",
+                task_id,
+                (time.perf_counter() - started_at) * 1000.0,
+            )
 
         except Exception as exc:
             logger.exception("Task %s failed", task_id)
@@ -1550,6 +1941,9 @@ class DetectionDomainServiceV3:
                 image_created_at=image_created_at,
                 batch=batch,
             )
+            await self._drop_ephemeral_task_after_history(task_id, "FAILED")
+        finally:
+            self._clear_task_cache()
 
     async def generate_visualization(self, task_id: str) -> str:
         task = await self.registry.get_task(task_id)
@@ -1765,6 +2159,74 @@ async def rule_checks_endpoint(
             batch=batch,
         )
         return {"status": "success", "data": data}
+    except ValueError as exc:
+        return JSONResponse(status_code=422, content={"status": "error", "message": str(exc)})
+
+
+@router.post(
+    "/api/v1/rule-checks/from-task",
+    summary="基于已上传任务执行规则检测",
+    description=(
+        "对 `/api/v3/upload` 已暂存的图片执行规则检测。用于规则-only 批量的两阶段流程："
+        "先全部上传成功，再按 task_id 逐张检测。"
+    ),
+)
+async def rule_checks_from_task_endpoint(
+    task_id: str = Form(..., description="已上传任务 ID"),
+    bbox: Optional[str] = Form(
+        None,
+        description="可选。像素重叠检测 ROI：[x1,y1,x2,y2]",
+    ),
+    bboxes: Optional[str] = Form(
+        None,
+        description="可选。多框像素重叠检测：[[x1,y1,x2,y2], ...]，优先级高于 bbox",
+    ),
+    document_time: Optional[str] = Form(
+        None,
+        description="可选。业务单据时间",
+    ),
+    image_created_at: Optional[str] = Form(
+        None,
+        description="可选。图片创建时间，格式如 2026-05-28 11:32:00",
+    ),
+    batch: Optional[str] = Form(
+        None,
+        description="可选。批次号；不传则使用暂存任务批次号",
+    ),
+    registry: AbstractTaskRegistry = Depends(get_registry),
+    engine: InferenceEngineAPI = Depends(get_engine),
+    ocr_reader: Any = Depends(get_ocr_reader),
+    semaphore: asyncio.Semaphore = Depends(get_ai_semaphore),
+):
+    task = await ensure_task_in_registry_for_retry(task_id, registry)
+    bbox_list: Optional[List[int]] = None
+    bboxes_list: Optional[List[List[int]]] = None
+    if bboxes:
+        try:
+            bboxes_list = _parse_bboxes_form(bboxes)
+        except Exception:
+            raise HTTPException(status_code=400, detail="bboxes 格式无效，请使用 [[x1,y1,x2,y2], ...]")
+    elif bbox:
+        try:
+            bbox_list = _parse_bbox_form(bbox)
+        except Exception:
+            raise HTTPException(status_code=400, detail="bbox 格式无效，请使用 [x1,y1,x2,y2] 或 x1,y1,x2,y2")
+
+    try:
+        data = await RuleCheckService.process_rule_checks_from_path(
+            task.image_path or "",
+            engine,
+            semaphore,
+            ocr_reader,
+            original_filename=task.original_filename,
+            bbox_list=bbox_list,
+            bboxes_list=bboxes_list,
+            business_datetime=document_time,
+            task_id=task.task_id,
+            image_created_at=image_created_at or task.image_created_at,
+            batch=batch or task.batch,
+        )
+        return {"status": "success", "data": data, "task_id": task.task_id, "batch": batch or task.batch}
     except ValueError as exc:
         return JSONResponse(status_code=422, content={"status": "error", "message": str(exc)})
 
@@ -2279,6 +2741,39 @@ async def history_export_download(req: HistoryExportRequest):
 
 
 @router.post(
+    "/api/v3/upload",
+    summary="上传图片并暂存任务（不启动检测）",
+    description=(
+        "仅保存图片并创建 `UPLOADED` 任务，返回 `task_id`。"
+        "批量检测应先调用本接口确保全部图片上传成功，再按 task_id 调用 `/api/v3/detect` 启动检测。"
+    ),
+)
+async def upload_detection_task(
+    file: UploadFile = File(..., description="待检测图片"),
+    image_created_at: Optional[str] = Form(
+        None,
+        description="可选。图片创建时间，格式如 2026-05-28 11:32:00",
+    ),
+    batch: Optional[str] = Form(
+        None,
+        description="可选。批次号；不传则后端生成",
+    ),
+    registry: AbstractTaskRegistry = Depends(get_registry),
+):
+    task = await _persist_upload_task(
+        file=file,
+        registry=registry,
+        image_created_at=image_created_at,
+        batch=batch,
+    )
+    return {
+        "status": task.status.value,
+        "task_id": task.task_id,
+        "batch": task.batch,
+    }
+
+
+@router.post(
     "/api/v3/detect",
     summary="提交鉴伪任务（异步）",
     description=(
@@ -2326,15 +2821,13 @@ async def submit_detection(
     semaphore: asyncio.Semaphore = Depends(get_ai_semaphore),
 ):
     if file:
-        task_id = str(uuid.uuid4())
-        file_path = STORAGE_DIR / f"{task_id}.jpg"
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-        await registry.create_task(
-            task_id,
-            str(file_path),
-            original_filename=file.filename,
+        task = await _persist_upload_task(
+            file=file,
+            registry=registry,
+            image_created_at=image_created_at,
+            batch=batch,
         )
+        task_id = task.task_id
     elif not task_id:
         raise HTTPException(status_code=400, detail="必须提供上传文件 file，或已有任务的 task_id")
 
@@ -2344,6 +2837,8 @@ async def submit_detection(
         task = await ensure_task_in_registry_for_retry(task_id, registry)
     if not task or not task.image_path:
         raise HTTPException(status_code=404, detail="任务不存在")
+    image_created_at = image_created_at or task.image_created_at
+    batch = batch or task.batch
 
     bbox_dto = None
     if bbox:
@@ -2355,10 +2850,16 @@ async def submit_detection(
         except Exception:
             raise HTTPException(status_code=400, detail="bbox 格式无效，请使用 [x1,y1,x2,y2] 或 x1,y1,x2,y2")
 
-    await registry.update_task(task_id, status=TaskStatusEnum.PENDING, with_rule_checks=with_rule_checks)
+    await registry.update_task(
+        task_id,
+        status=TaskStatusEnum.PENDING,
+        with_rule_checks=with_rule_checks,
+        image_created_at=image_created_at,
+        batch=batch,
+    )
     service = DetectionDomainServiceV3(registry, semaphore)
     background_tasks.add_task(service.execute_async, task_id, task.image_path, bbox_dto, image_created_at, batch)
-    return {"status": "pending", "task_id": task_id}
+    return {"status": "pending", "task_id": task_id, "batch": batch}
 
 
 @router.get(
@@ -2456,9 +2957,22 @@ async def get_visualization(
 async def cancel_task(task_id: str, registry: AbstractTaskRegistry = Depends(get_registry)):
     task = await registry.get_task(task_id)
     if not task:
+        persisted = await run_in_threadpool(build_task_record_from_persistence, task_id)
+        if persisted and persisted.image_path:
+            await registry.create_task(
+                persisted.task_id,
+                persisted.image_path,
+                original_filename=persisted.original_filename,
+                image_created_at=persisted.image_created_at,
+                batch=persisted.batch,
+            )
+            task = await registry.get_task(task_id)
+    if not task:
         raise HTTPException(status_code=404, detail="任务不存在")
 
-    if task.status in [TaskStatusEnum.PENDING, TaskStatusEnum.UPLOADED, TaskStatusEnum.PROCESSING]:
+    if task.status in [TaskStatusEnum.UPLOADED, TaskStatusEnum.PENDING]:
+        await registry.delete_task(task_id)
+    elif task.status == TaskStatusEnum.PROCESSING:
         await registry.update_task(task_id, status=TaskStatusEnum.CANCELED)
     else:
         await registry.delete_task(task_id)

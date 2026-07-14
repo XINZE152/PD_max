@@ -16,8 +16,12 @@ from app.ai_detection.core.exceptions import RecoverableError
 from app.ai_detection.core.extractors import FeatureExtractor, FontFeatureLibrary, TamperAnalyzer
 from app.ai_detection.core.detectors import PixelLevelDetector, OriginalityChecker
 from app.ai_detection.core.utils import NumpyEncoder, safe_read_image
+from app.ai_detection.ocr_utils import _resize_for_ocr
 
 logger = logging.getLogger(__name__)
+
+PREDICT_MAX_SIDE = max(1, int(os.getenv("AI_PREDICT_MAX_SIDE", "2200") or "2200"))
+PREDICT_MAX_PIXELS = max(1, int(os.getenv("AI_PREDICT_MAX_PIXELS", "4000000") or "4000000"))
 
 
 class InferenceEngineAPI:
@@ -186,6 +190,28 @@ class InferenceEngineAPI:
         return self._clip_bbox_xyxy([x1, y1, x1 + third, y1 + fourth], img_w, img_h)
 
     @staticmethod
+    def _scale_bbox_xyxy(
+        bbox_xyxy: Tuple[int, int, int, int],
+        *,
+        scale: float,
+        img_w: int,
+        img_h: int,
+    ) -> Tuple[int, int, int, int]:
+        if scale >= 0.999:
+            return InferenceEngineAPI._clip_bbox_xyxy(list(bbox_xyxy), img_w, img_h)
+        x1, y1, x2, y2 = bbox_xyxy
+        return InferenceEngineAPI._clip_bbox_xyxy(
+            [
+                int(round(x1 * scale)),
+                int(round(y1 * scale)),
+                int(round(x2 * scale)),
+                int(round(y2 * scale)),
+            ],
+            img_w,
+            img_h,
+        )
+
+    @staticmethod
     def _profile_numeric_text(extracted_text: str, max_len: int) -> Dict[str, float]:
         text_clean = extracted_text.replace(" ", "")
         total_len = len(text_clean)
@@ -245,6 +271,13 @@ class InferenceEngineAPI:
                 self._metrics["error_count"] += 1
                 return json.dumps({"result": "错误", "reason": "无法读取图片或路径不存在"}, ensure_ascii=False)
 
+            orig_h, orig_w = img.shape[:2]
+            work_img, work_scale = _resize_for_ocr(
+                img,
+                max_side=PREDICT_MAX_SIDE,
+                max_pixels=PREDICT_MAX_PIXELS,
+            )
+            img = work_img
             img_h, img_w = img.shape[:2]
 
             rules = self.config.get('business_rules', {})
@@ -265,8 +298,16 @@ class InferenceEngineAPI:
             w_global = fusion_cfg.get('weight_global', 0.35)
             w_local = fusion_cfg.get('weight_local', 0.65)
 
-            x1, y1, x2, y2 = self._normalize_roi_bbox(roi_bbox, img_w, img_h, bbox_format)
+            orig_x1, orig_y1, orig_x2, orig_y2 = self._normalize_roi_bbox(roi_bbox, orig_w, orig_h, bbox_format)
+            x1, y1, x2, y2 = self._scale_bbox_xyxy(
+                (orig_x1, orig_y1, orig_x2, orig_y2),
+                scale=work_scale,
+                img_w=img_w,
+                img_h=img_h,
+            )
             x, y, w, h = x1, y1, x2 - x1, y2 - y1
+            out_x, out_y = orig_x1, orig_y1
+            out_w, out_h = orig_x2 - orig_x1, orig_y2 - orig_y1
 
             # ================== 0. EXIF/元数据分析 ==================
             metadata_risk = 0.0
@@ -339,7 +380,7 @@ class InferenceEngineAPI:
             # ---- 像素重叠 / 检测框 IoU 分析 ----
             bbox_overlap_result = analyze_bbox_iou_overlaps(
                 detection_bboxes or [],
-                roi_bbox_xyxy=[x1, y1, x2, y2],
+                roi_bbox_xyxy=[orig_x1, orig_y1, orig_x2, orig_y2],
                 thresholds=thresh,
             )
             bbox_iou_risk = float(bbox_overlap_result.get("risk", 0.0))
@@ -450,7 +491,7 @@ class InferenceEngineAPI:
             output = {
                 "result": result_status,
                 "confidence": final_risk,
-                "bbox": [int(i) for i in [x, y, w, h]],
+                "bbox": [int(i) for i in [out_x, out_y, out_w, out_h]],
                 "reason": "；".join(dict.fromkeys(reasons)),
                 "bbox_overlap_check": bbox_overlap_result.get("bbox_overlap_check"),
                 "hard_tamper_flags": {
