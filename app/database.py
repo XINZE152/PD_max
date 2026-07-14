@@ -146,11 +146,24 @@ TABLE_STATEMENTS = [
         id INT AUTO_INCREMENT PRIMARY KEY COMMENT '库房类型ID',
         name VARCHAR(50) NOT NULL UNIQUE COMMENT '类型名称',
         color_config JSON DEFAULT NULL COMMENT '颜色配置（JSON），与类型唯一绑定',
+        category_id INT DEFAULT NULL COMMENT '大类ID',
         is_active TINYINT(1) DEFAULT 1 COMMENT '是否启用',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-        INDEX idx_wh_type_active (is_active)
+        INDEX idx_wh_type_active (is_active),
+        INDEX idx_wh_type_category (category_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='库房类型字典（类型-颜色一对一）';
+    """,
+    # 库房大类字典
+    """
+    CREATE TABLE IF NOT EXISTS dict_warehouse_categories (
+        id INT AUTO_INCREMENT PRIMARY KEY COMMENT '大类ID',
+        name VARCHAR(50) NOT NULL UNIQUE COMMENT '大类名称',
+        is_active TINYINT(1) DEFAULT 1 COMMENT '是否启用',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_wh_cat_active (is_active)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='库房大类字典';
     """,
     # 仓库字典表
     """
@@ -162,6 +175,7 @@ TABLE_STATEMENTS = [
         district VARCHAR(64) DEFAULT NULL COMMENT '区县',
         address VARCHAR(500) DEFAULT NULL COMMENT '详细地址',
         warehouse_type_id INT DEFAULT NULL COMMENT '库房类型ID（类型颜色见 dict_warehouse_types）',
+        category_id INT DEFAULT NULL COMMENT '大类ID（覆盖值；为空则取库房类型的默认大类）',
         color_config JSON DEFAULT NULL COMMENT '仓库独立颜色配置（JSON），可与库房类型颜色并存',
         longitude DECIMAL(11, 8) DEFAULT NULL COMMENT '经度',
         latitude DECIMAL(10, 8) DEFAULT NULL COMMENT '纬度',
@@ -188,6 +202,9 @@ TABLE_STATEMENTS = [
         from_warehouse_id INT NOT NULL COMMENT '源库房（出边起点）',
         to_warehouse_id INT NOT NULL COMMENT '对标库房（单向指向终点）',
         tier_price_spread JSON DEFAULT NULL COMMENT '阶梯价差（JSON，可按距离区间维护价差）',
+        remark TEXT DEFAULT NULL COMMENT '备注（手动编辑）',
+        ai_analysis TEXT DEFAULT NULL COMMENT 'AI分析（每天0点大模型自动生成）',
+        last_analysis_at TIMESTAMP NULL DEFAULT NULL COMMENT '上次AI分析时间',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
         UNIQUE KEY uk_wh_link_from_to (from_warehouse_id, to_warehouse_id),
         INDEX idx_wh_link_from (from_warehouse_id),
@@ -1810,6 +1827,10 @@ def create_tables() -> None:
     except Exception:
         logger.exception("库房类型表/warehouse_type_id 迁移失败")
     try:
+        ensure_warehouse_category_migration()
+    except Exception:
+        logger.exception("库房大类表/category_id 迁移失败")
+    try:
         ensure_dict_warehouses_color_config_column()
     except Exception:
         logger.exception("检查/添加 dict_warehouses.color_config（仓库颜色）失败")
@@ -1858,6 +1879,10 @@ def create_tables() -> None:
     except Exception:
         logger.exception("检查/添加 dict_warehouse_links.tier_price_spread 失败")
     try:
+        ensure_dict_warehouse_links_remark_ai_columns()
+    except Exception:
+        logger.exception("检查/添加 dict_warehouse_links.remark/ai_analysis 失败")
+    try:
         ensure_pd_pricing_benchmark_tables()
     except Exception:
         logger.exception("检查/创建 pd_* 对标定价相关表失败")
@@ -1885,6 +1910,99 @@ def create_tables() -> None:
         ensure_pd_warehouse_delivery_stats()
     except Exception:
         logger.exception("检查/创建 pd_warehouse_delivery_stats 库房送货统计缓存表失败")
+
+
+def ensure_warehouse_category_migration() -> None:
+    """库房大类表 + 库房类型表 category_id 列。"""
+    config_dict = get_mysql_config()
+    connection = pymysql.connect(**config_dict)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS dict_warehouse_categories (
+                    id INT AUTO_INCREMENT PRIMARY KEY COMMENT '大类ID',
+                    name VARCHAR(50) NOT NULL UNIQUE COMMENT '大类名称',
+                    is_active TINYINT(1) DEFAULT 1 COMMENT '是否启用',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    INDEX idx_wh_cat_active (is_active)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='库房大类字典';
+                """
+            )
+
+            cursor.execute("SHOW TABLES LIKE 'dict_warehouse_types'")
+            if cursor.fetchone() is None:
+                connection.commit()
+                return
+
+            def _type_has_col(col: str) -> bool:
+                cursor.execute(
+                    "SELECT COUNT(*) FROM information_schema.columns "
+                    "WHERE table_schema = DATABASE() AND table_name = 'dict_warehouse_types' "
+                    "AND column_name = %s",
+                    (col,),
+                )
+                return cursor.fetchone()[0] > 0
+
+            if not _type_has_col("category_id"):
+                cursor.execute(
+                    "ALTER TABLE dict_warehouse_types ADD COLUMN category_id INT DEFAULT NULL "
+                    "COMMENT '大类ID' AFTER color_config"
+                )
+                logger.info("已为 dict_warehouse_types 添加 category_id 列")
+
+            def _type_has_idx(idx: str) -> bool:
+                cursor.execute(
+                    "SELECT COUNT(*) FROM information_schema.statistics "
+                    "WHERE table_schema = DATABASE() AND table_name = 'dict_warehouse_types' "
+                    "AND index_name = %s",
+                    (idx,),
+                )
+                return cursor.fetchone()[0] > 0
+
+            if not _type_has_idx("idx_wh_type_category"):
+                cursor.execute(
+                    "CREATE INDEX idx_wh_type_category ON dict_warehouse_types (category_id)"
+                )
+
+            # 仓库表也加 category_id（覆盖值，为空时取类型的默认大类）
+            cursor.execute("SHOW TABLES LIKE 'dict_warehouses'")
+            if cursor.fetchone() is not None:
+
+                def _wh_has_col(col: str) -> bool:
+                    cursor.execute(
+                        "SELECT COUNT(*) FROM information_schema.columns "
+                        "WHERE table_schema = DATABASE() AND table_name = 'dict_warehouses' "
+                        "AND column_name = %s",
+                        (col,),
+                    )
+                    return cursor.fetchone()[0] > 0
+
+                if not _wh_has_col("category_id"):
+                    cursor.execute(
+                        "ALTER TABLE dict_warehouses ADD COLUMN category_id INT DEFAULT NULL "
+                        "COMMENT '大类ID（覆盖值；为空则取库房类型的默认大类）' AFTER warehouse_type_id"
+                    )
+                    logger.info("已为 dict_warehouses 添加 category_id 列")
+
+                def _wh_has_idx(idx: str) -> bool:
+                    cursor.execute(
+                        "SELECT COUNT(*) FROM information_schema.statistics "
+                        "WHERE table_schema = DATABASE() AND table_name = 'dict_warehouses' "
+                        "AND index_name = %s",
+                        (idx,),
+                    )
+                    return cursor.fetchone()[0] > 0
+
+                if not _wh_has_idx("idx_wh_category"):
+                    cursor.execute(
+                        "CREATE INDEX idx_wh_category ON dict_warehouses (category_id)"
+                    )
+
+        connection.commit()
+    finally:
+        connection.close()
 
 
 def ensure_warehouse_inventory_and_receipt_price_tables() -> None:
@@ -2226,6 +2344,50 @@ def ensure_dict_warehouse_links_tier_price_spread_column() -> None:
                     "COMMENT '阶梯价差（JSON）' AFTER to_warehouse_id"
                 )
                 logger.info("已为 dict_warehouse_links 添加 tier_price_spread")
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def ensure_dict_warehouse_links_remark_ai_columns() -> None:
+    """库房关联边：备注 + AI 分析。"""
+    config_dict = get_mysql_config()
+    connection = pymysql.connect(**config_dict)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SHOW TABLES LIKE 'dict_warehouse_links'")
+            if cursor.fetchone() is None:
+                return
+
+            def _has_col(col: str) -> bool:
+                cursor.execute(
+                    "SELECT COUNT(*) FROM information_schema.columns "
+                    "WHERE table_schema = DATABASE() AND table_name = 'dict_warehouse_links' "
+                    "AND column_name = %s",
+                    (col,),
+                )
+                return cursor.fetchone()[0] > 0
+
+            if not _has_col("remark"):
+                cursor.execute(
+                    "ALTER TABLE dict_warehouse_links ADD COLUMN remark TEXT DEFAULT NULL "
+                    "COMMENT '备注（手动编辑）' AFTER tier_price_spread"
+                )
+                logger.info("已为 dict_warehouse_links 添加 remark 列")
+
+            if not _has_col("ai_analysis"):
+                cursor.execute(
+                    "ALTER TABLE dict_warehouse_links ADD COLUMN ai_analysis TEXT DEFAULT NULL "
+                    "COMMENT 'AI分析（每天0点大模型自动生成）' AFTER remark"
+                )
+                logger.info("已为 dict_warehouse_links 添加 ai_analysis 列")
+
+            if not _has_col("last_analysis_at"):
+                cursor.execute(
+                    "ALTER TABLE dict_warehouse_links ADD COLUMN last_analysis_at "
+                    "TIMESTAMP NULL DEFAULT NULL COMMENT '上次AI分析时间' AFTER ai_analysis"
+                )
+                logger.info("已为 dict_warehouse_links 添加 last_analysis_at 列")
         connection.commit()
     finally:
         connection.close()

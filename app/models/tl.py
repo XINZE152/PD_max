@@ -237,6 +237,10 @@ class AddWarehouseRequest(BaseModel):
         None,
         description="库房类型 ID（可选）；类型颜色来自类型表的「颜色配置」",
     )
+    大类id: Optional[int] = Field(
+        None,
+        description="库房大类 ID（可选，覆盖值）；为空则取库房类型的默认大类",
+    )
     库房类型名: Optional[str] = Field(
         None,
         description="库房类型名称（可选）；若与省市区详址一并提供则走完整落库（含天地图经纬度），与仓库类型id二选一或同时传时优先名称",
@@ -334,12 +338,26 @@ class WarehouseLinksBatchOutboundRequest(BaseModel):
     )
 
 
+class UpdateWarehouseLinkRemarkRequest(BaseModel):
+    """修改库房关联边上的备注"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    源库房id: int = Field(..., ge=1)
+    对标库房id: int = Field(..., ge=1)
+    备注: Optional[str] = Field(None, description="备注内容；传 null 清空备注")
+
+
 class UpdateWarehouseRequest(BaseModel):
     """修改仓库请求体"""
     仓库id: int = Field(..., description="仓库ID")
     仓库名: Optional[str] = Field(None, description="仓库名称（可选）")
     is_active: Optional[bool] = Field(None, description="是否启用（可选）")
     地址: Optional[str] = Field(None, description="地址（可选）")
+    大类id: Optional[int] = Field(
+        None,
+        description="库房大类 ID（可选，覆盖值）；为空则取库房类型的默认大类；传 null 可清除覆盖",
+    )
     仓库类型id: Optional[int] = Field(
         None,
         description="库房类型 ID（可选）；传 null 可取消类型关联（库房类型颜色随之不可用）",
@@ -382,6 +400,10 @@ class AddWarehouseTypeRequest(BaseModel):
         None,
         description="颜色配置（JSON），如 {\"marker\": \"#3388ff\"} 或主色字段名与色值",
     )
+    大类id: Optional[int] = Field(
+        None,
+        description="库房大类 ID（可选）",
+    )
 
 
 class UpdateWarehouseTypeRequest(BaseModel):
@@ -389,6 +411,10 @@ class UpdateWarehouseTypeRequest(BaseModel):
     类型id: int = Field(..., description="dict_warehouse_types.id")
     类型名: Optional[str] = Field(None, description="类型名称（可选）")
     颜色配置: Optional[Any] = Field(None, description="颜色配置（可选）；传 null 可清空")
+    大类id: Optional[int] = Field(
+        None,
+        description="库房大类 ID（可选）；传 null 可取消大类关联",
+    )
     is_active: Optional[bool] = Field(None, description="是否启用（可选）")
 
 
@@ -406,6 +432,18 @@ class UpdateFactoryTypeRequest(BaseModel):
     类型id: int = Field(..., description="dict_factory_types.id")
     类型名: Optional[str] = Field(None, description="类型名称（可选）")
     颜色配置: Optional[Any] = Field(None, description="颜色配置（可选）；传 null 可清空")
+    is_active: Optional[bool] = Field(None, description="是否启用（可选）")
+
+
+class AddWarehouseCategoryRequest(BaseModel):
+    """新增库房大类"""
+    大类名: str = Field(..., description="大类名称，唯一")
+
+
+class UpdateWarehouseCategoryRequest(BaseModel):
+    """修改库房大类"""
+    大类id: int = Field(..., description="dict_warehouse_categories.id")
+    大类名: Optional[str] = Field(None, description="大类名称（可选）")
     is_active: Optional[bool] = Field(None, description="是否启用（可选）")
 
 

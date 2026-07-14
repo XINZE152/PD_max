@@ -250,6 +250,23 @@ try:
 except ValueError:
     WAREHOUSE_DELIVERY_STATS_SCHEDULE_MINUTE = 0
 
+# 库房关联 AI 分析定时任务（每天 0 点）
+WAREHOUSE_LINK_AI_ANALYSIS_SCHEDULE_ENABLED = _env_enabled(
+    "WAREHOUSE_LINK_AI_ANALYSIS_SCHEDULE_ENABLED", default=True
+)
+try:
+    WAREHOUSE_LINK_AI_ANALYSIS_SCHEDULE_HOUR = int(
+        os.getenv("WAREHOUSE_LINK_AI_ANALYSIS_SCHEDULE_HOUR", "0")
+    )
+except ValueError:
+    WAREHOUSE_LINK_AI_ANALYSIS_SCHEDULE_HOUR = 0
+try:
+    WAREHOUSE_LINK_AI_ANALYSIS_SCHEDULE_MINUTE = int(
+        os.getenv("WAREHOUSE_LINK_AI_ANALYSIS_SCHEDULE_MINUTE", "0")
+    )
+except ValueError:
+    WAREHOUSE_LINK_AI_ANALYSIS_SCHEDULE_MINUTE = 0
+
 # 启用「循融宝发货」的冶炼厂在比价/采购建议中货物单价加价（元/吨）；默认 80，可用环境变量覆盖
 try:
     _xrb = (os.getenv("XUNRONGBAO_SHIPPING_PREMIUM_PER_TON", "") or "80").strip() or "80"

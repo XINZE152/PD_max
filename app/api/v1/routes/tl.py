@@ -103,9 +103,12 @@ from app.models.tl import (
     UpdateWarehouseRequest,
     WarehouseLinkBindRequest,
     WarehouseLinkUpdateTierRequest,
+    UpdateWarehouseLinkRemarkRequest,
     WarehouseLinksBatchOutboundRequest,
     WarehouseLinksReplaceOutboundRequest,
     UpdateWarehouseTypeRequest,
+    AddWarehouseCategoryRequest,
+    UpdateWarehouseCategoryRequest,
     AddFactoryTypeRequest,
     UpdateFactoryTypeRequest,
     AddSmelterRequest,
@@ -230,6 +233,7 @@ def add_warehouse(
             name=body.仓库名,
             address=body.地址,
             warehouse_type_id=body.仓库类型id,
+            warehouse_category_id=body.大类id,
             warehouse_color_config=body.仓库颜色配置,
             province=body.省,
             city=body.市,
@@ -478,6 +482,7 @@ def add_warehouse_type(
         return service.add_warehouse_type(
             name=body.类型名,
             color_config=body.颜色配置,
+            category_id=body.大类id,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -507,6 +512,68 @@ def delete_warehouse_type(
 ):
     try:
         return service.delete_warehouse_type(type_id=type_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ===================== 接口1a-2：库房大类维护 =====================
+
+@router.get("/get_warehouse_categories", summary="库房大类列表")
+def get_warehouse_categories(
+    keyword: Optional[str] = Query(None, description="大类名模糊搜索（可选）"),
+    include_inactive: bool = Query(
+        False,
+        description="是否包含已停用的大类",
+    ),
+    service: TLService = Depends(get_tl_service),
+):
+    try:
+        data = service.get_warehouse_categories(
+            keyword=keyword,
+            include_inactive=include_inactive,
+        )
+        return {"code": 200, "data": data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/add_warehouse_category", summary="新增库房大类")
+def add_warehouse_category(
+    body: AddWarehouseCategoryRequest,
+    service: TLService = Depends(get_tl_service),
+):
+    try:
+        return service.add_warehouse_category(name=body.大类名)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/update_warehouse_category", summary="修改库房大类")
+def update_warehouse_category(
+    body: UpdateWarehouseCategoryRequest,
+    service: TLService = Depends(get_tl_service),
+):
+    try:
+        patch = body.model_dump(exclude_unset=True)
+        category_id = patch.pop("大类id")
+        return service.update_warehouse_category(category_id=category_id, patch=patch)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/delete_warehouse_category", summary="删除库房大类（软删除）")
+def delete_warehouse_category(
+    category_id: int = Query(..., description="库房大类 id"),
+    service: TLService = Depends(get_tl_service),
+):
+    try:
+        return service.delete_warehouse_category(category_id=category_id)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
@@ -904,6 +971,38 @@ def update_warehouse_link_tier(
         raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.put("/update_warehouse_link_remark", summary="修改库房关联边上的备注")
+def update_warehouse_link_remark(
+    body: UpdateWarehouseLinkRemarkRequest,
+    service: TLService = Depends(get_tl_service),
+):
+    """修改源库房→对标库房边上的备注；传 null 清空备注。"""
+    try:
+        return service.update_warehouse_link_remark(
+            body.源库房id,
+            body.对标库房id,
+            body.备注,
+        )
+    except ValueError as e:
+        raise _tl_value_error_http(e)
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/run_warehouse_link_ai_analysis", summary="手动触发库房关联AI分析")
+def run_warehouse_link_ai_analysis(
+    service: TLService = Depends(get_tl_service),
+):
+    """对所有活跃库房关联边逐一调大模型分析，结果写入 ai_analysis 字段。"""
+    try:
+        return service.run_warehouse_link_ai_analysis()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 
 @router.put("/replace_warehouse_links_outbound", summary="替换库房全部出边（覆盖式修改）")
