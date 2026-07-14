@@ -94,11 +94,13 @@ class _DummyPixelDetector:
     def __init__(self, score=0.1):
 
         self.score = score
+        self.last_shape = None
 
 
 
     def detect(self, cropped_img_np, quality=85, **kwargs):
 
+        self.last_shape = cropped_img_np.shape
         return self.score
 
 
@@ -285,6 +287,34 @@ class InferenceEngineApiTests(unittest.TestCase):
         self.assertEqual(result["result"], "可疑")
 
         self.assertIn("局部字体风格异常", result["reason"])
+
+    @patch("app.ai_detection.inference_api.analyze_bbox_iou_overlaps")
+    @patch("app.ai_detection.inference_api.safe_read_image")
+    def test_predict_downscales_large_work_image_but_returns_original_bbox(
+        self,
+        mock_safe_read_image,
+        mock_bbox_overlap,
+    ):
+        mock_safe_read_image.return_value = np.zeros((2863, 3000, 3), dtype=np.uint8)
+        mock_bbox_overlap.return_value = {
+            "bbox_overlap_check": {"max_iou": 0.0, "overlapping_pairs": [], "box_count": 0, "anomalies": []},
+            "risk": 0.0,
+            "reasons": [],
+            "hard_tamper": False,
+            "max_iou": 0.0,
+        }
+        engine = self._build_engine()
+        pixel_detector = _DummyPixelDetector(score=0.1)
+        engine.pixel_detector = pixel_detector
+
+        result = json.loads(engine.predict("/tmp/mock.jpg", [100, 200, 700, 500], bbox_format="xyxy"))
+
+        self.assertEqual(result["bbox"], [100, 200, 600, 300])
+        self.assertIsNotNone(pixel_detector.last_shape)
+        self.assertLess(pixel_detector.last_shape[0], 330)
+        self.assertLess(pixel_detector.last_shape[1], 650)
+        mock_bbox_overlap.assert_called()
+        self.assertEqual(mock_bbox_overlap.call_args.kwargs["roi_bbox_xyxy"], [100, 200, 700, 500])
 
     def test_file_size_metadata_is_hard_tamper_evidence(self):
         engine = self._build_engine()

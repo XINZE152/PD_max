@@ -421,7 +421,7 @@ TABLE_STATEMENTS = [
         id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间（UTC）',
         image_created_at DATETIME NULL COMMENT '图片创建时间（前端传入）',
-        batch VARCHAR(16) NULL COMMENT '批次号（后端自动生成，YYYYMMDD+序号）',
+        batch VARCHAR(64) NULL COMMENT '批次号（后端自动生成或由批量客户端传入）',
         mode VARCHAR(24) NOT NULL COMMENT 'sync_v1 | async_v3 | rule_checks | rule_pixel_overlap | rule_timestamp',
         task_id VARCHAR(64) NULL COMMENT '异步任务 UUID，同步为空',
         original_filename VARCHAR(512) NULL COMMENT '上传原始文件名',
@@ -433,6 +433,7 @@ TABLE_STATEMENTS = [
         feedback_marked_at DATETIME NULL COMMENT '人工标注提交时间',
         INDEX idx_ai_hist_created (created_at),
         INDEX idx_ai_hist_task (task_id),
+        INDEX idx_ai_hist_batch (batch),
         INDEX idx_ai_hist_feedback (feedback_status)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='AI图片鉴伪历史记录';
     """,
@@ -1524,6 +1525,58 @@ def ensure_ai_detection_history_stored_image_column() -> None:
         connection.close()
 
 
+def ensure_ai_detection_history_batch_columns() -> None:
+    """已有库升级：补齐图片鉴伪的图片时间与批次列。"""
+    config_dict = get_mysql_config()
+    connection = pymysql.connect(**config_dict)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT COUNT(*) FROM information_schema.columns "
+                "WHERE table_schema = DATABASE() AND table_name = 'ai_detection_history' "
+                "AND column_name = 'image_created_at'"
+            )
+            if cursor.fetchone()[0] == 0:
+                cursor.execute(
+                    "ALTER TABLE ai_detection_history ADD COLUMN image_created_at DATETIME NULL "
+                    "COMMENT '图片创建时间（前端传入）' AFTER created_at"
+                )
+                logger.info("已为 ai_detection_history 添加 image_created_at 列")
+
+            cursor.execute(
+                "SELECT CHARACTER_MAXIMUM_LENGTH FROM information_schema.columns "
+                "WHERE table_schema = DATABASE() AND table_name = 'ai_detection_history' "
+                "AND column_name = 'batch'"
+            )
+            batch_row = cursor.fetchone()
+            if batch_row is None:
+                cursor.execute(
+                    "ALTER TABLE ai_detection_history ADD COLUMN batch VARCHAR(64) NULL "
+                    "COMMENT '批次号（后端自动生成或由批量客户端传入）' AFTER image_created_at"
+                )
+                logger.info("已为 ai_detection_history 添加 batch 列")
+            elif int(batch_row[0] or 0) < 64:
+                cursor.execute(
+                    "ALTER TABLE ai_detection_history MODIFY COLUMN batch VARCHAR(64) NULL "
+                    "COMMENT '批次号（后端自动生成或由批量客户端传入）'"
+                )
+                logger.info("已扩展 ai_detection_history.batch 到 VARCHAR(64)")
+
+            cursor.execute(
+                "SELECT COUNT(*) FROM information_schema.statistics "
+                "WHERE table_schema = DATABASE() AND table_name = 'ai_detection_history' "
+                "AND index_name = 'idx_ai_hist_batch'"
+            )
+            if cursor.fetchone()[0] == 0:
+                cursor.execute(
+                    "ALTER TABLE ai_detection_history ADD INDEX idx_ai_hist_batch (batch)"
+                )
+                logger.info("已为 ai_detection_history.batch 添加索引")
+        connection.commit()
+    finally:
+        connection.close()
+
+
 def ensure_ai_detection_history_feedback_status_column() -> None:
     """已有库升级：为 ai_detection_history 增加 feedback_status（新建库已由 CREATE TABLE 包含）。"""
     config_dict = get_mysql_config()
@@ -1733,6 +1786,10 @@ def create_tables() -> None:
         ensure_ai_detection_history_stored_image_column()
     except Exception:
         logger.exception("检查/添加 ai_detection_history.stored_image 失败")
+    try:
+        ensure_ai_detection_history_batch_columns()
+    except Exception:
+        logger.exception("检查/添加 ai_detection_history.image_created_at/batch 失败")
     try:
         ensure_ai_detection_history_feedback_status_column()
     except Exception:
