@@ -3397,8 +3397,9 @@ class TLService:
 
         **报价日期**：
         - 若传入 `quote_date_str`（YYYY-MM-DD）：只使用该日的 `quote_details`。
-        - 否则：只使用比价基准日（默认 `Asia/Shanghai` 当天，见 `QUOTE_COMPARISON_TZ`）的报价；
-          当天无报价的 (冶炼厂, 品种) 组合直接跳过，不参与比价。
+        - 否则：以比价基准日（默认 `Asia/Shanghai` 当天，见 `QUOTE_COMPARISON_TZ`）为参照，
+          对每个 (冶炼厂, 品种名) 在 `quote_details` 中取 **与基准日日历距离最近** 的一条；
+          距离相同时按 **`created_at` 最新**（视为最近上传/写入）优先，再以 `id` 较大者优先。
 
         **冶炼厂与明细范围**：
         - `冶炼厂id列表` 仅过滤停用厂后 **保持请求中的顺序与去重结果**；
@@ -3629,15 +3630,30 @@ class TLService:
                         ref_day = _comparison_quote_calendar_date()
                         cur.execute(
                             f"""
-                            SELECT factory_id, TRIM(category_name) AS category_name,
-                                   unit_price, price_1pct_vat, price_3pct_vat, price_13pct_vat,
-                                   price_normal_invoice, price_reverse_invoice
-                            FROM quote_details
-                            WHERE factory_id IN ({sm_ph})
-                              AND TRIM(category_name) IN ({cn_ph})
-                              AND quote_date = %s
+                            SELECT qd.factory_id, TRIM(qd.category_name) AS category_name,
+                                   qd.unit_price, qd.price_1pct_vat, qd.price_3pct_vat,
+                                   qd.price_13pct_vat,
+                                   qd.price_normal_invoice, qd.price_reverse_invoice
+                            FROM quote_details qd
+                            INNER JOIN (
+                                SELECT id FROM (
+                                    SELECT id,
+                                           ROW_NUMBER() OVER (
+                                               PARTITION BY factory_id, TRIM(category_name)
+                                               ORDER BY ABS(DATEDIFF(quote_date, %s)) ASC,
+                                                        created_at DESC,
+                                                        id DESC
+                                           ) AS rn
+                                    FROM quote_details
+                                    WHERE factory_id IN ({sm_ph})
+                                      AND TRIM(category_name) IN ({cn_ph})
+                                ) ranked
+                                WHERE ranked.rn = 1
+                            ) pick ON pick.id = qd.id
                             """,
-                            tuple(smelter_ids) + tuple(all_cat_names) + (ref_day,),
+                            (ref_day,)
+                            + tuple(smelter_ids)
+                            + tuple(all_cat_names),
                         )
                     # raw_price_map: {(factory_id, category_name): {col: value}}
                     col_names = ["unit_price", "price_1pct_vat", "price_3pct_vat",
