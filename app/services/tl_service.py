@@ -666,7 +666,9 @@ class TLService:
                 res = _raise_tl_geo_crud_result(sa_wh_create(payload))
                 data = res.get("data") or {}
                 wid = int(data.get("id", 0))
-                return {"code": 200, "msg": "仓库新建成功", "仓库id": wid, "新建": True}
+                sa_msg = str(res.get("msg", ""))
+                is_new = sa_msg != "仓库已存在"
+                return {"code": 200, "msg": sa_msg, "仓库id": wid, "新建": is_new}
             except ValueError:
                 raise
             except RuntimeError as e:

@@ -195,17 +195,24 @@ def get_async_v3_history_by_task_id(task_id: str) -> Optional[Dict[str, Any]]:
     has_batch = _table_has_column("ai_detection_history", "batch")
     image_created_field = "image_created_at" if has_img_created else "NULL AS image_created_at"
     batch_field = "batch" if has_batch else "NULL AS batch"
+<<<<<<< HEAD
     upload_fields = [
         column if _table_has_column("ai_detection_history", column) else f"NULL AS {column}"
         for column in ("content_sha256", "size_bytes", "media_type")
     ]
+=======
+>>>>>>> 89404cdd7a5495c421d5bddbe645a2a25e14a6c0
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 f"""
                 SELECT id, task_id, status, outcome_json, stored_image, original_filename,
+<<<<<<< HEAD
                        created_at, bbox, {image_created_field}, {batch_field},
                        {', '.join(upload_fields)}
+=======
+                       created_at, bbox, {image_created_field}, {batch_field}
+>>>>>>> 89404cdd7a5495c421d5bddbe645a2a25e14a6c0
                 FROM ai_detection_history
                 WHERE task_id=%s AND mode='async_v3'
                 ORDER BY id DESC
@@ -228,9 +235,12 @@ def get_async_v3_history_by_task_id(task_id: str) -> Optional[Dict[str, Any]]:
         bbox_raw,
         image_created_at,
         batch,
+<<<<<<< HEAD
         content_sha256,
         size_bytes,
         media_type,
+=======
+>>>>>>> 89404cdd7a5495c421d5bddbe645a2a25e14a6c0
     ) = row
     try:
         outcome = json.loads(outcome_json) if isinstance(outcome_json, str) else _jsonish(outcome_json)
@@ -263,9 +273,12 @@ def get_async_v3_history_by_task_id(task_id: str) -> Optional[Dict[str, Any]]:
         "created_at": created_text,
         "image_created_at": image_created_text,
         "batch": batch,
+<<<<<<< HEAD
         "content_sha256": content_sha256,
         "size_bytes": int(size_bytes) if size_bytes is not None else None,
         "media_type": media_type,
+=======
+>>>>>>> 89404cdd7a5495c421d5bddbe645a2a25e14a6c0
         "bbox": bbox_val,
     }
 
