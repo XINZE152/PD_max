@@ -1,0 +1,15 @@
+{
+  "status": "completed",
+  "timestamp": "20260628_100511",
+  "total_samples": 696,
+  "positive_samples": 444,
+  "negative_samples": 252,
+  "font_library_size": 0,
+  "feedback_samples": 71,
+  "feedback_training_samples": 62,
+  "feedback_skipped_samples": 9,
+  "model_path": "/home/ubuntu/var/www/PD_max/app/ai_detection/models/trained/global_layout_model_20260628_100511.pkl",
+  "font_lib_path": "/home/ubuntu/var/www/PD_max/app/ai_detection/models/trained/font_lib",
+  "visualizations": [],
+  "train_accuracy": 0.9310344827586207
+}

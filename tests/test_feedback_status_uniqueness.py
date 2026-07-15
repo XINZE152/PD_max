@@ -31,6 +31,21 @@ def test_table_definition():
     print("  PASS")
 
 
+def test_image_detection_history_batch_schema():
+    print("Test 2b: image detection history batch schema and migration")
+    from app.database import TABLE_STATEMENTS, create_tables, ensure_ai_detection_history_batch_columns
+
+    source = inspect.getsource(ensure_ai_detection_history_batch_columns)
+    assert "image_created_at" in source
+    assert "batch" in source
+    assert "idx_ai_hist_batch" in source
+    assert "ALTER TABLE ai_detection_history" in source
+    create_source = inspect.getsource(create_tables)
+    assert "ensure_ai_detection_history_batch_columns" in create_source
+    assert any("batch VARCHAR(64)" in stmt and "idx_ai_hist_batch" in stmt for stmt in TABLE_STATEMENTS)
+    print("  PASS")
+
+
 def test_helper_functions_exist():
     print("Test 3: history_db exports get/mark/clear")
     from app.ai_detection import history_db as hdb

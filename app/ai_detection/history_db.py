@@ -44,6 +44,7 @@ HISTORY_RETENTION_DAYS = int(os.getenv("AI_DETECTION_HISTORY_DAYS", "7"))
 HISTORY_IMAGES_DIR = Path(UPLOAD_DIR) / "ai_detection_history_images"
 HISTORY_STORAGE_DIR = Path(UPLOAD_DIR) / "ai_detection_storage"
 HISTORY_ORIGINAL_FILENAME_MAX = 512
+HISTORY_IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp")
 
 
 def normalize_history_original_filename(
@@ -62,6 +63,14 @@ def normalize_history_original_filename(
 
 def _ensure_history_images_dir() -> None:
     HISTORY_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _find_task_storage_image(task_id: str) -> Optional[Path]:
+    for extension in HISTORY_IMAGE_EXTENSIONS:
+        candidate = HISTORY_STORAGE_DIR / f"{task_id}{extension}"
+        if candidate.is_file():
+            return candidate
+    return None
 
 
 def get_ai_detection_history_image_path(record_id: int) -> Optional[Path]:
@@ -109,9 +118,7 @@ def get_ai_detection_history_outcome(record_id: int) -> Optional[Dict[str, Any]]
             if p.is_file():
                 image_path = p
     if image_path is None and task_id:
-        p = HISTORY_STORAGE_DIR / f"{task_id}.jpg"
-        if p.is_file():
-            image_path = p
+        image_path = _find_task_storage_image(str(task_id))
     return {"id": rid, "mode": mode, "outcome": outcome, "image_path": image_path}
 
 
@@ -184,12 +191,21 @@ def get_async_v3_history_by_task_id(task_id: str) -> Optional[Dict[str, Any]]:
     tid = str(task_id or "").strip()
     if not tid:
         return None
+    has_img_created = _table_has_column("ai_detection_history", "image_created_at")
+    has_batch = _table_has_column("ai_detection_history", "batch")
+    image_created_field = "image_created_at" if has_img_created else "NULL AS image_created_at"
+    batch_field = "batch" if has_batch else "NULL AS batch"
+    upload_fields = [
+        column if _table_has_column("ai_detection_history", column) else f"NULL AS {column}"
+        for column in ("content_sha256", "size_bytes", "media_type")
+    ]
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """
+                f"""
                 SELECT id, task_id, status, outcome_json, stored_image, original_filename,
-                       created_at, bbox
+                       created_at, bbox, {image_created_field}, {batch_field},
+                       {', '.join(upload_fields)}
                 FROM ai_detection_history
                 WHERE task_id=%s AND mode='async_v3'
                 ORDER BY id DESC
@@ -210,6 +226,11 @@ def get_async_v3_history_by_task_id(task_id: str) -> Optional[Dict[str, Any]]:
         original_filename,
         created_at,
         bbox_raw,
+        image_created_at,
+        batch,
+        content_sha256,
+        size_bytes,
+        media_type,
     ) = row
     try:
         outcome = json.loads(outcome_json) if isinstance(outcome_json, str) else _jsonish(outcome_json)
@@ -227,6 +248,11 @@ def get_async_v3_history_by_task_id(task_id: str) -> Optional[Dict[str, Any]]:
         if hasattr(created_at, "isoformat")
         else str(created_at or "")
     )
+    image_created_text = (
+        image_created_at.isoformat(sep=" ", timespec="seconds")
+        if hasattr(image_created_at, "isoformat")
+        else (str(image_created_at) if image_created_at else None)
+    )
     return {
         "id": int(rid),
         "task_id": _task_id,
@@ -235,6 +261,11 @@ def get_async_v3_history_by_task_id(task_id: str) -> Optional[Dict[str, Any]]:
         "stored_image": stored_image,
         "original_filename": original_filename,
         "created_at": created_text,
+        "image_created_at": image_created_text,
+        "batch": batch,
+        "content_sha256": content_sha256,
+        "size_bytes": int(size_bytes) if size_bytes is not None else None,
+        "media_type": media_type,
         "bbox": bbox_val,
     }
 
@@ -348,6 +379,9 @@ def insert_ai_detection_history(
     source_image_path: Optional[str] = None,
     image_created_at: Optional[str] = None,
     batch: Optional[str] = None,
+    content_sha256: Optional[str] = None,
+    size_bytes: Optional[int] = None,
+    media_type: Optional[str] = None,
 ) -> None:
     """写入一条检测历史（失败时仅打日志，不抛出给上层）。可选复制源图到归档目录。
 
@@ -371,6 +405,14 @@ def insert_ai_detection_history(
                 if has_batch:
                     columns.append("batch")
                     values.append(batch)
+                for column, value in (
+                    ("content_sha256", content_sha256),
+                    ("size_bytes", size_bytes),
+                    ("media_type", media_type),
+                ):
+                    if _table_has_column("ai_detection_history", column):
+                        columns.append(column)
+                        values.append(value)
                 placeholders = ", ".join(["%s"] * len(values))
                 cur.execute(
                     f"INSERT INTO ai_detection_history ({', '.join(columns)}) VALUES ({placeholders})",
@@ -382,7 +424,16 @@ def insert_ai_detection_history(
                     and source_image_path
                     and os.path.isfile(source_image_path)
                 ):
-                    stored_name = f"{int(rid)}.jpg"
+                    media_extensions = {
+                        "image/jpeg": ".jpg",
+                        "image/png": ".png",
+                        "image/webp": ".webp",
+                    }
+                    source_suffix = Path(source_image_path).suffix.lower()
+                    stored_ext = media_extensions.get(str(media_type or "").lower())
+                    if stored_ext is None and source_suffix in {".jpg", ".jpeg", ".png", ".webp"}:
+                        stored_ext = ".jpg" if source_suffix == ".jpeg" else source_suffix
+                    stored_name = f"{int(rid)}{stored_ext or '.jpg'}"
                     dest = HISTORY_IMAGES_DIR / stored_name
                     try:
                         shutil.copy2(source_image_path, dest)
@@ -556,6 +607,10 @@ def list_ai_detection_history(
                 "id", "created_at",
                 "image_created_at" if has_img_created else "NULL AS image_created_at",
                 "batch" if has_batch else "NULL AS batch",
+                *(
+                    column if _table_has_column("ai_detection_history", column) else f"NULL AS {column}"
+                    for column in ("content_sha256", "size_bytes", "media_type")
+                ),
                 "mode", "task_id", "original_filename", "bbox", "status",
                 "outcome_json", "stored_image", "feedback_status", "feedback_marked_at",
             ]
@@ -674,6 +729,10 @@ def query_ai_detection_history_for_export(
         "id", "created_at",
         "image_created_at" if has_img_created else "NULL AS image_created_at",
         "batch" if has_batch else "NULL AS batch",
+        *(
+            column if _table_has_column("ai_detection_history", column) else f"NULL AS {column}"
+            for column in ("content_sha256", "size_bytes", "media_type")
+        ),
         "mode", "task_id", "original_filename", "bbox", "status",
         "outcome_json", "stored_image", "feedback_status",
     ]

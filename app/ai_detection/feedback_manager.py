@@ -17,6 +17,15 @@ import cv2
 import numpy as np
 import yaml
 
+from app.ai_detection.reviewed_dataset import (
+    ReviewedDatasetManager,
+    normalize_display_filename,
+)
+
+
+class FeedbackEntryReviewedError(RuntimeError):
+    """Raised when a reviewed feedback source is deleted before review revocation."""
+
 
 class FeedbackManager:
     """管理用户对检测结果的标注反馈。"""
@@ -33,6 +42,7 @@ class FeedbackManager:
         self.correct_dir = self.base_dir / "correct"
         self.wrong_dir = self.base_dir / "wrong"
         self.suspicious_dir = self.base_dir / "suspicious"
+        self.reviewed = ReviewedDatasetManager(self.base_dir)
 
         for d in [self.correct_dir, self.wrong_dir, self.suspicious_dir]:
             d.mkdir(parents=True, exist_ok=True)
@@ -51,6 +61,11 @@ class FeedbackManager:
         bbox: Optional[List[int]] = None,
         result: Optional[Dict[str, Any]] = None,
         note: str = "",
+        original_filename: Optional[str] = None,
+        content_sha256: Optional[str] = None,
+        size_bytes: Optional[int] = None,
+        media_type: Optional[str] = None,
+        initial_reviewer: Optional[str] = None,
     ) -> Dict[str, Any]:
         """保存用户判断。wrong 时额外保存裁剪区域图。"""
         entry_id = str(uuid.uuid4())[:8]
@@ -98,9 +113,17 @@ class FeedbackManager:
             "entry_id": entry_id,
             "original_image": str(dst_img),
             "cropped_roi": cropped_path,
+            "original_filename": normalize_display_filename(
+                original_filename,
+                fallback=src_img.name or f"task-{task_id}{src_img.suffix}",
+            ),
+            "content_sha256": content_sha256,
+            "size_bytes": size_bytes,
+            "media_type": media_type,
+            "initial_reviewer": initial_reviewer,
+            "review_status": "pending",
         }
-        with open(target_dir / "metadata.json", "w", encoding="utf-8") as f:
-            json.dump(metadata, f, ensure_ascii=False, indent=2)
+        self._write_metadata(target_dir / "metadata.json", metadata)
 
         return metadata
 
@@ -139,7 +162,28 @@ class FeedbackManager:
         roi = folder / "roi.jpg"
         metadata["roi_url"] = f"/ai-detection/api/v3/feedback/{folder.name}/roi" if roi.is_file() else None
         metadata["can_confirm"] = judgment == "suspicious"
+        metadata["original_filename"] = normalize_display_filename(
+            metadata.get("original_filename"),
+            fallback=Path(str(metadata.get("original_image") or "image")).name,
+        )
+        metadata["review_status"] = (
+            "reviewed" if metadata.get("reviewed_sample_id") else "pending"
+        )
+        metadata["can_review"] = True
+        metadata["can_revoke_review"] = metadata["review_status"] == "reviewed"
         return metadata
+
+    @staticmethod
+    def _write_metadata(path: Path, metadata: Dict[str, Any]) -> None:
+        temp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            with temp_path.open("w", encoding="utf-8") as stream:
+                json.dump(metadata, stream, ensure_ascii=False, indent=2)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temp_path, path)
+        finally:
+            temp_path.unlink(missing_ok=True)
 
     def get_entry(self, entry_folder: str) -> Optional[Dict[str, Any]]:
         """按文件夹名返回单条反馈元数据。"""
@@ -171,7 +215,13 @@ class FeedbackManager:
                 return candidate
         return None
 
-    def update_entry(self, entry_folder: str, judgment: str, note: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    def update_entry(
+        self,
+        entry_folder: str,
+        judgment: str,
+        note: Optional[str] = None,
+        original_filename: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
         """修改反馈判断类型，可在 correct / wrong / suspicious 之间移动。"""
         dst_root = self._dir_for_judgment(judgment)
         src = self._find_entry_folder(entry_folder)
@@ -193,8 +243,12 @@ class FeedbackManager:
         metadata["updated_at"] = datetime.now().strftime("%Y%m%d_%H%M%S")
         if note is not None:
             metadata["user_note"] = note
-        with open(meta_file, "w", encoding="utf-8") as f:
-            json.dump(metadata, f, ensure_ascii=False, indent=2)
+        if original_filename is not None:
+            metadata["original_filename"] = normalize_display_filename(
+                original_filename,
+                fallback=Path(str(metadata.get("original_image") or "image")).name,
+            )
+        self._write_metadata(meta_file, metadata)
         return self._read_entry(dst)
 
     def delete_entry(self, entry_folder: str) -> bool:
@@ -202,7 +256,211 @@ class FeedbackManager:
         folder = self._find_entry_folder(entry_folder)
         if folder is None:
             return False
+        metadata = self._read_entry(folder) or {}
+        if metadata.get("reviewed_sample_id"):
+            raise FeedbackEntryReviewedError("该反馈已完成二审，请先撤销二审再删除")
         shutil.rmtree(str(folder))
+        return True
+
+    def _sync_review_links(self, record: Dict[str, Any]) -> None:
+        """Keep all feedback sources linked to a deduplicated reviewed sample in sync."""
+        for source in list(record.get("sources") or []):
+            source_id = str(source.get("source_id") or "").strip()
+            folder = self._find_entry_folder(source_id)
+            if folder is None:
+                continue
+            metadata_path = folder / "metadata.json"
+            metadata = self._read_metadata_file(metadata_path)
+            if metadata is None:
+                continue
+            metadata.update(
+                {
+                    "review_status": "reviewed",
+                    "reviewed_sample_id": record.get("sample_id"),
+                    "true_label": record.get("label"),
+                    "true_label_name": record.get("label_name"),
+                    "second_reviewed_at": source.get("reviewed_at"),
+                    "second_reviewer": source.get("reviewer"),
+                    "second_review_note": source.get("note", ""),
+                }
+            )
+            self._write_metadata(metadata_path, metadata)
+
+    @staticmethod
+    def _read_metadata_file(path: Path) -> Optional[Dict[str, Any]]:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    def review_entry(
+        self,
+        entry_folder: str,
+        *,
+        label: int,
+        reviewer: str,
+        note: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        """Apply an explicit truth label and link the feedback to reviewed training data."""
+        folder = self._find_entry_folder(entry_folder)
+        if folder is None:
+            return None
+        metadata_path = folder / "metadata.json"
+        metadata = self._read_metadata_file(metadata_path)
+        image_path = self.get_entry_file(folder.name, "image")
+        if metadata is None or image_path is None:
+            return None
+
+        existing_sample_id = str(metadata.get("reviewed_sample_id") or "").strip()
+        if existing_sample_id:
+            existing = self.reviewed.get_entry(existing_sample_id)
+            if existing and int(existing.get("label", -1)) != int(label):
+                self.reviewed.reclassify(
+                    existing_sample_id,
+                    int(label),
+                    reviewer=reviewer,
+                    note=note,
+                )
+
+        record = self.reviewed.add_review(
+            image_path=image_path,
+            label=int(label),
+            original_filename=metadata.get("original_filename"),
+            source={
+                "source_id": folder.name,
+                "task_id": metadata.get("task_id"),
+                "initial_judgment": metadata.get("judgment") or folder.parent.name,
+                "initial_reviewer": metadata.get("initial_reviewer"),
+                "initial_timestamp": metadata.get("timestamp"),
+                "engine_result": metadata.get("engine_result"),
+            },
+            reviewer=reviewer,
+            note=note,
+        )
+        self._sync_review_links(record)
+        return self._read_entry(folder)
+
+    def revoke_review(
+        self,
+        entry_folder: str,
+        *,
+        reviewer: str,
+        note: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        """Remove one feedback source from the reviewed dataset."""
+        folder = self._find_entry_folder(entry_folder)
+        if folder is None:
+            return None
+        metadata_path = folder / "metadata.json"
+        metadata = self._read_metadata_file(metadata_path)
+        if metadata is None:
+            return None
+        sample_id = str(metadata.get("reviewed_sample_id") or "").strip()
+        if not sample_id:
+            return self._read_entry(folder)
+        self.reviewed.revoke_source(
+            sample_id,
+            folder.name,
+            reviewer=reviewer,
+            note=note,
+        )
+        for key in (
+            "reviewed_sample_id",
+            "true_label",
+            "true_label_name",
+            "second_reviewed_at",
+            "second_reviewer",
+            "second_review_note",
+        ):
+            metadata.pop(key, None)
+        metadata.update(
+            {
+                "review_status": "pending",
+                "review_revoked_at": datetime.now().strftime("%Y%m%d_%H%M%S"),
+                "review_revoked_by": str(reviewer or "unknown"),
+                "review_revoke_note": str(note or ""),
+            }
+        )
+        self._write_metadata(metadata_path, metadata)
+        return self._read_entry(folder)
+
+    @staticmethod
+    def _clear_review_fields(
+        metadata: Dict[str, Any],
+        *,
+        reviewer: str,
+        note: str,
+        event: str,
+    ) -> None:
+        for key in (
+            "reviewed_sample_id",
+            "true_label",
+            "true_label_name",
+            "second_reviewed_at",
+            "second_reviewer",
+            "second_review_note",
+        ):
+            metadata.pop(key, None)
+        metadata.update(
+            {
+                "review_status": "pending",
+                f"review_{event}_at": datetime.now().strftime("%Y%m%d_%H%M%S"),
+                f"review_{event}_by": str(reviewer or "unknown"),
+                f"review_{event}_note": str(note or ""),
+            }
+        )
+
+    def update_reviewed_sample(
+        self,
+        sample_id: str,
+        *,
+        original_filename: Optional[str] = None,
+        label: Optional[int] = None,
+        reviewer: str,
+        note: str = "",
+    ) -> Dict[str, Any]:
+        record = self.reviewed.update_entry(
+            sample_id,
+            original_filename=original_filename,
+            label=label,
+            reviewer=reviewer,
+            note=note,
+        )
+        self._sync_review_links(record)
+        return record
+
+    def delete_reviewed_sample(
+        self,
+        sample_id: str,
+        *,
+        reviewer: str,
+        note: str = "",
+    ) -> bool:
+        record = self.reviewed.get_entry(sample_id)
+        if record is None:
+            return False
+        source_ids = [
+            str(item.get("source_id") or "").strip()
+            for item in list(record.get("sources") or [])
+        ]
+        if not self.reviewed.delete_entry(sample_id):
+            return False
+        for source_id in source_ids:
+            folder = self._find_entry_folder(source_id)
+            if folder is None:
+                continue
+            metadata_path = folder / "metadata.json"
+            metadata = self._read_metadata_file(metadata_path)
+            if metadata is None:
+                continue
+            self._clear_review_fields(
+                metadata,
+                reviewer=reviewer,
+                note=note,
+                event="deleted",
+            )
+            self._write_metadata(metadata_path, metadata)
         return True
 
     def confirm_suspicious(self, entry_folder: str, final_judgment: str) -> Optional[Dict[str, Any]]:
@@ -220,12 +478,15 @@ class FeedbackManager:
                 with open(meta_file, "r", encoding="utf-8") as f:
                     metadata = json.load(f)
                 metadata["confirmed_at"] = entry["confirmed_at"]
-                with open(meta_file, "w", encoding="utf-8") as f:
-                    json.dump(metadata, f, ensure_ascii=False, indent=2)
+                self._write_metadata(meta_file, metadata)
                 return self._read_entry(folder)
         return entry
 
-    def list_entries(self, judgment_filter: Optional[str] = None) -> List[Dict[str, Any]]:
+    def list_entries(
+        self,
+        judgment_filter: Optional[str] = None,
+        review_filter: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         """列出反馈条目。"""
         entries = []
         search_dirs = []
@@ -242,7 +503,11 @@ class FeedbackManager:
                 continue
             for folder in sorted(d.iterdir(), reverse=True):
                 entry = self._read_entry(folder)
-                if entry:
+                if entry and (
+                    not review_filter
+                    or review_filter == "all"
+                    or entry.get("review_status") == review_filter
+                ):
                     entries.append(entry)
 
         return entries

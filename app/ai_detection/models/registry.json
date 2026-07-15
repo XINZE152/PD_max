@@ -1,0 +1,21 @@
+{
+  "schema_version": 2,
+  "active_version": "legacy-12d628d8ddde",
+  "versions": [
+    {
+      "version": "legacy-12d628d8ddde",
+      "timestamp": "legacy-12d628d8ddde",
+      "status": "ACTIVE",
+      "model_path": "/home/ubuntu/var/www/PD_max/app/ai_detection/models/global_layout_model.pkl",
+      "model_sha256": "12d628d8dddee0c00835968563a35ca9a9b3984ad7b179a1594c302113c2fd2e",
+      "gates": {
+        "passed": true,
+        "legacy_baseline": true
+      },
+      "created_at": "2026-07-14T11:53:04+00:00",
+      "activated_at": "2026-07-14T11:53:04+00:00",
+      "activated_by": "system-bootstrap"
+    }
+  ],
+  "updated_at": "2026-07-14T11:53:04+00:00"
+}

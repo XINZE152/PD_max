@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import io
 import json
 import logging
@@ -24,12 +25,14 @@ import yaml
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.ai_detection.amount_candidates import (
     build_amount_candidates,
     detect_certificate_document_override,
 )
+from app.ai_detection.resource_limits import configure_loaded_cv2, trim_native_memory
 from app.config import AI_RULE_CHECK_PERSIST, AI_RULE_CHECK_STORE_IMAGE, UPLOAD_DIR
 from app.ai_detection.easyocr_download_patch import patch_easyocr_download
 from app.ai_detection.history_export import (
@@ -73,18 +76,85 @@ from app.ai_detection.rule_check_service import (
     run_timestamp_check,
 )
 from app.ai_detection.runtime_assets import get_easyocr_reader_kwargs
+from app.ai_detection.upload_storage import (
+    ImageTooLargeError,
+    UnsupportedImageTypeError,
+    save_original_image,
+)
+from app.ai_detection.review_audit import insert_review_audit
+from app.services.user_service import decode_access_token
 
 if TYPE_CHECKING:
     from app.ai_detection.inference_api import InferenceEngineAPI
+
+configure_loaded_cv2()
 
 logger = logging.getLogger(__name__)
 
 STORAGE_DIR = Path(UPLOAD_DIR) / "ai_detection_storage"
 STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 
+_optional_bearer = HTTPBearer(auto_error=False)
+
+
+def _optional_ai_user(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(_optional_bearer),
+) -> Optional[Dict[str, Any]]:
+    if credentials is None:
+        return None
+    return decode_access_token(credentials.credentials)
+
+
+def _require_ai_admin(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(_optional_bearer),
+) -> Dict[str, Any]:
+    if credentials is None:
+        raise HTTPException(
+            status_code=401,
+            detail={"code": "AUTH_REQUIRED", "message": "请先登录管理员账号"},
+        )
+    user = decode_access_token(credentials.credentials)
+    if not user:
+        raise HTTPException(
+            status_code=401,
+            detail={"code": "TOKEN_INVALID", "message": "登录状态已失效"},
+        )
+    if user.get("role") != "admin":
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "ADMIN_REQUIRED", "message": "该操作仅允许管理员执行"},
+        )
+    return user
+
+
+def _actor_name(user: Optional[Dict[str, Any]]) -> str:
+    if not user:
+        return "anonymous"
+    return str(user.get("username") or user.get("sub") or user.get("uid") or "unknown")
+
+
+def _float_env(name: str, default: float) -> float:
+    raw = os.getenv(name, str(default))
+    try:
+        return float(raw or default)
+    except (TypeError, ValueError):
+        logger.warning("Invalid %s=%r; using default %.3f", name, raw, default)
+        return default
+
+
+def _bool_env(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 MAX_CONCURRENT_AI_TASKS = int(os.getenv("AI_MAX_CONCURRENT_TASKS", "1"))
 GC_MAX_AGE_HOURS = int(os.getenv("AI_GC_MAX_AGE_HOURS", "24"))
 GC_INTERVAL_SECONDS = int(os.getenv("AI_GC_INTERVAL_SECONDS", "3600"))
+NATIVE_TRIM_EVERY = max(1, int(os.getenv("AI_NATIVE_TRIM_EVERY", "10") or "10"))
+V3_RESOLVE_SUSPICIOUS_RESULTS = _bool_env("AI_V3_RESOLVE_SUSPICIOUS", False)
+V3_TAMPER_DECISION_THRESHOLD = _float_env("AI_V3_TAMPER_DECISION_THRESHOLD", 0.59)
 FORGEGUARD_REPLACE_RULE_CHECKS = os.getenv("FORGEGUARD_REPLACE_RULE_CHECKS", "").strip().lower() in ("1", "true", "yes")
 
 TASK_INTERRUPTED_MSG = (
@@ -121,10 +191,15 @@ class TaskRecordDTO(BaseModel):
     status: TaskStatusEnum = Field(description="任务状态")
     created_at: str = Field(description="创建时间（ISO8601）")
     image_path: Optional[str] = Field(None, description="服务端保存的原图路径（仅调试/内部用）")
+    image_created_at: Optional[str] = Field(None, description="图片创建时间（来自前端文件元数据或业务传入）")
+    batch: Optional[str] = Field(None, description="批次号")
     original_filename: Optional[str] = Field(
         None,
-        description="用户上传时的原始文件名（用于历史展示；磁盘文件仍为 task_id.jpg）",
+        description="用户上传时的原始文件名（仅用于展示，磁盘文件使用 task_id）",
     )
+    content_sha256: Optional[str] = Field(None, description="上传原图的 SHA-256")
+    size_bytes: Optional[int] = Field(None, ge=0, description="上传原图字节数")
+    media_type: Optional[str] = Field(None, description="服务端校验后的图片媒体类型")
     bbox: Optional[BBoxDTO] = Field(None, description="用户指定的检测框；未传则后台自动 OCR 找金额、姓名、时间关键区域")
     result: Optional[Dict[str, Any]] = Field(
         None,
@@ -185,6 +260,12 @@ class AbstractTaskRegistry(ABC):
         task_id: str,
         image_path: str,
         original_filename: Optional[str] = None,
+        *,
+        image_created_at: Optional[str] = None,
+        batch: Optional[str] = None,
+        content_sha256: Optional[str] = None,
+        size_bytes: Optional[int] = None,
+        media_type: Optional[str] = None,
     ) -> None:
         pass
 
@@ -210,17 +291,29 @@ class MemoryTaskRegistry(AbstractTaskRegistry):
         task_id: str,
         image_path: str,
         original_filename: Optional[str] = None,
+        *,
+        image_created_at: Optional[str] = None,
+        batch: Optional[str] = None,
+        content_sha256: Optional[str] = None,
+        size_bytes: Optional[int] = None,
+        media_type: Optional[str] = None,
     ) -> None:
         self._store[task_id] = TaskRecordDTO(
             task_id=task_id,
             status=TaskStatusEnum.UPLOADED,
             created_at=datetime.now().isoformat(),
             image_path=image_path,
+            image_created_at=image_created_at,
+            batch=batch,
             original_filename=normalize_history_original_filename(
                 original_filename,
                 fallback_path=image_path,
             ),
+            content_sha256=content_sha256,
+            size_bytes=size_bytes,
+            media_type=media_type,
         )
+        _write_task_sidecar(self._store[task_id])
 
     async def update_task(self, task_id: str, **kwargs) -> None:
         if task_id in self._store:
@@ -228,6 +321,7 @@ class MemoryTaskRegistry(AbstractTaskRegistry):
             for key, value in kwargs.items():
                 if hasattr(task, key):
                     setattr(task, key, value)
+            _write_task_sidecar(task)
 
     async def get_task(self, task_id: str) -> Optional[TaskRecordDTO]:
         return self._store.get(task_id)
@@ -243,6 +337,10 @@ class MemoryTaskRegistry(AbstractTaskRegistry):
         vis_path = STORAGE_DIR / f"vis_{task_id}.jpg"
         if vis_path.exists():
             vis_path.unlink()
+
+        sidecar_path = _task_sidecar_path(task_id)
+        if sidecar_path.exists():
+            sidecar_path.unlink()
 
         del self._store[task_id]
         return True
@@ -277,6 +375,16 @@ async def cleanup_daemon(registry: AbstractTaskRegistry):
                 logger.info("GC removed %s expired AI detection task(s)", len(tasks_to_delete))
 
             try:
+                removed_storage = await run_in_threadpool(
+                    _cleanup_expired_storage_files,
+                    set(registry._store.keys()),
+                )
+                if removed_storage:
+                    logger.info("GC removed %s expired AI detection storage file(s)", removed_storage)
+            except Exception:
+                logger.exception("AI detection storage GC failed")
+
+            try:
                 purged = await run_in_threadpool(purge_ai_detection_history_older_than)
                 if purged:
                     logger.info(
@@ -298,6 +406,7 @@ class EngineContainer:
     registry: Optional[AbstractTaskRegistry] = None
     ocr_reader: Optional[Any] = None
     ai_semaphore: Optional[asyncio.Semaphore] = None
+    work_lock: Optional[asyncio.Lock] = None
     cleanup_task: Optional[asyncio.Task] = None
     _runtime_lock: Optional[asyncio.Lock] = None
 
@@ -350,9 +459,16 @@ async def startup_ai_detection() -> None:
     EngineContainer._runtime_lock = asyncio.Lock()
     EngineContainer.registry = MemoryTaskRegistry()
     EngineContainer.ai_semaphore = asyncio.Semaphore(MAX_CONCURRENT_AI_TASKS)
+    EngineContainer.work_lock = asyncio.Lock()
     EngineContainer.cleanup_task = asyncio.create_task(
         cleanup_daemon(EngineContainer.registry)
     )
+    try:
+        interrupted = await run_in_threadpool(_training_job_store().interrupt_stale)
+        if interrupted:
+            logger.warning("Marked %s stale AI training job(s) as INTERRUPTED", interrupted)
+    except Exception:
+        logger.exception("Failed to restore AI training job state")
     logger.info(
         "AI detection registry ready (EasyOCR/engine load deferred until first AI request)"
     )
@@ -452,6 +568,7 @@ async def shutdown_ai_detection() -> None:
     EngineContainer.registry = None
     EngineContainer.ocr_reader = None
     EngineContainer.ai_semaphore = None
+    EngineContainer.work_lock = None
     EngineContainer.cleanup_task = None
     EngineContainer._runtime_lock = None
 
@@ -463,8 +580,194 @@ async def get_engine() -> InferenceEngineAPI:
     return EngineContainer.instance
 
 
-def _storage_image_path(task_id: str) -> Path:
-    return STORAGE_DIR / f"{task_id}.jpg"
+_STORAGE_IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp")
+
+
+def _storage_image_path(task_id: str, extension: str = ".jpg") -> Path:
+    ext = extension.lower()
+    if ext not in _STORAGE_IMAGE_EXTENSIONS:
+        raise ValueError("Unsupported storage image extension")
+    return STORAGE_DIR / f"{task_id}{ext}"
+
+
+def _find_storage_image_path(task_id: str) -> Optional[Path]:
+    for extension in _STORAGE_IMAGE_EXTENSIONS:
+        candidate = _storage_image_path(task_id, extension)
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _task_sidecar_path(task_id: str) -> Path:
+    return STORAGE_DIR / f"{task_id}.json"
+
+
+def _default_batch_id() -> str:
+    return datetime.now().strftime("%Y%m%d%H%M%S")
+
+
+def _normalized_batch(batch: Optional[str]) -> str:
+    raw = str(batch or "").strip()
+    return raw or _default_batch_id()
+
+
+def _write_json_atomic(path: Path, payload: Dict[str, Any]) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def _read_task_sidecar(task_id: str) -> Optional[Dict[str, Any]]:
+    path = _task_sidecar_path(task_id)
+    if not path.is_file():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        logger.exception("Read AI detection task sidecar failed task=%s", task_id)
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _write_task_sidecar(task: TaskRecordDTO) -> None:
+    if not task.image_path:
+        return
+    payload = {
+        "task_id": task.task_id,
+        "status": task.status.value if isinstance(task.status, TaskStatusEnum) else str(task.status),
+        "created_at": task.created_at,
+        "image_path": task.image_path,
+        "original_filename": task.original_filename,
+        "content_sha256": task.content_sha256,
+        "size_bytes": task.size_bytes,
+        "media_type": task.media_type,
+        "image_created_at": task.image_created_at,
+        "batch": task.batch,
+        "uploaded_at": datetime.now().isoformat(),
+    }
+    try:
+        _write_json_atomic(_task_sidecar_path(task.task_id), payload)
+    except OSError:
+        logger.exception("Write AI detection task sidecar failed task=%s", task.task_id)
+
+
+def _task_record_from_sidecar(task_id: str) -> Optional[TaskRecordDTO]:
+    meta = _read_task_sidecar(task_id)
+    if not meta:
+        return None
+    persisted_path = str(meta.get("image_path") or "").strip()
+    fallback_path = _find_storage_image_path(task_id)
+    image_path = persisted_path or (str(fallback_path) if fallback_path else "")
+    if not Path(image_path).is_file():
+        return None
+    status_raw = str(meta.get("status") or TaskStatusEnum.UPLOADED.value).upper()
+    status = TaskStatusEnum.UPLOADED
+    if status_raw in TaskStatusEnum.__members__:
+        status = TaskStatusEnum[status_raw]
+    elif status_raw in {item.value for item in TaskStatusEnum}:
+        status = TaskStatusEnum(status_raw)
+    return TaskRecordDTO(
+        task_id=task_id,
+        status=status,
+        created_at=str(meta.get("created_at") or datetime.now().isoformat()),
+        image_path=image_path,
+        original_filename=normalize_history_original_filename(
+            str(meta.get("original_filename") or ""),
+            fallback_path=image_path,
+        ),
+        content_sha256=str(meta.get("content_sha256") or "") or None,
+        size_bytes=int(meta["size_bytes"]) if meta.get("size_bytes") is not None else None,
+        media_type=str(meta.get("media_type") or "") or None,
+        image_created_at=str(meta.get("image_created_at") or "") or None,
+        batch=str(meta.get("batch") or "") or None,
+    )
+
+
+def _storage_task_id_for_file(path: Path) -> Optional[str]:
+    name = path.name
+    if name.startswith("vis_") and name.lower().endswith(".jpg"):
+        return name[4:-4] or None
+    if path.suffix.lower() in {*_STORAGE_IMAGE_EXTENSIONS, ".json"}:
+        return path.stem or None
+    if name.endswith(".upload.part"):
+        return name[1:-12] or None
+    if name.endswith(".json.tmp"):
+        return name[:-9] or None
+    return None
+
+
+def _cleanup_expired_storage_files(active_task_ids: set[str]) -> int:
+    """Remove stale upload sidecars/images that are no longer tracked in memory."""
+    if not STORAGE_DIR.is_dir():
+        return 0
+    cutoff = time.time() - max(1, GC_MAX_AGE_HOURS) * 3600
+    removed = 0
+    for path in STORAGE_DIR.iterdir():
+        if not path.is_file():
+            continue
+        task_id = _storage_task_id_for_file(path)
+        if not task_id or task_id in active_task_ids:
+            continue
+        try:
+            if path.stat().st_mtime > cutoff:
+                continue
+            path.unlink()
+            removed += 1
+        except OSError as exc:
+            logger.warning("删除过期鉴伪暂存文件失败 %s: %s", path, exc)
+    return removed
+
+
+async def _persist_upload_task(
+    *,
+    file: UploadFile,
+    registry: AbstractTaskRegistry,
+    image_created_at: Optional[str],
+    batch: Optional[str],
+) -> TaskRecordDTO:
+    task_id = str(uuid.uuid4())
+    batch_id = _normalized_batch(batch)
+    try:
+        artifact = await run_in_threadpool(
+            partial(
+                save_original_image,
+                file.file,
+                storage_dir=STORAGE_DIR,
+                task_id=task_id,
+                original_filename=file.filename,
+            )
+        )
+    except ImageTooLargeError as exc:
+        raise HTTPException(
+            status_code=413,
+            detail={"code": exc.code, "message": "单张图片不能超过 20 MiB"},
+        ) from exc
+    except UnsupportedImageTypeError as exc:
+        raise HTTPException(
+            status_code=415,
+            detail={"code": exc.code, "message": "仅支持有效的 JPEG、PNG、WebP 图片"},
+        ) from exc
+
+    try:
+        await registry.create_task(
+            task_id,
+            str(artifact.path),
+            original_filename=artifact.original_filename,
+            image_created_at=image_created_at,
+            batch=batch_id,
+            content_sha256=artifact.content_sha256,
+            size_bytes=artifact.size_bytes,
+            media_type=artifact.media_type,
+        )
+    except Exception:
+        artifact.path.unlink(missing_ok=True)
+        raise
+    task = await registry.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=500, detail="任务创建失败")
+    return task
 
 
 def _bbox_dto_from_history(bbox_val: Any) -> Optional[BBoxDTO]:
@@ -492,16 +795,36 @@ def build_task_record_from_persistence(task_id: str) -> Optional[TaskRecordDTO]:
     if not tid:
         return None
 
-    storage_path = _storage_image_path(tid)
+    storage_path = _find_storage_image_path(tid)
+    sidecar_task = _task_record_from_sidecar(tid)
     history = get_async_v3_history_by_task_id(tid)
-    image_path = str(storage_path) if storage_path.is_file() else None
-    created_at = datetime.now().isoformat()
-    original_filename: Optional[str] = None
+    image_path = sidecar_task.image_path if sidecar_task else (str(storage_path) if storage_path else None)
+    created_at = sidecar_task.created_at if sidecar_task else datetime.now().isoformat()
+    original_filename: Optional[str] = sidecar_task.original_filename if sidecar_task else None
+    content_sha256: Optional[str] = sidecar_task.content_sha256 if sidecar_task else None
+    size_bytes: Optional[int] = sidecar_task.size_bytes if sidecar_task else None
+    media_type: Optional[str] = sidecar_task.media_type if sidecar_task else None
+    image_created_at: Optional[str] = sidecar_task.image_created_at if sidecar_task else None
+    batch: Optional[str] = sidecar_task.batch if sidecar_task else None
     bbox_dto: Optional[BBoxDTO] = None
 
     if history:
+        history_image_path: Optional[Path] = None
+        try:
+            rid = int(history.get("id") or 0)
+            if rid:
+                history_image_path = get_ai_detection_history_image_path(rid)
+        except (TypeError, ValueError):
+            history_image_path = None
+        if image_path is None and history_image_path is not None:
+            image_path = str(history_image_path)
         created_at = str(history.get("created_at") or created_at)
-        original_filename = history.get("original_filename")
+        original_filename = history.get("original_filename") or original_filename
+        content_sha256 = history.get("content_sha256") or content_sha256
+        size_bytes = history.get("size_bytes") if history.get("size_bytes") is not None else size_bytes
+        media_type = history.get("media_type") or media_type
+        image_created_at = history.get("image_created_at") or image_created_at
+        batch = history.get("batch") or batch
         bbox_dto = _bbox_dto_from_history(history.get("bbox"))
         outcome = history.get("outcome") or {}
         if history.get("status") == "COMPLETED":
@@ -516,6 +839,11 @@ def build_task_record_from_persistence(task_id: str) -> Optional[TaskRecordDTO]:
                 created_at=created_at,
                 image_path=image_path,
                 original_filename=original_filename,
+                content_sha256=content_sha256,
+                size_bytes=size_bytes,
+                media_type=media_type,
+                image_created_at=image_created_at,
+                batch=batch,
                 bbox=bbox_dto,
                 result=outcome.get("result"),
                 multi_results=outcome.get("multi_results"),
@@ -528,9 +856,20 @@ def build_task_record_from_persistence(task_id: str) -> Optional[TaskRecordDTO]:
                 created_at=created_at,
                 image_path=image_path,
                 original_filename=original_filename,
+                content_sha256=content_sha256,
+                size_bytes=size_bytes,
+                media_type=media_type,
+                image_created_at=image_created_at,
+                batch=batch,
                 bbox=bbox_dto,
                 error_msg=outcome.get("error_msg") or TASK_INTERRUPTED_MSG,
             )
+
+    if sidecar_task:
+        if sidecar_task.status in {TaskStatusEnum.PENDING, TaskStatusEnum.PROCESSING}:
+            sidecar_task.status = TaskStatusEnum.FAILED
+            sidecar_task.error_msg = TASK_INTERRUPTED_MSG
+        return sidecar_task
 
     if image_path:
         logger.warning(
@@ -543,6 +882,11 @@ def build_task_record_from_persistence(task_id: str) -> Optional[TaskRecordDTO]:
             created_at=created_at,
             image_path=image_path,
             original_filename=original_filename,
+            content_sha256=content_sha256,
+            size_bytes=size_bytes,
+            media_type=media_type,
+            image_created_at=image_created_at,
+            batch=batch,
             error_msg=TASK_INTERRUPTED_MSG,
         )
     return None
@@ -576,6 +920,11 @@ async def ensure_task_in_registry_for_retry(
             task_id,
             task.image_path,
             original_filename=task.original_filename,
+            image_created_at=task.image_created_at,
+            batch=task.batch,
+            content_sha256=task.content_sha256,
+            size_bytes=task.size_bytes,
+            media_type=task.media_type,
         )
         restored = await registry.get_task(task_id)
         if restored:
@@ -989,25 +1338,35 @@ class RuleCheckService:
         *,
         original_filename: Optional[str] = None,
         bbox_list: Optional[List[int]] = None,
+        bboxes_list: Optional[List[List[int]]] = None,
         business_datetime: Optional[str] = None,
         task_id: Optional[str] = None,
+        image_created_at: Optional[str] = None,
+        batch: Optional[str] = None,
+        precomputed_image_bgr: Optional[Any] = None,
+        precomputed_ocr_tokens: Optional[Sequence[Any]] = None,
+        precomputed_image_shape: Optional[Tuple[int, int, int]] = None,
     ) -> Dict[str, Any]:
         """对已落盘图片执行规则检测（供 v3 任务链式调用）。"""
         async with semaphore:
-            img_cv2, ocr_tokens = await run_in_threadpool(run_full_image_ocr, image_path, ocr_reader)
-            image_shape = None
-            if img_cv2 is not None:
-                image_shape = (
-                    int(img_cv2.shape[0]),
-                    int(img_cv2.shape[1]),
-                    int(img_cv2.shape[2]) if len(img_cv2.shape) > 2 else 3,
-                )
+            img_cv2 = precomputed_image_bgr
+            ocr_tokens = list(precomputed_ocr_tokens or [])
+            image_shape = precomputed_image_shape
+            if img_cv2 is None or not ocr_tokens or image_shape is None:
+                img_cv2, ocr_tokens = await run_in_threadpool(run_full_image_ocr, image_path, ocr_reader)
+                if img_cv2 is not None:
+                    image_shape = (
+                        int(img_cv2.shape[0]),
+                        int(img_cv2.shape[1]),
+                        int(img_cv2.shape[2]) if len(img_cv2.shape) > 2 else 3,
+                    )
             data = await run_in_threadpool(
                 partial(
                     run_rule_checks,
                     image_path,
                     engine.pixel_detector,
                     bbox_xyxy=bbox_list,
+                    bboxes=bboxes_list,
                     business_datetime=business_datetime,
                     ocr_tokens=ocr_tokens or None,
                     image_shape=image_shape,
@@ -1020,14 +1379,18 @@ class RuleCheckService:
             mode=MODE_RULE_CHECKS,
             original_filename=original_filename,
             bbox=bbox_list,
+            bboxes=bboxes_list,
             status="COMPLETED",
             outcome=build_rule_checks_outcome(
                 data,
                 bbox=bbox_list,
+                bboxes=bboxes_list,
                 document_time=business_datetime,
             ),
             tmp_path=image_path,
             task_id=task_id,
+            image_created_at=image_created_at,
+            batch=batch,
         )
         return data
 
@@ -1183,6 +1546,8 @@ class RuleCheckService:
 
 
 class DetectionDomainServiceV3:
+    _cache_cleanup_count = 0
+
     def __init__(
         self,
         registry: AbstractTaskRegistry,
@@ -1196,6 +1561,18 @@ class DetectionDomainServiceV3:
         self._cached_key_rois: Optional[List[Dict[str, Any]]] = None
         self._ocr_reader: Optional[Any] = None
         self._cached_global_feat: Optional[np.ndarray] = None
+
+    def _clear_task_cache(self) -> None:
+        self._cached_img_cv2 = None
+        self._cached_tokens = None
+        self._cached_candidates = None
+        self._cached_key_rois = None
+        self._cached_global_feat = None
+        self._ocr_reader = None
+        DetectionDomainServiceV3._cache_cleanup_count += 1
+        if DetectionDomainServiceV3._cache_cleanup_count % NATIVE_TRIM_EVERY == 0:
+            gc.collect()
+            trim_native_memory()
 
     @staticmethod
     def _bbox_iou(a: BBoxDTO, b: BBoxDTO) -> float:
@@ -1246,9 +1623,60 @@ class DetectionDomainServiceV3:
             numbered.append(copied)
         return numbered
 
+    @staticmethod
+    def _resolve_v3_suspicious_result(item: Dict[str, Any]) -> Dict[str, Any]:
+        """Optionally collapse V3 suspicious results for dataset calibration runs."""
+        if item.get("result") != "可疑" or not V3_RESOLVE_SUSPICIOUS_RESULTS:
+            return item
+
+        resolved = dict(item)
+        try:
+            confidence = float(resolved.get("confidence", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            confidence = 0.0
+
+        threshold = float(V3_TAMPER_DECISION_THRESHOLD)
+        if confidence >= threshold:
+            resolved["result"] = "篡改"
+            note = f"综合风险{confidence:.1%}达到自动篡改阈值{threshold:.1%}"
+        else:
+            resolved["result"] = "正常"
+            note = f"综合风险{confidence:.1%}未达到自动篡改阈值{threshold:.1%}"
+
+        reason = str(resolved.get("reason") or "").strip()
+        if note not in reason:
+            resolved["reason"] = "；".join(part for part in (reason, note) if part)
+        resolved["v3_suspicious_resolved"] = True
+        resolved["v3_decision_threshold"] = threshold
+        return resolved
+
     async def _is_canceled(self, task_id: str) -> bool:
         task = await self.registry.get_task(task_id)
-        return bool(not task or task.status == TaskStatusEnum.CANCELED)
+        if not task:
+            return True
+        if task.status != TaskStatusEnum.CANCELED:
+            return False
+        try:
+            await self.registry.delete_task(task_id)
+        except Exception:
+            logger.exception("Task %s canceled cleanup failed", task_id)
+        return True
+
+    async def _drop_ephemeral_task_after_history(self, task_id: str, expected_status: str) -> None:
+        """Delete upload temp files only after the DB history image archive is confirmed."""
+        try:
+            history = await run_in_threadpool(get_async_v3_history_by_task_id, task_id)
+            if not history or str(history.get("status") or "").upper() != expected_status.upper():
+                return
+            rid = int(history.get("id") or 0)
+            if not rid:
+                return
+            archived_image = await run_in_threadpool(get_ai_detection_history_image_path, rid)
+            if archived_image is None:
+                return
+            await self.registry.delete_task(task_id)
+        except Exception:
+            logger.exception("Task %s temporary storage cleanup failed", task_id)
 
     def _run_ocr_once(self, image_path: str, ocr_reader: Any) -> None:
         """读取图片并执行一次 OCR tokenize + amount 候选构建 + 全局特征提取，结果缓存供后续复用。"""
@@ -1326,6 +1754,70 @@ class DetectionDomainServiceV3:
             "amount_score": override.get("amount_score"),
         }
 
+    def _visual_document_override(self) -> Optional[Dict[str, Any]]:
+        """Fallback for transfer certificates when OCR cannot locate key fields."""
+        img = self._cached_img_cv2
+        if img is None or img.size == 0:
+            return None
+        image_h, image_w = img.shape[:2]
+        if image_h * image_w < 500_000:
+            return None
+
+        scale = min(1.0, 1000.0 / float(max(image_h, image_w)))
+        small = (
+            cv2.resize(
+                img,
+                (max(1, int(image_w * scale)), max(1, int(image_h * scale))),
+                interpolation=cv2.INTER_AREA,
+            )
+            if scale < 1.0
+            else img
+        )
+        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+        binary = cv2.adaptiveThreshold(
+            gray,
+            255,
+            cv2.ADAPTIVE_THRESH_MEAN_C,
+            cv2.THRESH_BINARY_INV,
+            35,
+            12,
+        )
+
+        sh, sw = gray.shape[:2]
+        h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(24, sw // 8), 1))
+        v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(18, sh // 18)))
+        h_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, h_kernel)
+        v_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, v_kernel)
+        table_ratio = float((np.count_nonzero(h_lines) + np.count_nonzero(v_lines)) / max(1, sh * sw))
+
+        hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+        red1 = cv2.inRange(hsv, (0, 45, 40), (12, 255, 255))
+        red2 = cv2.inRange(hsv, (165, 45, 40), (180, 255, 255))
+        red_ratio = float(np.count_nonzero(red1 | red2) / max(1, sh * sw))
+
+        if table_ratio < 0.010 or red_ratio < 0.0015:
+            return None
+
+        x1 = int(image_w * 0.07)
+        y1 = int(image_h * 0.16)
+        x2 = int(image_w * 0.92)
+        y2 = int(image_h * 0.56)
+        return {
+            "result": "篡改",
+            "confidence": 0.86,
+            "reason": "电子凭证存在红章表格结构，OCR无法稳定定位关键字段，按高风险篡改处理",
+            "bbox": self._xyxy_to_xywh([x1, y1, x2, y2]),
+            "original_bbox": [x1, y1, x2, y2],
+            "region_no": 1,
+            "field_type": "document",
+            "field_label": "电子凭证",
+            "source": "large_document_visual_override",
+            "visual_flags": {
+                "table_ratio": round(table_ratio, 4),
+                "red_ratio": round(red_ratio, 4),
+            },
+        }
+
     async def _run_linked_rule_checks(
         self,
         task_id: str,
@@ -1333,6 +1825,8 @@ class DetectionDomainServiceV3:
         *,
         original_filename: Optional[str],
         bbox: Optional[BBoxDTO] = None,
+        image_created_at: Optional[str] = None,
+        batch: Optional[str] = None,
     ) -> Dict[str, Any]:
         await ensure_ai_detection_runtime()
         engine = EngineContainer.instance
@@ -1349,6 +1843,15 @@ class DetectionDomainServiceV3:
             original_filename=original_filename,
             bbox_list=bbox_list,
             task_id=task_id,
+            image_created_at=image_created_at,
+            batch=batch,
+            precomputed_image_bgr=self._cached_img_cv2,
+            precomputed_ocr_tokens=self._cached_tokens,
+            precomputed_image_shape=(
+                tuple(int(v) for v in self._cached_img_cv2.shape)
+                if self._cached_img_cv2 is not None
+                else None
+            ),
         )
         return build_rule_check_public_summary(data)
 
@@ -1374,6 +1877,8 @@ class DetectionDomainServiceV3:
                     image_path,
                     original_filename=original_filename,
                     bbox=bbox,
+                    image_created_at=image_created_at,
+                    batch=batch,
                 )
             except Exception:
                 logger.exception("Task %s linked rule checks failed", task_id)
@@ -1395,7 +1900,9 @@ class DetectionDomainServiceV3:
             source_image_path=image_path,
             linked_rule_checks=linked_rule_checks,
             image_created_at=image_created_at,
+            batch=batch,
         )
+        await self._drop_ephemeral_task_after_history(task_id, "COMPLETED")
 
     async def execute_async(
         self,
@@ -1405,8 +1912,38 @@ class DetectionDomainServiceV3:
         image_created_at: Optional[str] = None,
         batch: Optional[str] = None,
     ) -> None:
+        work_lock = EngineContainer.work_lock
+        if work_lock is not None:
+            async with work_lock:
+                await self._execute_async_locked(
+                    task_id,
+                    image_path,
+                    bbox=bbox,
+                    image_created_at=image_created_at,
+                    batch=batch,
+                )
+            return
+        await self._execute_async_locked(
+            task_id,
+            image_path,
+            bbox=bbox,
+            image_created_at=image_created_at,
+            batch=batch,
+        )
+
+    async def _execute_async_locked(
+        self,
+        task_id: str,
+        image_path: str,
+        bbox: Optional[BBoxDTO] = None,
+        image_created_at: Optional[str] = None,
+        batch: Optional[str] = None,
+    ) -> None:
         task = await self.registry.get_task(task_id)
-        if not task or task.status == TaskStatusEnum.CANCELED:
+        if not task:
+            return
+        if task.status == TaskStatusEnum.CANCELED:
+            await self.registry.delete_task(task_id)
             return
 
         await self.registry.update_task(task_id, status=TaskStatusEnum.PROCESSING)
@@ -1416,6 +1953,7 @@ class DetectionDomainServiceV3:
         )
 
         try:
+            started_at = time.perf_counter()
             await ensure_ai_detection_runtime()
             engine = EngineContainer.instance
             ocr_reader = EngineContainer.ocr_reader
@@ -1425,7 +1963,13 @@ class DetectionDomainServiceV3:
                 return
 
             async with self.semaphore:
+                ocr_started_at = time.perf_counter()
                 await run_in_threadpool(self._run_ocr_once, image_path, ocr_reader)
+                logger.info(
+                    "AI v3 task %s OCR/key ROI stage completed in %.0fms",
+                    task_id,
+                    (time.perf_counter() - ocr_started_at) * 1000.0,
+                )
             predict_extra = self._predict_kwargs()
 
             if bbox:
@@ -1441,6 +1985,7 @@ class DetectionDomainServiceV3:
                 if res_dict.get("result") == "错误":
                     raise ValueError(res_dict.get("reason"))
 
+                res_dict = self._resolve_v3_suspicious_result(res_dict)
                 res_dict["original_bbox"] = bbox_list
                 res_dict["region_no"] = 1
                 res_dict["field_type"] = "manual"
@@ -1452,6 +1997,7 @@ class DetectionDomainServiceV3:
                     bbox=bbox,
                     result=res_dict,
                     image_created_at=image_created_at,
+                    batch=batch,
                 )
                 return
 
@@ -1462,33 +2008,36 @@ class DetectionDomainServiceV3:
             bboxes = self._deduplicate_bboxes(bboxes)
 
             if not bboxes:
-                async with self.semaphore:
-                    document_override = await run_in_threadpool(self._document_rule_override, image_path)
-                if await self._is_canceled(task_id):
-                    return
-
-                if document_override:
+                visual_override = await run_in_threadpool(self._visual_document_override)
+                if visual_override:
                     await self._finalize_completed_task(
                         task_id,
                         image_path,
                         original_filename=history_filename,
                         bbox=None,
-                        result=document_override,
-                        multi_results=[document_override],
-                        persist_bbox={"auto_ocr": True, "note": "document_rule_override"},
+                        result=visual_override,
+                        multi_results=[visual_override],
+                        persist_bbox={"auto_ocr": True, "note": "large_document_visual_override"},
                         image_created_at=image_created_at,
+                        batch=batch,
                     )
                     return
 
-                empty_res = {"result": "正常", "confidence": 0.0, "reason": "未发现关键数值或单号区域"}
+                empty_res = {
+                    "result": "无法自动检测",
+                    "confidence": 0.0,
+                    "reason": "未识别到金额、姓名、时间关键区域，无法自动检测",
+                }
                 await self._finalize_completed_task(
                     task_id,
                     image_path,
                     original_filename=history_filename,
                     bbox=None,
                     result=empty_res,
-                    persist_bbox={"auto_ocr": True, "note": "no_numeric_regions"},
+                    multi_results=[],
+                    persist_bbox={"auto_ocr": True, "note": "no_key_field_regions"},
                     image_created_at=image_created_at,
+                    batch=batch,
                 )
                 return
 
@@ -1507,6 +2056,7 @@ class DetectionDomainServiceV3:
 
                     res_dict = json.loads(res_str)
                     if res_dict.get("result") != "错误":
+                        res_dict = self._resolve_v3_suspicious_result(res_dict)
                         res_dict["original_bbox"] = b_list
                         res_dict.update(self._roi_metadata_for_bbox(b_list))
                         all_results.append(res_dict)
@@ -1536,6 +2086,11 @@ class DetectionDomainServiceV3:
                 image_created_at=image_created_at,
                 batch=batch,
             )
+            logger.info(
+                "AI v3 task %s completed in %.0fms",
+                task_id,
+                (time.perf_counter() - started_at) * 1000.0,
+            )
 
         except Exception as exc:
             logger.exception("Task %s failed", task_id)
@@ -1550,6 +2105,9 @@ class DetectionDomainServiceV3:
                 image_created_at=image_created_at,
                 batch=batch,
             )
+            await self._drop_ephemeral_task_after_history(task_id, "FAILED")
+        finally:
+            self._clear_task_cache()
 
     async def generate_visualization(self, task_id: str) -> str:
         task = await self.registry.get_task(task_id)
@@ -1599,6 +2157,10 @@ class DetectionDomainServiceV3:
         batch: Optional[str] = None,
     ) -> None:
         try:
+            task = await self.registry.get_task(task_id)
+            content_sha256 = task.content_sha256 if task else None
+            size_bytes = task.size_bytes if task else None
+            media_type = task.media_type if task else None
             outcome: Dict[str, Any] = {}
             if result is not None:
                 outcome["result"] = result
@@ -1608,6 +2170,13 @@ class DetectionDomainServiceV3:
                 outcome["error_msg"] = error_msg
             if linked_rule_checks is not None:
                 outcome["linked_rule_checks"] = linked_rule_checks
+            if task:
+                outcome["upload_meta"] = {
+                    "original_filename": task.original_filename or original_filename,
+                    "content_sha256": content_sha256,
+                    "size_bytes": size_bytes,
+                    "media_type": media_type,
+                }
             await run_in_threadpool(
                 partial(
                     insert_ai_detection_history,
@@ -1620,6 +2189,9 @@ class DetectionDomainServiceV3:
                     source_image_path=source_image_path,
                     image_created_at=image_created_at,
                     batch=batch,
+                    content_sha256=content_sha256,
+                    size_bytes=size_bytes,
+                    media_type=media_type,
                 ),
             )
         except Exception:
@@ -1765,6 +2337,78 @@ async def rule_checks_endpoint(
             batch=batch,
         )
         return {"status": "success", "data": data}
+    except ValueError as exc:
+        return JSONResponse(status_code=422, content={"status": "error", "message": str(exc)})
+
+
+@router.post(
+    "/api/v1/rule-checks/from-task",
+    summary="基于已上传任务执行规则检测",
+    description=(
+        "对 `/api/v3/upload` 已暂存的图片执行规则检测。用于规则-only 批量的两阶段流程："
+        "先全部上传成功，再按 task_id 逐张检测。"
+    ),
+)
+async def rule_checks_from_task_endpoint(
+    task_id: str = Form(..., description="已上传任务 ID"),
+    bbox: Optional[str] = Form(
+        None,
+        description="可选。像素重叠检测 ROI：[x1,y1,x2,y2]",
+    ),
+    bboxes: Optional[str] = Form(
+        None,
+        description="可选。多框像素重叠检测：[[x1,y1,x2,y2], ...]，优先级高于 bbox",
+    ),
+    document_time: Optional[str] = Form(
+        None,
+        description="可选。业务单据时间",
+    ),
+    image_created_at: Optional[str] = Form(
+        None,
+        description="可选。图片创建时间，格式如 2026-05-28 11:32:00",
+    ),
+    batch: Optional[str] = Form(
+        None,
+        description="可选。批次号；不传则使用暂存任务批次号",
+    ),
+    registry: AbstractTaskRegistry = Depends(get_registry),
+    engine: InferenceEngineAPI = Depends(get_engine),
+    ocr_reader: Any = Depends(get_ocr_reader),
+    semaphore: asyncio.Semaphore = Depends(get_ai_semaphore),
+):
+    task = await ensure_task_in_registry_for_retry(task_id, registry)
+    bbox_list: Optional[List[int]] = None
+    bboxes_list: Optional[List[List[int]]] = None
+    if bboxes:
+        try:
+            bboxes_list = _parse_bboxes_form(bboxes)
+        except Exception:
+            raise HTTPException(status_code=400, detail="bboxes 格式无效，请使用 [[x1,y1,x2,y2], ...]")
+    elif bbox:
+        try:
+            bbox_list = _parse_bbox_form(bbox)
+        except Exception:
+            raise HTTPException(status_code=400, detail="bbox 格式无效，请使用 [x1,y1,x2,y2] 或 x1,y1,x2,y2")
+
+    try:
+        work_lock = EngineContainer.work_lock
+        if work_lock is None:
+            raise RuntimeError("AI 工作协调锁未初始化")
+        async with work_lock:
+            data = await RuleCheckService.process_rule_checks_from_path(
+                task.image_path or "",
+                engine,
+                semaphore,
+                ocr_reader,
+                original_filename=task.original_filename,
+                bbox_list=bbox_list,
+                bboxes_list=bboxes_list,
+                business_datetime=document_time,
+                task_id=task.task_id,
+                image_created_at=image_created_at or task.image_created_at,
+                batch=batch or task.batch,
+            )
+        return {"status": "success", "data": data, "task_id": task.task_id, "batch": batch or task.batch}
     except ValueError as exc:
         return JSONResponse(status_code=422, content={"status": "error", "message": str(exc)})
 
@@ -2279,6 +2923,43 @@ async def history_export_download(req: HistoryExportRequest):
 
 
 @router.post(
+    "/api/v3/upload",
+    summary="上传图片并暂存任务（不启动检测）",
+    description=(
+        "仅保存图片并创建 `UPLOADED` 任务，返回 `task_id`。"
+        "批量检测应先调用本接口确保全部图片上传成功，再按 task_id 调用 `/api/v3/detect` 启动检测。"
+    ),
+)
+async def upload_detection_task(
+    file: UploadFile = File(..., description="待检测图片"),
+    image_created_at: Optional[str] = Form(
+        None,
+        description="可选。图片创建时间，格式如 2026-05-28 11:32:00",
+    ),
+    batch: Optional[str] = Form(
+        None,
+        description="可选。批次号；不传则后端生成",
+    ),
+    registry: AbstractTaskRegistry = Depends(get_registry),
+):
+    task = await _persist_upload_task(
+        file=file,
+        registry=registry,
+        image_created_at=image_created_at,
+        batch=batch,
+    )
+    return {
+        "status": task.status.value,
+        "task_id": task.task_id,
+        "batch": task.batch,
+        "original_filename": task.original_filename,
+        "content_sha256": task.content_sha256,
+        "size_bytes": task.size_bytes,
+        "media_type": task.media_type,
+    }
+
+
+@router.post(
     "/api/v3/detect",
     summary="提交鉴伪任务（异步）",
     description=(
@@ -2326,15 +3007,13 @@ async def submit_detection(
     semaphore: asyncio.Semaphore = Depends(get_ai_semaphore),
 ):
     if file:
-        task_id = str(uuid.uuid4())
-        file_path = STORAGE_DIR / f"{task_id}.jpg"
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-        await registry.create_task(
-            task_id,
-            str(file_path),
-            original_filename=file.filename,
+        task = await _persist_upload_task(
+            file=file,
+            registry=registry,
+            image_created_at=image_created_at,
+            batch=batch,
         )
+        task_id = task.task_id
     elif not task_id:
         raise HTTPException(status_code=400, detail="必须提供上传文件 file，或已有任务的 task_id")
 
@@ -2344,6 +3023,8 @@ async def submit_detection(
         task = await ensure_task_in_registry_for_retry(task_id, registry)
     if not task or not task.image_path:
         raise HTTPException(status_code=404, detail="任务不存在")
+    image_created_at = image_created_at or task.image_created_at
+    batch = batch or task.batch
 
     bbox_dto = None
     if bbox:
@@ -2355,10 +3036,16 @@ async def submit_detection(
         except Exception:
             raise HTTPException(status_code=400, detail="bbox 格式无效，请使用 [x1,y1,x2,y2] 或 x1,y1,x2,y2")
 
-    await registry.update_task(task_id, status=TaskStatusEnum.PENDING, with_rule_checks=with_rule_checks)
+    await registry.update_task(
+        task_id,
+        status=TaskStatusEnum.PENDING,
+        with_rule_checks=with_rule_checks,
+        image_created_at=image_created_at,
+        batch=batch,
+    )
     service = DetectionDomainServiceV3(registry, semaphore)
     background_tasks.add_task(service.execute_async, task_id, task.image_path, bbox_dto, image_created_at, batch)
-    return {"status": "pending", "task_id": task_id}
+    return {"status": "pending", "task_id": task_id, "batch": batch}
 
 
 @router.get(
@@ -2456,9 +3143,30 @@ async def get_visualization(
 async def cancel_task(task_id: str, registry: AbstractTaskRegistry = Depends(get_registry)):
     task = await registry.get_task(task_id)
     if not task:
+        persisted = await run_in_threadpool(build_task_record_from_persistence, task_id)
+        if persisted and persisted.status in {TaskStatusEnum.COMPLETED, TaskStatusEnum.FAILED}:
+            return {"status": "already_finished"}
+        if persisted and persisted.image_path:
+            await registry.create_task(
+                persisted.task_id,
+                persisted.image_path,
+                original_filename=persisted.original_filename,
+                image_created_at=persisted.image_created_at,
+                batch=persisted.batch,
+                content_sha256=persisted.content_sha256,
+                size_bytes=persisted.size_bytes,
+                media_type=persisted.media_type,
+            )
+            task = await registry.get_task(task_id)
+    if not task:
         raise HTTPException(status_code=404, detail="任务不存在")
 
-    if task.status in [TaskStatusEnum.PENDING, TaskStatusEnum.UPLOADED, TaskStatusEnum.PROCESSING]:
+    if task.status in {TaskStatusEnum.COMPLETED, TaskStatusEnum.FAILED}:
+        return {"status": "already_finished"}
+
+    if task.status in [TaskStatusEnum.UPLOADED, TaskStatusEnum.PENDING]:
+        await registry.delete_task(task_id)
+    elif task.status == TaskStatusEnum.PROCESSING:
         await registry.update_task(task_id, status=TaskStatusEnum.CANCELED)
     else:
         await registry.delete_task(task_id)
@@ -2478,10 +3186,31 @@ class JudgmentRequest(BaseModel):
 class FeedbackUpdateRequest(BaseModel):
     judgment: str = Field(..., pattern="^(correct|wrong|suspicious)$")
     note: Optional[str] = None
+    original_filename: Optional[str] = Field(None, max_length=512)
+
+
+class FeedbackReviewRequest(BaseModel):
+    label: int = Field(..., ge=0, le=1, description="真实标签：0=正常，1=篡改")
+    note: str = ""
+
+
+class ReviewedDatasetUpdateRequest(BaseModel):
+    original_filename: Optional[str] = Field(None, max_length=512)
+    label: Optional[int] = Field(None, ge=0, le=1)
+    note: str = ""
 
 
 class DatasetUpdateRequest(BaseModel):
     label: int = Field(..., ge=0, le=1, description="训练标签：0=正常，1=篡改")
+
+
+class TrainingJobCreateRequest(BaseModel):
+    confirm: bool = Field(True, description="确认开始后台候选训练")
+
+
+class ModelActivateRequest(BaseModel):
+    force: bool = False
+    reason: str = Field("", max_length=2000)
 
 
 @router.post(
@@ -2502,6 +3231,7 @@ class DatasetUpdateRequest(BaseModel):
 async def submit_judgment(
     req: JudgmentRequest,
     registry: AbstractTaskRegistry = Depends(get_registry),
+    current_user: Optional[Dict[str, Any]] = Depends(_optional_ai_user),
 ):
     from app.ai_detection.feedback_manager import FeedbackManager
 
@@ -2518,9 +3248,17 @@ async def submit_judgment(
     task = await registry.get_task(req.task_id)
     image_path: Optional[str] = None
     result: Dict[str, Any] = {}
+    original_filename: Optional[str] = None
+    content_sha256: Optional[str] = None
+    size_bytes: Optional[int] = None
+    media_type: Optional[str] = None
     if task:
         image_path = task.image_path
         result = task.result or {}
+        original_filename = task.original_filename
+        content_sha256 = task.content_sha256
+        size_bytes = task.size_bytes
+        media_type = task.media_type
     else:
         # 内存注册表中不存在时，从持久化历史记录回退（服务重启/GC 后仍可标注）
         history = await run_in_threadpool(get_latest_ai_detection_history_by_task_id, req.task_id)
@@ -2529,6 +3267,12 @@ async def submit_judgment(
         image_path = str(history["image_path"])
         outcome = history.get("outcome") or {}
         result = outcome.get("result") or {}
+        history_meta = await run_in_threadpool(get_async_v3_history_by_task_id, req.task_id)
+        if history_meta:
+            original_filename = history_meta.get("original_filename")
+            content_sha256 = history_meta.get("content_sha256")
+            size_bytes = history_meta.get("size_bytes")
+            media_type = history_meta.get("media_type")
 
     bbox = req.bbox
     if bbox is None:
@@ -2540,6 +3284,11 @@ async def submit_judgment(
         bbox=bbox,
         result=result,
         note=req.note,
+        original_filename=original_filename,
+        content_sha256=content_sha256,
+        size_bytes=size_bytes,
+        media_type=media_type,
+        initial_reviewer=_actor_name(current_user),
     )
     # 同步标注状态到数据库
     await run_in_threadpool(mark_feedback_status, req.task_id, req.judgment)
@@ -2555,11 +3304,14 @@ async def submit_judgment(
         "**查询参数**：`judgment`（可选）— 过滤 correct / wrong / suspicious\n"
     ),
 )
-async def list_feedback(judgment: Optional[str] = Query(None, pattern="^(correct|wrong|suspicious)$")):
+async def list_feedback(
+    judgment: Optional[str] = Query(None, pattern="^(correct|wrong|suspicious)$"),
+    review_status: Optional[str] = Query(None, pattern="^(pending|reviewed|all)$"),
+):
     from app.ai_detection.feedback_manager import FeedbackManager
 
     fb = FeedbackManager()
-    entries = fb.list_entries(judgment_filter=judgment)
+    entries = fb.list_entries(judgment_filter=judgment, review_filter=review_status)
     return {"total": len(entries), "items": entries}
 
 
@@ -2614,11 +3366,32 @@ async def get_feedback_roi(folder_name: str):
     summary="修改反馈判断",
     description="在 correct / wrong / suspicious 之间移动反馈条目，可用于纠错或撤回疑似状态。",
 )
-async def update_feedback(folder_name: str, req: FeedbackUpdateRequest):
+async def update_feedback(
+    folder_name: str,
+    req: FeedbackUpdateRequest,
+    current_user: Optional[Dict[str, Any]] = Depends(_optional_ai_user),
+):
     from app.ai_detection.feedback_manager import FeedbackManager
 
+    if req.original_filename is not None:
+        if not current_user:
+            raise HTTPException(
+                status_code=401,
+                detail={"code": "AUTH_REQUIRED", "message": "修改展示文件名需要管理员登录"},
+            )
+        if current_user.get("role") != "admin":
+            raise HTTPException(
+                status_code=403,
+                detail={"code": "ADMIN_REQUIRED", "message": "修改展示文件名仅允许管理员执行"},
+            )
+
     fb = FeedbackManager()
-    entry = fb.update_entry(folder_name, req.judgment, note=req.note)
+    entry = fb.update_entry(
+        folder_name,
+        req.judgment,
+        note=req.note,
+        original_filename=req.original_filename,
+    )
     if not entry:
         raise HTTPException(404, "反馈条目不存在")
     # 同步标注状态到数据库
@@ -2633,13 +3406,20 @@ async def update_feedback(folder_name: str, req: FeedbackUpdateRequest):
     summary="删除/撤销反馈标注",
 )
 async def delete_feedback(folder_name: str):
-    from app.ai_detection.feedback_manager import FeedbackManager
+    from app.ai_detection.feedback_manager import FeedbackEntryReviewedError, FeedbackManager
 
     fb = FeedbackManager()
     # 删除前先获取 task_id
     entry = fb.get_entry(folder_name)
     task_id = entry.get("task_id") if entry else None
-    if not fb.delete_entry(folder_name):
+    try:
+        removed = fb.delete_entry(folder_name)
+    except FeedbackEntryReviewedError as exc:
+        raise HTTPException(
+            409,
+            detail={"code": "REVIEW_REVOKE_REQUIRED", "message": str(exc)},
+        ) from exc
+    if not removed:
         raise HTTPException(404, "反馈条目不存在")
     # 同步清除数据库标注状态（恢复为可再次标注）
     if task_id:
@@ -2669,6 +3449,243 @@ async def confirm_suspicious(folder_name: str = Form(...), judgment: str = Form(
     if task_id:
         await run_in_threadpool(mark_feedback_status, task_id, judgment)
     return {"status": "success", "entry": entry}
+
+
+@router.put(
+    "/api/v3/feedback/{folder_name}/review",
+    summary="二次审核反馈并写入训练集",
+)
+async def review_feedback(
+    folder_name: str,
+    req: FeedbackReviewRequest,
+    admin: Dict[str, Any] = Depends(_require_ai_admin),
+):
+    from app.ai_detection.feedback_manager import FeedbackManager
+    from app.ai_detection.reviewed_dataset import ReviewedDatasetConflict
+
+    manager = FeedbackManager()
+    before = manager.get_entry(folder_name)
+    if not before:
+        raise HTTPException(
+            404,
+            detail={"code": "FEEDBACK_NOT_FOUND", "message": "反馈条目不存在"},
+        )
+    try:
+        entry = await run_in_threadpool(
+            partial(
+                manager.review_entry,
+                folder_name,
+                label=req.label,
+                reviewer=_actor_name(admin),
+                note=req.note,
+            )
+        )
+    except ReviewedDatasetConflict as exc:
+        raise HTTPException(
+            409,
+            detail={"code": exc.code, "message": str(exc)},
+        ) from exc
+    if not entry:
+        raise HTTPException(
+            422,
+            detail={"code": "FEEDBACK_IMAGE_MISSING", "message": "反馈原图不存在，无法二审"},
+        )
+    await run_in_threadpool(
+        partial(
+            insert_review_audit,
+            action="review",
+            actor=admin,
+            feedback_folder=folder_name,
+            sample_id=entry.get("reviewed_sample_id"),
+            old_label=before.get("true_label"),
+            new_label=req.label,
+            note=req.note,
+            details={"task_id": entry.get("task_id")},
+        )
+    )
+    return {"status": "success", "entry": entry}
+
+
+@router.delete(
+    "/api/v3/feedback/{folder_name}/review",
+    summary="撤销反馈二次审核",
+)
+async def revoke_feedback_review(
+    folder_name: str,
+    note: str = Query("", max_length=2000),
+    admin: Dict[str, Any] = Depends(_require_ai_admin),
+):
+    from app.ai_detection.feedback_manager import FeedbackManager
+    from app.ai_detection.reviewed_dataset import ReviewedDatasetNotFound
+
+    manager = FeedbackManager()
+    before = manager.get_entry(folder_name)
+    if not before:
+        raise HTTPException(
+            404,
+            detail={"code": "FEEDBACK_NOT_FOUND", "message": "反馈条目不存在"},
+        )
+    if before.get("review_status") != "reviewed":
+        raise HTTPException(
+            409,
+            detail={"code": "REVIEW_NOT_FOUND", "message": "该反馈尚未完成二审"},
+        )
+    try:
+        entry = await run_in_threadpool(
+            partial(
+                manager.revoke_review,
+                folder_name,
+                reviewer=_actor_name(admin),
+                note=note,
+            )
+        )
+    except ReviewedDatasetNotFound as exc:
+        raise HTTPException(404, detail={"code": exc.code, "message": str(exc)}) from exc
+    await run_in_threadpool(
+        partial(
+            insert_review_audit,
+            action="revoke",
+            actor=admin,
+            feedback_folder=folder_name,
+            sample_id=before.get("reviewed_sample_id"),
+            old_label=before.get("true_label"),
+            note=note,
+            details={"task_id": before.get("task_id")},
+        )
+    )
+    return {"status": "success", "entry": entry}
+
+
+# ---- 已二审训练集管理 ----
+
+@router.get(
+    "/api/v3/reviewed-dataset",
+    summary="分页列出已二审训练样本",
+)
+async def list_reviewed_dataset(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
+    label: Optional[int] = Query(None, ge=0, le=1),
+):
+    from app.ai_detection.feedback_manager import FeedbackManager
+
+    manager = FeedbackManager().reviewed
+    data = await run_in_threadpool(
+        partial(manager.list_entries, page=page, page_size=page_size, label=label)
+    )
+    for item in data["items"]:
+        item["image_url"] = (
+            f"/ai-detection/api/v3/reviewed-dataset/{item['sample_id']}/image"
+        )
+    return {"status": "success", **data}
+
+
+@router.get(
+    "/api/v3/reviewed-dataset/{sample_id}/image",
+    summary="获取已二审训练样本原图",
+    response_class=FileResponse,
+)
+async def get_reviewed_dataset_image(sample_id: str):
+    from app.ai_detection.feedback_manager import FeedbackManager
+
+    path = await run_in_threadpool(FeedbackManager().reviewed.image_path, sample_id)
+    if path is None:
+        raise HTTPException(404, "二审训练样本不存在")
+    media_type, _encoding = mimetypes.guess_type(path.name)
+    return FileResponse(
+        str(path),
+        media_type=media_type or "application/octet-stream",
+        filename=path.name,
+    )
+
+
+@router.patch(
+    "/api/v3/reviewed-dataset/{sample_id}",
+    summary="修改已二审样本展示名或真实标签",
+)
+async def update_reviewed_dataset(
+    sample_id: str,
+    req: ReviewedDatasetUpdateRequest,
+    admin: Dict[str, Any] = Depends(_require_ai_admin),
+):
+    from app.ai_detection.feedback_manager import FeedbackManager
+    from app.ai_detection.reviewed_dataset import (
+        ReviewedDatasetConflict,
+        ReviewedDatasetNotFound,
+    )
+
+    manager = FeedbackManager()
+    before = manager.reviewed.get_entry(sample_id)
+    if before is None:
+        raise HTTPException(404, detail={"code": "REVIEWED_SAMPLE_NOT_FOUND", "message": "二审训练样本不存在"})
+    try:
+        entry = await run_in_threadpool(
+            partial(
+                manager.update_reviewed_sample,
+                sample_id,
+                original_filename=req.original_filename,
+                label=req.label,
+                reviewer=_actor_name(admin),
+                note=req.note,
+            )
+        )
+    except ReviewedDatasetNotFound as exc:
+        raise HTTPException(404, detail={"code": exc.code, "message": str(exc)}) from exc
+    except ReviewedDatasetConflict as exc:
+        raise HTTPException(409, detail={"code": exc.code, "message": str(exc)}) from exc
+    await run_in_threadpool(
+        partial(
+            insert_review_audit,
+            action="update_reviewed",
+            actor=admin,
+            sample_id=sample_id,
+            old_label=before.get("label"),
+            new_label=entry.get("label"),
+            note=req.note,
+            details={"original_filename": entry.get("original_filename")},
+        )
+    )
+    entry["image_url"] = f"/ai-detection/api/v3/reviewed-dataset/{sample_id}/image"
+    return {"status": "success", "entry": entry}
+
+
+@router.delete(
+    "/api/v3/reviewed-dataset/{sample_id}",
+    summary="删除已二审训练样本并将来源退回待二审",
+)
+async def delete_reviewed_dataset(
+    sample_id: str,
+    note: str = Query("", max_length=2000),
+    admin: Dict[str, Any] = Depends(_require_ai_admin),
+):
+    from app.ai_detection.feedback_manager import FeedbackManager
+
+    manager = FeedbackManager()
+    before = manager.reviewed.get_entry(sample_id)
+    if before is None:
+        raise HTTPException(404, detail={"code": "REVIEWED_SAMPLE_NOT_FOUND", "message": "二审训练样本不存在"})
+    removed = await run_in_threadpool(
+        partial(
+            manager.delete_reviewed_sample,
+            sample_id,
+            reviewer=_actor_name(admin),
+            note=note,
+        )
+    )
+    if not removed:
+        raise HTTPException(404, "二审训练样本不存在")
+    await run_in_threadpool(
+        partial(
+            insert_review_audit,
+            action="delete_reviewed",
+            actor=admin,
+            sample_id=sample_id,
+            old_label=before.get("label"),
+            note=note,
+            details={"source_count": len(before.get("sources") or [])},
+        )
+    )
+    return {"status": "success"}
 
 
 # ---- 原始训练集管理 ----
@@ -2728,7 +3745,11 @@ async def get_training_dataset_annotation(filename: str):
     summary="修改训练集样本标签",
     description="通过重命名样本及其 *_enhanced 配套图、locate_json 标注来修改训练标签。",
 )
-async def update_training_dataset_entry(filename: str, req: DatasetUpdateRequest):
+async def update_training_dataset_entry(
+    filename: str,
+    req: DatasetUpdateRequest,
+    admin: Dict[str, Any] = Depends(_require_ai_admin),
+):
     from app.ai_detection.dataset_manager import DatasetManager
 
     manager = DatasetManager()
@@ -2738,6 +3759,15 @@ async def update_training_dataset_entry(filename: str, req: DatasetUpdateRequest
         raise HTTPException(409, str(exc))
     if entry is None:
         raise HTTPException(404, "训练样本不存在")
+    await run_in_threadpool(
+        partial(
+            insert_review_audit,
+            action="update_base_training_label",
+            actor=admin,
+            new_label=req.label,
+            details={"filename": filename, "result_filename": entry.get("filename")},
+        )
+    )
     return {"status": "success", "entry": entry, "summary": manager.summary()}
 
 
@@ -2749,6 +3779,7 @@ async def update_training_dataset_entry(filename: str, req: DatasetUpdateRequest
 async def delete_training_dataset_entry(
     filename: str,
     delete_family: bool = Query(True, description="是否同时删除同一基础样本的增强图和 JSON 标注"),
+    admin: Dict[str, Any] = Depends(_require_ai_admin),
 ):
     from app.ai_detection.dataset_manager import DatasetManager
 
@@ -2756,14 +3787,245 @@ async def delete_training_dataset_entry(
     removed = await run_in_threadpool(manager.delete_entry, filename, delete_family)
     if not removed:
         raise HTTPException(404, "训练样本不存在")
+    await run_in_threadpool(
+        partial(
+            insert_review_audit,
+            action="delete_base_training_sample",
+            actor=admin,
+            details={"filename": filename, "delete_family": delete_family},
+        )
+    )
     return {"status": "success", "summary": manager.summary()}
 
 
 # ---- 训练端点 (含风险提示) ----
 
+def _training_job_store():
+    from app.ai_detection.training_jobs import TrainingJobStore
+
+    cfg = _read_model_config()
+    training = cfg.get("training") if isinstance(cfg.get("training"), dict) else {}
+    path = _resolve_model_path(training.get("jobs_path", "models/training_jobs.json"))
+    return TrainingJobStore(path)
+
+
+def _model_registry_manager():
+    from app.ai_detection.model_registry import ModelRegistry
+
+    cfg = _read_model_config()
+    paths = cfg.get("paths") if isinstance(cfg.get("paths"), dict) else {}
+    training = cfg.get("training") if isinstance(cfg.get("training"), dict) else {}
+    fallback = _resolve_model_path(paths.get("xgb_model_path", "models/global_layout_model.pkl"))
+    registry_path = _resolve_model_path(training.get("registry_path", "models/registry.json"))
+    return ModelRegistry(registry_path, fallback_model_path=fallback)
+
+
+async def _evaluate_candidate_model(
+    version: str,
+    engine: "InferenceEngineAPI",
+    ocr_reader: Any,
+) -> Dict[str, Any]:
+    from app.ai_detection.candidate_evaluation import build_candidate_gates, fixed_regression_samples
+
+    registry = _model_registry_manager()
+    candidate_model, candidate = await run_in_threadpool(registry.validate_loadable, version)
+    active = registry.resolve_active()
+    active_metrics = candidate.get("active_evaluation")
+    if not isinstance(active_metrics, dict) or not active_metrics.get("available"):
+        active_metrics = active.get("evaluation") if isinstance(active.get("evaluation"), dict) else None
+    config = _read_model_config()
+    dataset_cfg = config.get("dataset") if isinstance(config.get("dataset"), dict) else {}
+    image_dir = _resolve_model_path(dataset_cfg.get("image_dir", "images"))
+    pptest_dir = _resolve_model_path(dataset_cfg.get("regression_dir", "pptest"))
+    predictions = []
+    old_model = engine.global_model
+    old_font_lib = engine.font_lib
+    candidate_font_lib = None
+    candidate_font_path = str(candidate.get("font_lib_path") or "").strip()
+    if candidate_font_path:
+        from app.ai_detection.core.extractors import FontFeatureLibrary
+
+        loaded_font_lib = FontFeatureLibrary()
+        if loaded_font_lib.load(candidate_font_path):
+            candidate_font_lib = loaded_font_lib
+    service = DetectionDomainServiceV3(MemoryTaskRegistry(), asyncio.Semaphore(1))
+    try:
+        engine.global_model = candidate_model
+        if candidate_font_lib is not None:
+            engine.font_lib = candidate_font_lib
+        for image_path, expected_label in fixed_regression_samples(image_dir, pptest_dir):
+            service._clear_task_cache()
+            await run_in_threadpool(service._run_ocr_once, str(image_path), ocr_reader)
+            bboxes = service._deduplicate_bboxes(service._easyocr_auto_detect(str(image_path)))
+            rows = []
+            if not bboxes:
+                visual_override = await run_in_threadpool(service._visual_document_override)
+                if visual_override:
+                    rows.append(visual_override)
+            for bbox in bboxes:
+                bbox_list = [bbox.x1, bbox.y1, bbox.x2, bbox.y2]
+                raw = await run_in_threadpool(
+                    partial(
+                        engine.predict,
+                        str(image_path),
+                        bbox_list,
+                        "xyxy",
+                        **service._predict_kwargs(),
+                    )
+                )
+                result = json.loads(raw)
+                if result.get("result") != "错误":
+                    rows.append(result)
+            document_override = await run_in_threadpool(
+                service._document_rule_override,
+                str(image_path),
+            )
+            if document_override and not any(item.get("result") == "篡改" for item in rows):
+                rows.append(document_override)
+            top = service._select_top_result(rows)
+            actual = str((top or {}).get("result") or "无法自动检测")
+            predictions.append((str(image_path), expected_label, actual))
+    finally:
+        engine.global_model = old_model
+        engine.font_lib = old_font_lib
+        service._clear_task_cache()
+
+    gates = build_candidate_gates(
+        regression_predictions=predictions,
+        candidate_metrics=candidate.get("evaluation"),
+        active_metrics=active_metrics,
+    )
+    report = {
+        "version": version,
+        "gates": gates,
+        "regression_predictions": [
+            {"path": path, "expected_label": label, "actual": actual}
+            for path, label, actual in predictions
+        ],
+    }
+    report_path = candidate.get("report_path")
+    if report_path:
+        path = Path(str(report_path))
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+        except (OSError, json.JSONDecodeError):
+            existing = {}
+        existing["candidate_evaluation"] = report
+        path.write_text(json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8")
+    registry.update_candidate(version, gates=gates, evaluation_report=report)
+    return gates
+
+
+async def _run_training_job(job_id: str, actor: Dict[str, Any]) -> None:
+    store = _training_job_store()
+    lock = EngineContainer.work_lock
+    try:
+        if lock is None:
+            raise RuntimeError("AI 工作协调锁未初始化")
+        await store_update_async(store, job_id, status="QUEUED", queue_reason="等待当前图片检测结束")
+        semaphore = EngineContainer.ai_semaphore
+        if semaphore is None:
+            raise RuntimeError("AI 推理信号量未初始化")
+        async with lock, semaphore:
+            await store_update_async(
+                store,
+                job_id,
+                status="RUNNING",
+                progress=0.01,
+                queue_reason=None,
+                started_at=datetime.now().isoformat(),
+            )
+            await ensure_ai_detection_runtime()
+            engine = EngineContainer.instance
+            ocr_reader = EngineContainer.ocr_reader
+            if engine is None or ocr_reader is None:
+                raise RuntimeError("AI 检测运行时不可用")
+
+            from app.ai_detection.train_pipeline_v2 import TrainPipeline
+
+            def progress(current: int, total: int, message: str) -> None:
+                ratio = 0.05 + (0.70 * current / max(1, total))
+                store.update(job_id, progress=round(ratio, 4), message=message)
+
+            summary = await run_in_threadpool(
+                lambda: TrainPipeline(ocr_reader=ocr_reader).run(progress_callback=progress)
+            )
+            if summary.get("status") != "completed":
+                raise RuntimeError(str(summary.get("reason") or "候选模型训练失败"))
+            version = str(summary["timestamp"])
+            await store_update_async(store, job_id, progress=0.80, candidate_version=version, summary=summary)
+            gates = await _evaluate_candidate_model(version, engine, ocr_reader)
+            await store_update_async(
+                store,
+                job_id,
+                status="COMPLETED",
+                progress=1.0,
+                candidate_version=version,
+                gates=gates,
+                completed_at=datetime.now().isoformat(),
+            )
+            await run_in_threadpool(
+                partial(
+                    insert_review_audit,
+                    action="train_candidate",
+                    actor=actor,
+                    details={"job_id": job_id, "version": version, "gates": gates},
+                )
+            )
+    except Exception as exc:
+        logger.exception("AI candidate training job failed job_id=%s", job_id)
+        await store_update_async(
+            store,
+            job_id,
+            status="FAILED",
+            error=str(exc),
+            completed_at=datetime.now().isoformat(),
+        )
+
+
+async def store_update_async(store: Any, job_id: str, **changes: Any) -> Dict[str, Any]:
+    return await run_in_threadpool(partial(store.update, job_id, **changes))
+
+
+@router.post("/api/v3/training-jobs", summary="创建后台候选训练任务")
+async def create_training_job(
+    req: TrainingJobCreateRequest,
+    background_tasks: BackgroundTasks,
+    admin: Dict[str, Any] = Depends(_require_ai_admin),
+):
+    if not req.confirm:
+        raise HTTPException(400, detail={"code": "TRAIN_CONFIRM_REQUIRED", "message": "请确认后再开始训练"})
+    store = _training_job_store()
+    running = [job for job in store.list() if job.get("status") in {"QUEUED", "RUNNING"}]
+    if running:
+        raise HTTPException(409, detail={"code": "TRAIN_JOB_EXISTS", "message": "已有训练任务正在排队或运行"})
+    job = await run_in_threadpool(store.create, actor=_actor_name(admin))
+    background_tasks.add_task(_run_training_job, job["job_id"], admin)
+    return {"status": "success", "job": job}
+
+
+@router.get("/api/v3/training-jobs", summary="列出候选训练任务")
+async def list_training_jobs(
+    limit: int = Query(100, ge=1, le=500),
+    _admin: Dict[str, Any] = Depends(_require_ai_admin),
+):
+    rows = await run_in_threadpool(_training_job_store().list, limit=limit)
+    return {"status": "success", "total": len(rows), "items": rows}
+
+
+@router.get("/api/v3/training-jobs/{job_id}", summary="查询候选训练任务")
+async def get_training_job(
+    job_id: str,
+    _admin: Dict[str, Any] = Depends(_require_ai_admin),
+):
+    job = await run_in_threadpool(_training_job_store().get, job_id)
+    if not job:
+        raise HTTPException(404, detail={"code": "TRAIN_JOB_NOT_FOUND", "message": "训练任务不存在"})
+    return {"status": "success", "job": job}
+
 class TrainResponse(BaseModel):
     status: str
-    warning: str = "训练将使用反馈数据+原始数据集重新训练模型。这将覆盖当前模型（旧模型自动备份）。训练期间 GPU 资源占用高，可能影响正在进行的检测任务。"
+    warning: str = "训练将使用基础训练集与已二审训练集生成候选模型，不会自动替换线上活跃模型。训练期间新检测会排队等待。"
     summary: Optional[Dict[str, Any]] = None
 
 
@@ -2778,9 +4040,9 @@ class TrainResponse(BaseModel):
     ),
 )
 async def trigger_training(
+    background_tasks: BackgroundTasks,
     confirm: bool = Form(False, description="必须设为 true 以确认风险"),
-    engine: "InferenceEngineAPI" = Depends(get_engine),
-    ocr_reader: Any = Depends(get_ocr_reader),
+    admin: Dict[str, Any] = Depends(_require_ai_admin),
 ):
     if not confirm:
         return TrainResponse(
@@ -2788,16 +4050,13 @@ async def trigger_training(
             warning="请仔细阅读风险提示，确认后将 confirm 设为 true 重新提交。",
         )
 
-    from app.ai_detection.train_pipeline_v2 import TrainPipeline
-
-    try:
-        summary = await run_in_threadpool(
-            lambda: TrainPipeline(ocr_reader=ocr_reader).run()
-        )
-        return TrainResponse(status="completed", summary=summary)
-    except Exception as e:
-        logger.exception("训练失败")
-        return TrainResponse(status="failed", warning=f"训练异常: {str(e)}")
+    store = _training_job_store()
+    running = [job for job in store.list() if job.get("status") in {"QUEUED", "RUNNING"}]
+    if running:
+        return TrainResponse(status="aborted", warning="已有训练任务正在排队或运行。")
+    job = await run_in_threadpool(store.create, actor=_actor_name(admin))
+    background_tasks.add_task(_run_training_job, job["job_id"], admin)
+    return TrainResponse(status="queued", summary={"job": job})
 
 
 @router.get(
@@ -2865,6 +4124,61 @@ async def list_models():
 
 
 @router.post(
+    "/api/v3/models/{version}/activate",
+    summary="启用候选模型或回滚至旧版本",
+)
+async def activate_model(
+    version: str,
+    req: ModelActivateRequest,
+    admin: Dict[str, Any] = Depends(_require_ai_admin),
+):
+    from app.ai_detection.model_registry import ModelActivationError
+
+    if req.force and not req.reason.strip():
+        raise HTTPException(
+            422,
+            detail={"code": "FORCE_REASON_REQUIRED", "message": "强制启用必须填写原因"},
+        )
+    await ensure_ai_detection_runtime()
+    engine = EngineContainer.instance
+    lock = EngineContainer.work_lock
+    semaphore = EngineContainer.ai_semaphore
+    if engine is None or lock is None or semaphore is None:
+        raise HTTPException(503, detail={"code": "AI_RUNTIME_UNAVAILABLE", "message": "AI 检测运行时不可用"})
+    registry = _model_registry_manager()
+    try:
+        model, validated = await run_in_threadpool(registry.validate_loadable, version)
+        async with lock, semaphore:
+            activated = await run_in_threadpool(
+                partial(
+                    registry.activate,
+                    version,
+                    actor=_actor_name(admin),
+                    force=req.force,
+                    reason=req.reason,
+                )
+            )
+            try:
+                detail = await run_in_threadpool(engine.install_validated_model, model, activated)
+            except Exception:
+                logger.exception("Activated registry but hot installation failed version=%s", version)
+                raise
+    except ModelActivationError as exc:
+        raise HTTPException(409, detail={"code": exc.code, "message": str(exc)}) from exc
+    await run_in_threadpool(
+        partial(
+            insert_review_audit,
+            action="activate_model",
+            actor=admin,
+            sample_id=None,
+            note=req.reason,
+            details={"version": version, "force": req.force, "detail": detail},
+        )
+    )
+    return {"status": "success", "model": activated, "detail": detail}
+
+
+@router.post(
     "/api/v3/reload",
     summary="热重载模型",
     description=(
@@ -2876,6 +4190,15 @@ async def list_models():
 async def reload_model(
     version: Optional[str] = Form(None),
     engine: "InferenceEngineAPI" = Depends(get_engine),
+    admin: Dict[str, Any] = Depends(_require_ai_admin),
 ):
     result = await run_in_threadpool(lambda: engine.reload_models(version))
+    await run_in_threadpool(
+        partial(
+            insert_review_audit,
+            action="reload_model",
+            actor=admin,
+            details={"version": version, "result": result},
+        )
+    )
     return {"status": "ok", "detail": result}

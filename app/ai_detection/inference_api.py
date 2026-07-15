@@ -8,6 +8,7 @@ import logging
 import os
 import joblib
 import re
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -16,8 +17,13 @@ from app.ai_detection.core.exceptions import RecoverableError
 from app.ai_detection.core.extractors import FeatureExtractor, FontFeatureLibrary, TamperAnalyzer
 from app.ai_detection.core.detectors import PixelLevelDetector, OriginalityChecker
 from app.ai_detection.core.utils import NumpyEncoder, safe_read_image
+from app.ai_detection.ocr_utils import _resize_for_ocr
+from app.ai_detection.model_registry import ModelRegistry
 
 logger = logging.getLogger(__name__)
+
+PREDICT_MAX_SIDE = max(1, int(os.getenv("AI_PREDICT_MAX_SIDE", "2200") or "2200"))
+PREDICT_MAX_PIXELS = max(1, int(os.getenv("AI_PREDICT_MAX_PIXELS", "4000000") or "4000000"))
 
 
 class InferenceEngineAPI:
@@ -40,7 +46,6 @@ class InferenceEngineAPI:
         self.font_lib.load(font_lib_path)
 
         xgb_path = self.config.get('paths', {}).get('xgb_model_path', "models/global_layout_model.pkl")
-        self.global_model = joblib.load(self._resolve_path(xgb_path))
 
         pixel_cfg = self.config.get('pixel_detector', {})
         self.pixel_detector = PixelLevelDetector(config=pixel_cfg)
@@ -49,10 +54,16 @@ class InferenceEngineAPI:
         self._origin_enabled = self.config.get('originality', {}).get('enabled', True)
 
         self._font_lib_path = font_lib_path
-        self._xgb_path = self._resolve_path(xgb_path)
-
         registry_path = self.config.get("training", {}).get("registry_path", "models/registry.json")
         self._registry_path = self._resolve_path(registry_path)
+        self._legacy_xgb_path = self._resolve_path(xgb_path)
+        ModelRegistry(
+            self._registry_path,
+            fallback_model_path=self._legacy_xgb_path,
+        ).bootstrap_fallback()
+        self._xgb_path = self._resolve_active_model_path(self._legacy_xgb_path)
+        self._model_reload_lock = threading.RLock()
+        self.global_model = joblib.load(self._xgb_path)
 
         calib_cfg = self.config.get("thresholds", {})
         self._calibration_temp = float(calib_cfg.get("calibration_temperature", 1.0))
@@ -69,16 +80,15 @@ class InferenceEngineAPI:
 
     def list_model_versions(self) -> dict:
         """返回模型版本注册表中所有版本。"""
-        registry_path = Path(self._registry_path)
-        if not registry_path.exists():
-            return {"versions": [], "current_model": str(self._xgb_path)}
-        try:
-            with open(registry_path, "r", encoding="utf-8") as f:
-                registry = json.load(f)
-        except (json.JSONDecodeError, OSError):
-            return {"versions": [], "current_model": str(self._xgb_path)}
-        registry["current_model"] = str(self._xgb_path)
-        return registry
+        return self._model_registry().list_models()
+
+    def _model_registry(self) -> ModelRegistry:
+        fallback = getattr(self, "_legacy_xgb_path", None) or getattr(self, "_xgb_path", "")
+        return ModelRegistry(self._registry_path, fallback_model_path=fallback)
+
+    def _resolve_active_model_path(self, fallback_path: str) -> str:
+        registry = ModelRegistry(self._registry_path, fallback_model_path=fallback_path)
+        return str(registry.resolve_active().get("model_path") or fallback_path)
 
     def reload_models(self, version: Optional[str] = None) -> dict:
         """热重载 FAISS 字体库和 XGBoost 模型，无需重启服务。
@@ -88,21 +98,19 @@ class InferenceEngineAPI:
         """
         result = {"font_lib": "unchanged", "global_model": "unchanged"}
 
-        xgb_path = self._xgb_path
+        xgb_path = self._resolve_active_model_path(self._legacy_xgb_path)
         font_lib_path = self._font_lib_path
 
         if version:
-            versions_info = self.list_model_versions()
-            for entry in versions_info.get("versions", []):
-                if entry.get("timestamp") == version:
-                    xgb_path = entry.get("model_path", xgb_path)
-                    font_lib_path = entry.get("font_lib_path", font_lib_path)
-                    result["version"] = version
-                    logger.info("切换到模型版本: %s", version)
-                    break
-            else:
-                logger.warning("未找到版本 %s，使用当前活跃模型", version)
-                result["version"] = "current"
+            active_version = self._model_registry().resolve_active().get("version")
+            if version != active_version:
+                raise ValueError("指定版本切换必须使用模型启用接口完成评估与审计")
+            entry = self._model_registry().get(version)
+            if entry is None:
+                raise ValueError(f"未找到模型版本: {version}")
+            xgb_path = entry.get("model_path", xgb_path)
+            font_lib_path = entry.get("font_lib_path", font_lib_path)
+            result["version"] = version
 
         new_font_lib = FontFeatureLibrary()
         if new_font_lib.load(font_lib_path):
@@ -113,13 +121,48 @@ class InferenceEngineAPI:
 
         try:
             new_model = joblib.load(xgb_path)
+        except Exception as exc:
+            raise RuntimeError("全局模型加载失败，当前模型未变更") from exc
+        if not callable(getattr(new_model, "predict_proba", None)):
+            raise RuntimeError("全局模型格式无效，当前模型未变更")
+        with self._model_reload_lock:
             self.global_model = new_model
-            result["global_model"] = "reloaded"
-        except Exception:
-            logger.warning("全局模型重载失败，保留当前模型", exc_info=True)
+            self._xgb_path = str(Path(xgb_path).resolve())
+            if result["font_lib"] == "reloaded":
+                self._font_lib_path = str(font_lib_path)
+        result["global_model"] = "reloaded"
+        result["current_model"] = self._xgb_path
 
         logger.info("模型热重载完成: %s", result)
         return result
+
+    def install_validated_model(self, model: Any, entry: Dict[str, Any]) -> dict:
+        """Atomically install a model that ModelRegistry already validated."""
+        if not callable(getattr(model, "predict_proba", None)):
+            raise ValueError("候选模型缺少 predict_proba")
+        model_path = str(Path(str(entry.get("model_path") or "")).resolve())
+        if not model_path:
+            raise ValueError("候选模型路径为空")
+
+        next_font_lib = None
+        font_path = str(entry.get("font_lib_path") or "").strip()
+        if font_path:
+            candidate_font_lib = FontFeatureLibrary()
+            if candidate_font_lib.load(font_path):
+                next_font_lib = candidate_font_lib
+
+        with self._model_reload_lock:
+            self.global_model = model
+            self._xgb_path = model_path
+            if next_font_lib is not None:
+                self.font_lib = next_font_lib
+                self._font_lib_path = font_path
+        return {
+            "version": entry.get("version"),
+            "global_model": "reloaded",
+            "font_lib": "reloaded" if next_font_lib is not None else "unchanged",
+            "current_model": self._xgb_path,
+        }
 
     def get_metrics(self) -> dict:
         """返回累计推理指标快照。"""
@@ -186,6 +229,28 @@ class InferenceEngineAPI:
         return self._clip_bbox_xyxy([x1, y1, x1 + third, y1 + fourth], img_w, img_h)
 
     @staticmethod
+    def _scale_bbox_xyxy(
+        bbox_xyxy: Tuple[int, int, int, int],
+        *,
+        scale: float,
+        img_w: int,
+        img_h: int,
+    ) -> Tuple[int, int, int, int]:
+        if scale >= 0.999:
+            return InferenceEngineAPI._clip_bbox_xyxy(list(bbox_xyxy), img_w, img_h)
+        x1, y1, x2, y2 = bbox_xyxy
+        return InferenceEngineAPI._clip_bbox_xyxy(
+            [
+                int(round(x1 * scale)),
+                int(round(y1 * scale)),
+                int(round(x2 * scale)),
+                int(round(y2 * scale)),
+            ],
+            img_w,
+            img_h,
+        )
+
+    @staticmethod
     def _profile_numeric_text(extracted_text: str, max_len: int) -> Dict[str, float]:
         text_clean = extracted_text.replace(" ", "")
         total_len = len(text_clean)
@@ -245,6 +310,13 @@ class InferenceEngineAPI:
                 self._metrics["error_count"] += 1
                 return json.dumps({"result": "错误", "reason": "无法读取图片或路径不存在"}, ensure_ascii=False)
 
+            orig_h, orig_w = img.shape[:2]
+            work_img, work_scale = _resize_for_ocr(
+                img,
+                max_side=PREDICT_MAX_SIDE,
+                max_pixels=PREDICT_MAX_PIXELS,
+            )
+            img = work_img
             img_h, img_w = img.shape[:2]
 
             rules = self.config.get('business_rules', {})
@@ -265,8 +337,16 @@ class InferenceEngineAPI:
             w_global = fusion_cfg.get('weight_global', 0.35)
             w_local = fusion_cfg.get('weight_local', 0.65)
 
-            x1, y1, x2, y2 = self._normalize_roi_bbox(roi_bbox, img_w, img_h, bbox_format)
+            orig_x1, orig_y1, orig_x2, orig_y2 = self._normalize_roi_bbox(roi_bbox, orig_w, orig_h, bbox_format)
+            x1, y1, x2, y2 = self._scale_bbox_xyxy(
+                (orig_x1, orig_y1, orig_x2, orig_y2),
+                scale=work_scale,
+                img_w=img_w,
+                img_h=img_h,
+            )
             x, y, w, h = x1, y1, x2 - x1, y2 - y1
+            out_x, out_y = orig_x1, orig_y1
+            out_w, out_h = orig_x2 - orig_x1, orig_y2 - orig_y1
 
             # ================== 0. EXIF/元数据分析 ==================
             metadata_risk = 0.0
@@ -339,7 +419,7 @@ class InferenceEngineAPI:
             # ---- 像素重叠 / 检测框 IoU 分析 ----
             bbox_overlap_result = analyze_bbox_iou_overlaps(
                 detection_bboxes or [],
-                roi_bbox_xyxy=[x1, y1, x2, y2],
+                roi_bbox_xyxy=[orig_x1, orig_y1, orig_x2, orig_y2],
                 thresholds=thresh,
             )
             bbox_iou_risk = float(bbox_overlap_result.get("risk", 0.0))
@@ -450,7 +530,7 @@ class InferenceEngineAPI:
             output = {
                 "result": result_status,
                 "confidence": final_risk,
-                "bbox": [int(i) for i in [x, y, w, h]],
+                "bbox": [int(i) for i in [out_x, out_y, out_w, out_h]],
                 "reason": "；".join(dict.fromkeys(reasons)),
                 "bbox_overlap_check": bbox_overlap_result.get("bbox_overlap_check"),
                 "hard_tamper_flags": {

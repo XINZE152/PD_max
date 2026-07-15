@@ -7,5 +7,10 @@
   "user_note": "test fallback",
   "entry_id": "ea8bc850",
   "original_image": "/home/quyu/PD_new/PD_max/app/ai_detection/feedback/correct/20260601_173648_0634173e-2eb3-4a91-b072-45ff0ab96143_ea8bc850/original.jpg",
-  "cropped_roi": null
+  "cropped_roi": null,
+  "review_status": "pending",
+  "original_filename": "task-0634173e.jpg",
+  "content_sha256": "260a36732d451afa3b62f4e3781ecfea864bd10aa0e7d9c5f2235ed04bdaa763",
+  "size_bytes": 212699,
+  "media_type": "image/jpeg"
 }

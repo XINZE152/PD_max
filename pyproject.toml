@@ -25,6 +25,7 @@ dependencies = [
 	"joblib",
 	"PyYAML",
 	"Pillow",
+	"pypinyin>=0.51.0,<1.0",
 	"openpyxl>=3.1.0",
 	"sqlalchemy[asyncio]>=2.0",
 	"aiomysql",
