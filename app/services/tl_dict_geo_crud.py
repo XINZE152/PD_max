@@ -311,19 +311,14 @@ def warehouse_create(payload: Dict[str, Any]) -> Dict[str, Any]:
                         row = cur.fetchone()
                         data = _warehouse_row_api(row, row.get("type_name"))
                         return _ok("仓库已存在", data=data)
+                    # 停用状态：重命名旧记录释放原名，再创建全新仓库
+                    old_name = f"{name}__已删除_{wh_id}"
+                    if len(old_name) > 100:
+                        old_name = old_name[:100]
                     cur.execute(
-                        "UPDATE dict_warehouses SET is_active = 1 WHERE id = %s",
-                        (wh_id,),
+                        "UPDATE dict_warehouses SET name = %s WHERE id = %s",
+                        (old_name, wh_id),
                     )
-                    cur.execute(
-                        "SELECT dw.*, wt.name AS type_name FROM dict_warehouses dw "
-                        "LEFT JOIN dict_warehouse_types wt ON dw.warehouse_type_id = wt.id "
-                        "WHERE dw.id = %s",
-                        (wh_id,),
-                    )
-                    row = cur.fetchone()
-                    data = _warehouse_row_api(row, row.get("type_name"))
-                    return _ok("仓库已恢复启用", data=data)
 
                 cat_id_val = payload.get("category_id")
                 if cat_id_val is not None:

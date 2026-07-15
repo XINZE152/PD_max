@@ -713,11 +713,13 @@ class TLService:
                         wid, is_active = int(row[0]), row[1]
                         if is_active == 1:
                             return {"code": 200, "msg": "仓库已存在", "仓库id": wid, "新建": False}
+                        old_name = f"{name}__已删除_{wid}"
+                        if len(old_name) > 100:
+                            old_name = old_name[:100]
                         cur.execute(
-                            "UPDATE dict_warehouses SET is_active = 1 WHERE id = %s",
-                            (wid,),
+                            "UPDATE dict_warehouses SET name = %s WHERE id = %s",
+                            (old_name, wid),
                         )
-                        return {"code": 200, "msg": "仓库已恢复启用", "仓库id": wid, "新建": False}
                     cur.execute(
                         "INSERT INTO dict_warehouses "
                         "(name, address, warehouse_type_id, category_id, color_config, is_active) "
