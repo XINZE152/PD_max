@@ -2,11 +2,15 @@ import logging
 import os
 import time
 
+import app.config as app_config  # noqa: F401 — 加载项目根 .env（副作用）
+from app.ai_detection.resource_limits import apply_ai_detection_resource_defaults
+
+apply_ai_detection_resource_defaults()
+
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-import app.config as app_config  # noqa: F401 — 加载项目根 .env（副作用）
 from app.api.v1.router import api_router
 from app.database import create_tables
 from app.logging_config import setup_logging

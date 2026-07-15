@@ -2,6 +2,7 @@
 """全图 OCR 工具：供同步/异步鉴伪共用，抽取时间戳等。"""
 from __future__ import annotations
 
+import os
 from typing import Any, List, Optional, Sequence, Tuple
 
 import cv2
@@ -9,6 +10,62 @@ import numpy as np
 
 from app.ai_detection.amount_candidates import OCRToken, build_amount_candidates, tokenize_ocr_results
 from app.ai_detection.rule_check_roi import find_key_field_rois
+
+OCR_MAX_SIDE = max(1, int(os.getenv("AI_OCR_MAX_SIDE", "2200") or "2200"))
+OCR_MAX_PIXELS = max(1, int(os.getenv("AI_OCR_MAX_PIXELS", "4000000") or "4000000"))
+OCR_MAG_RATIO = max(1.0, float(os.getenv("AI_OCR_MAG_RATIO", "1.5") or "1.5"))
+
+
+def _resize_for_ocr(
+    img_cv2: np.ndarray,
+    *,
+    max_side: int = OCR_MAX_SIDE,
+    max_pixels: int = OCR_MAX_PIXELS,
+) -> Tuple[np.ndarray, float]:
+    """Downscale oversized images before EasyOCR to avoid memory spikes."""
+    h, w = img_cv2.shape[:2]
+    if h <= 0 or w <= 0:
+        return img_cv2, 1.0
+
+    scale = 1.0
+    longest = max(h, w)
+    if longest > max_side:
+        scale = min(scale, max_side / float(longest))
+    pixels = h * w
+    if pixels > max_pixels:
+        scale = min(scale, (max_pixels / float(pixels)) ** 0.5)
+
+    if scale >= 0.999:
+        return img_cv2, 1.0
+
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+    return cv2.resize(img_cv2, (new_w, new_h), interpolation=cv2.INTER_AREA), scale
+
+
+def _scale_ocr_results_to_original(
+    ocr_results: Sequence[Tuple[Sequence[Sequence[float]], str, float]],
+    *,
+    scale: float,
+    original_shape: Tuple[int, int, int],
+) -> List[Tuple[List[List[float]], str, float]]:
+    if scale >= 0.999:
+        return [(list(map(list, bbox)), text, conf) for bbox, text, conf in ocr_results]
+
+    h, w = original_shape[:2]
+    inv_scale = 1.0 / max(scale, 1e-6)
+    scaled: List[Tuple[List[List[float]], str, float]] = []
+    for bbox, text, conf in ocr_results:
+        points: List[List[float]] = []
+        for point in bbox:
+            if len(point) < 2:
+                continue
+            x = min(max(float(point[0]) * inv_scale, 0.0), max(float(w - 1), 0.0))
+            y = min(max(float(point[1]) * inv_scale, 0.0), max(float(h - 1), 0.0))
+            points.append([x, y])
+        if points:
+            scaled.append((points, text, conf))
+    return scaled
 
 
 def run_full_image_ocr(
@@ -20,15 +77,21 @@ def run_full_image_ocr(
     if img_cv2 is None:
         return None, []
 
-    gray = cv2.cvtColor(img_cv2, cv2.COLOR_BGR2GRAY)
+    ocr_img, scale = _resize_for_ocr(img_cv2)
+    gray = cv2.cvtColor(ocr_img, cv2.COLOR_BGR2GRAY)
     blurred = cv2.medianBlur(gray, 3)
     ocr_results = ocr_reader.readtext(
         blurred,
         adjust_contrast=0.5,
-        mag_ratio=2.0,
+        mag_ratio=OCR_MAG_RATIO,
         text_threshold=0.25,
     )
-    return img_cv2, tokenize_ocr_results(ocr_results)
+    original_results = _scale_ocr_results_to_original(
+        ocr_results,
+        scale=scale,
+        original_shape=img_cv2.shape,
+    )
+    return img_cv2, tokenize_ocr_results(original_results)
 
 
 def build_detection_bboxes_from_tokens(

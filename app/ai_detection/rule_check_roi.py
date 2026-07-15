@@ -166,7 +166,8 @@ def find_key_field_rois(
             digit_count = len(re.findall(r"\d", text))
             if digit_count == 0 or digit_count / max(len(text), 1) < 0.20:
                 continue
-            if re.search(r"[一-鿿]", text):
+            chinese_chars = set(re.findall(r"[\u4e00-\u9fff]", text))
+            if chinese_chars - set("人民币元圆"):
                 continue
             if candidate.bbox[1] < image_h * 0.07:
                 continue

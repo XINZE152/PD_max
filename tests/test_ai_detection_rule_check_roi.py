@@ -47,6 +47,23 @@ class RuleCheckRoiTests(unittest.TestCase):
         amount_rois = [roi for roi in rois if roi.get("field_type") == "amount"]
         self.assertGreaterEqual(len(amount_rois), 2)
 
+    def test_find_key_field_rois_keeps_currency_unit_amount_candidate(self):
+        image_shape = (2781, 1280, 3)
+        tokens = [
+            OCRToken("转余额", "转余额", (139, 1117, 361, 1186), 0.004, 222, 69, 1151.5),
+            OCRToken("9,123.00元", "9,123.00元", (889, 1121, 1135, 1181), 0.661, 246, 60, 1151.0),
+            OCRToken("付歉账户余额", "付歉账户余额", (139, 1747, 463, 1816), 0.026, 324, 69, 1781.5),
+            OCRToken("74,119.35元", "74,119.35元", (866, 1747, 1135, 1812), 0.633, 269, 65, 1779.5),
+        ]
+
+        rois = find_key_field_rois(tokens, image_shape)
+
+        self.assertIn(
+            [889, 1121, 1135, 1181],
+            [roi["bbox"] for roi in rois if roi.get("field_type") == "amount"],
+        )
+        self.assertNotIn([139, 1747, 1135, 1816], [roi["bbox"] for roi in rois])
+
     def test_find_key_field_rois_excludes_plain_digits_accounts_and_orders(self):
         image_shape = (1200, 800, 3)
         tokens = [
