@@ -295,12 +295,26 @@ def warehouse_create(payload: Dict[str, Any]) -> Dict[str, Any]:
                     return _err(CODE_VALIDATION, "库房类型不存在或未启用，请先维护库房类型")
 
                 cur.execute(
-                    "SELECT id FROM dict_warehouses WHERE name = %s",
+                    "SELECT id, is_active FROM dict_warehouses WHERE name = %s",
                     (name,),
                 )
                 existing = cur.fetchone()
                 if existing:
                     wh_id = int(existing["id"])
+                    if int(existing.get("is_active") or 0) == 1:
+                        cur.execute(
+                            "SELECT dw.*, wt.name AS type_name FROM dict_warehouses dw "
+                            "LEFT JOIN dict_warehouse_types wt ON dw.warehouse_type_id = wt.id "
+                            "WHERE dw.id = %s",
+                            (wh_id,),
+                        )
+                        row = cur.fetchone()
+                        data = _warehouse_row_api(row, row.get("type_name"))
+                        return _ok("仓库已存在", data=data)
+                    cur.execute(
+                        "UPDATE dict_warehouses SET is_active = 1 WHERE id = %s",
+                        (wh_id,),
+                    )
                     cur.execute(
                         "SELECT dw.*, wt.name AS type_name FROM dict_warehouses dw "
                         "LEFT JOIN dict_warehouse_types wt ON dw.warehouse_type_id = wt.id "
@@ -309,7 +323,7 @@ def warehouse_create(payload: Dict[str, Any]) -> Dict[str, Any]:
                     )
                     row = cur.fetchone()
                     data = _warehouse_row_api(row, row.get("type_name"))
-                    return _ok("仓库已存在", data=data)
+                    return _ok("仓库已恢复启用", data=data)
 
                 cat_id_val = payload.get("category_id")
                 if cat_id_val is not None:

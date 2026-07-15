@@ -667,7 +667,7 @@ class TLService:
                 data = res.get("data") or {}
                 wid = int(data.get("id", 0))
                 sa_msg = str(res.get("msg", ""))
-                is_new = sa_msg != "仓库已存在"
+                is_new = "创建成功" in sa_msg
                 return {"code": 200, "msg": sa_msg, "仓库id": wid, "新建": is_new}
             except ValueError:
                 raise
@@ -705,12 +705,19 @@ class TLService:
                                 f"库房大类 id={warehouse_category_id} 不存在或未启用"
                             )
                     cur.execute(
-                        "SELECT id FROM dict_warehouses WHERE name = %s",
+                        "SELECT id, is_active FROM dict_warehouses WHERE name = %s",
                         (name,),
                     )
                     row = cur.fetchone()
                     if row:
-                        return {"code": 200, "msg": "仓库已存在", "仓库id": row[0], "新建": False}
+                        wid, is_active = int(row[0]), row[1]
+                        if is_active == 1:
+                            return {"code": 200, "msg": "仓库已存在", "仓库id": wid, "新建": False}
+                        cur.execute(
+                            "UPDATE dict_warehouses SET is_active = 1 WHERE id = %s",
+                            (wid,),
+                        )
+                        return {"code": 200, "msg": "仓库已恢复启用", "仓库id": wid, "新建": False}
                     cur.execute(
                         "INSERT INTO dict_warehouses "
                         "(name, address, warehouse_type_id, category_id, color_config, is_active) "
