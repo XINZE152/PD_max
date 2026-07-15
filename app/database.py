@@ -169,7 +169,7 @@ TABLE_STATEMENTS = [
     """
     CREATE TABLE IF NOT EXISTS dict_warehouses (
         id INT AUTO_INCREMENT PRIMARY KEY COMMENT '仓库ID',
-        name VARCHAR(100) NOT NULL UNIQUE COMMENT '仓库名称',
+        name VARCHAR(100) NOT NULL UNIQUE COLLATE utf8mb4_bin COMMENT '仓库名称',
         province VARCHAR(64) DEFAULT NULL COMMENT '省',
         city VARCHAR(64) DEFAULT NULL COMMENT '市',
         district VARCHAR(64) DEFAULT NULL COMMENT '区县',
@@ -1818,6 +1818,10 @@ def create_tables() -> None:
     except Exception:
         logger.exception("检查/添加 dict_warehouses 当前库存/收货价格列失败")
     try:
+        ensure_dict_warehouses_name_collation_binary()
+    except Exception:
+        logger.exception("检查/修改 dict_warehouses.name 排序规则失败")
+    try:
         ensure_dict_warehouse_links_tier_price_spread_column()
     except Exception:
         logger.exception("检查/添加 dict_warehouse_links.tier_price_spread 失败")
@@ -2257,6 +2261,35 @@ def ensure_dict_warehouses_inventory_price_columns() -> None:
                     "AFTER current_inventory_ton"
                 )
                 logger.info("已为 dict_warehouses 添加 receipt_price_per_ton")
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def ensure_dict_warehouses_name_collation_binary() -> None:
+    """将 dict_warehouses.name 列排序规则改为 utf8mb4_bin，确保全角/半角括号等字符被视为不同字符。"""
+    config_dict = get_mysql_config()
+    connection = pymysql.connect(**config_dict)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SHOW TABLES LIKE 'dict_warehouses'")
+            if cursor.fetchone() is None:
+                return
+
+            cursor.execute(
+                "SELECT COLLATION_NAME FROM information_schema.columns "
+                "WHERE table_schema = DATABASE() AND table_name = 'dict_warehouses' "
+                "AND column_name = 'name'"
+            )
+            row = cursor.fetchone()
+            if row and row[0] == "utf8mb4_bin":
+                return
+
+            cursor.execute(
+                "ALTER TABLE dict_warehouses MODIFY name VARCHAR(100) NOT NULL "
+                "COLLATE utf8mb4_bin COMMENT '仓库名称'"
+            )
+            logger.info("已将 dict_warehouses.name 排序规则改为 utf8mb4_bin（支持全角括号等字符区分）")
         connection.commit()
     finally:
         connection.close()

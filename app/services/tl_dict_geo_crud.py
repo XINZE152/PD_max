@@ -298,8 +298,18 @@ def warehouse_create(payload: Dict[str, Any]) -> Dict[str, Any]:
                     "SELECT id FROM dict_warehouses WHERE name = %s",
                     (name,),
                 )
-                if cur.fetchone():
-                    return _err(CODE_DUP_NAME, "仓库名称已存在")
+                existing = cur.fetchone()
+                if existing:
+                    wh_id = int(existing["id"])
+                    cur.execute(
+                        "SELECT dw.*, wt.name AS type_name FROM dict_warehouses dw "
+                        "LEFT JOIN dict_warehouse_types wt ON dw.warehouse_type_id = wt.id "
+                        "WHERE dw.id = %s",
+                        (wh_id,),
+                    )
+                    row = cur.fetchone()
+                    data = _warehouse_row_api(row, row.get("type_name"))
+                    return _ok("仓库已存在", data=data)
 
                 cat_id_val = payload.get("category_id")
                 if cat_id_val is not None:
