@@ -94,7 +94,6 @@ logger = logging.getLogger(__name__)
 STORAGE_DIR = Path(UPLOAD_DIR) / "ai_detection_storage"
 STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 
-<<<<<<< HEAD
 _optional_bearer = HTTPBearer(auto_error=False)
 
 
@@ -133,8 +132,6 @@ def _actor_name(user: Optional[Dict[str, Any]]) -> str:
         return "anonymous"
     return str(user.get("username") or user.get("sub") or user.get("uid") or "unknown")
 
-=======
->>>>>>> 89404cdd7a5495c421d5bddbe645a2a25e14a6c0
 
 def _float_env(name: str, default: float) -> float:
     raw = os.getenv(name, str(default))
@@ -266,12 +263,9 @@ class AbstractTaskRegistry(ABC):
         *,
         image_created_at: Optional[str] = None,
         batch: Optional[str] = None,
-<<<<<<< HEAD
         content_sha256: Optional[str] = None,
         size_bytes: Optional[int] = None,
         media_type: Optional[str] = None,
-=======
->>>>>>> 89404cdd7a5495c421d5bddbe645a2a25e14a6c0
     ) -> None:
         pass
 
@@ -300,12 +294,9 @@ class MemoryTaskRegistry(AbstractTaskRegistry):
         *,
         image_created_at: Optional[str] = None,
         batch: Optional[str] = None,
-<<<<<<< HEAD
         content_sha256: Optional[str] = None,
         size_bytes: Optional[int] = None,
         media_type: Optional[str] = None,
-=======
->>>>>>> 89404cdd7a5495c421d5bddbe645a2a25e14a6c0
     ) -> None:
         self._store[task_id] = TaskRecordDTO(
             task_id=task_id,
@@ -941,7 +932,6 @@ def build_task_record_from_persistence(task_id: str) -> Optional[TaskRecordDTO]:
     if not tid:
         return None
 
-<<<<<<< HEAD
     storage_path = _find_storage_image_path(tid)
     sidecar_task = _task_record_from_sidecar(tid)
     history = get_async_v3_history_by_task_id(tid)
@@ -951,14 +941,6 @@ def build_task_record_from_persistence(task_id: str) -> Optional[TaskRecordDTO]:
     content_sha256: Optional[str] = sidecar_task.content_sha256 if sidecar_task else None
     size_bytes: Optional[int] = sidecar_task.size_bytes if sidecar_task else None
     media_type: Optional[str] = sidecar_task.media_type if sidecar_task else None
-=======
-    storage_path = _storage_image_path(tid)
-    sidecar_task = _task_record_from_sidecar(tid)
-    history = get_async_v3_history_by_task_id(tid)
-    image_path = sidecar_task.image_path if sidecar_task else (str(storage_path) if storage_path.is_file() else None)
-    created_at = sidecar_task.created_at if sidecar_task else datetime.now().isoformat()
-    original_filename: Optional[str] = sidecar_task.original_filename if sidecar_task else None
->>>>>>> 89404cdd7a5495c421d5bddbe645a2a25e14a6c0
     image_created_at: Optional[str] = sidecar_task.image_created_at if sidecar_task else None
     batch: Optional[str] = sidecar_task.batch if sidecar_task else None
     bbox_dto: Optional[BBoxDTO] = None
@@ -975,12 +957,9 @@ def build_task_record_from_persistence(task_id: str) -> Optional[TaskRecordDTO]:
             image_path = str(history_image_path)
         created_at = str(history.get("created_at") or created_at)
         original_filename = history.get("original_filename") or original_filename
-<<<<<<< HEAD
         content_sha256 = history.get("content_sha256") or content_sha256
         size_bytes = history.get("size_bytes") if history.get("size_bytes") is not None else size_bytes
         media_type = history.get("media_type") or media_type
-=======
->>>>>>> 89404cdd7a5495c421d5bddbe645a2a25e14a6c0
         image_created_at = history.get("image_created_at") or image_created_at
         batch = history.get("batch") or batch
         bbox_dto = _bbox_dto_from_history(history.get("bbox"))
@@ -997,12 +976,9 @@ def build_task_record_from_persistence(task_id: str) -> Optional[TaskRecordDTO]:
                 created_at=created_at,
                 image_path=image_path,
                 original_filename=original_filename,
-<<<<<<< HEAD
                 content_sha256=content_sha256,
                 size_bytes=size_bytes,
                 media_type=media_type,
-=======
->>>>>>> 89404cdd7a5495c421d5bddbe645a2a25e14a6c0
                 image_created_at=image_created_at,
                 batch=batch,
                 bbox=bbox_dto,
@@ -1017,12 +993,9 @@ def build_task_record_from_persistence(task_id: str) -> Optional[TaskRecordDTO]:
                 created_at=created_at,
                 image_path=image_path,
                 original_filename=original_filename,
-<<<<<<< HEAD
                 content_sha256=content_sha256,
                 size_bytes=size_bytes,
                 media_type=media_type,
-=======
->>>>>>> 89404cdd7a5495c421d5bddbe645a2a25e14a6c0
                 image_created_at=image_created_at,
                 batch=batch,
                 bbox=bbox_dto,
@@ -1030,12 +1003,9 @@ def build_task_record_from_persistence(task_id: str) -> Optional[TaskRecordDTO]:
             )
 
     if sidecar_task:
-<<<<<<< HEAD
         if sidecar_task.status in {TaskStatusEnum.PENDING, TaskStatusEnum.PROCESSING}:
             sidecar_task.status = TaskStatusEnum.FAILED
             sidecar_task.error_msg = TASK_INTERRUPTED_MSG
-=======
->>>>>>> 89404cdd7a5495c421d5bddbe645a2a25e14a6c0
         return sidecar_task
 
     if image_path:
@@ -1049,12 +1019,9 @@ def build_task_record_from_persistence(task_id: str) -> Optional[TaskRecordDTO]:
             created_at=created_at,
             image_path=image_path,
             original_filename=original_filename,
-<<<<<<< HEAD
             content_sha256=content_sha256,
             size_bytes=size_bytes,
             media_type=media_type,
-=======
->>>>>>> 89404cdd7a5495c421d5bddbe645a2a25e14a6c0
             image_created_at=image_created_at,
             batch=batch,
             error_msg=TASK_INTERRUPTED_MSG,
@@ -1092,12 +1059,9 @@ async def ensure_task_in_registry_for_retry(
             original_filename=task.original_filename,
             image_created_at=task.image_created_at,
             batch=task.batch,
-<<<<<<< HEAD
             content_sha256=task.content_sha256,
             size_bytes=task.size_bytes,
             media_type=task.media_type,
-=======
->>>>>>> 89404cdd7a5495c421d5bddbe645a2a25e14a6c0
         )
         restored = await registry.get_task(task_id)
         if restored:
@@ -2564,7 +2528,6 @@ async def rule_checks_from_task_endpoint(
             raise HTTPException(status_code=400, detail="bbox 格式无效，请使用 [x1,y1,x2,y2] 或 x1,y1,x2,y2")
 
     try:
-<<<<<<< HEAD
         work_lock = EngineContainer.work_lock
         if work_lock is None:
             raise RuntimeError("AI 工作协调锁未初始化")
@@ -2582,21 +2545,6 @@ async def rule_checks_from_task_endpoint(
                 image_created_at=image_created_at or task.image_created_at,
                 batch=batch or task.batch,
             )
-=======
-        data = await RuleCheckService.process_rule_checks_from_path(
-            task.image_path or "",
-            engine,
-            semaphore,
-            ocr_reader,
-            original_filename=task.original_filename,
-            bbox_list=bbox_list,
-            bboxes_list=bboxes_list,
-            business_datetime=document_time,
-            task_id=task.task_id,
-            image_created_at=image_created_at or task.image_created_at,
-            batch=batch or task.batch,
-        )
->>>>>>> 89404cdd7a5495c421d5bddbe645a2a25e14a6c0
         return {"status": "success", "data": data, "task_id": task.task_id, "batch": batch or task.batch}
     except ValueError as exc:
         return JSONResponse(status_code=422, content={"status": "error", "message": str(exc)})
@@ -3141,13 +3089,10 @@ async def upload_detection_task(
         "status": task.status.value,
         "task_id": task.task_id,
         "batch": task.batch,
-<<<<<<< HEAD
         "original_filename": task.original_filename,
         "content_sha256": task.content_sha256,
         "size_bytes": task.size_bytes,
         "media_type": task.media_type,
-=======
->>>>>>> 89404cdd7a5495c421d5bddbe645a2a25e14a6c0
     }
 
 
@@ -3336,11 +3281,8 @@ async def cancel_task(task_id: str, registry: AbstractTaskRegistry = Depends(get
     task = await registry.get_task(task_id)
     if not task:
         persisted = await run_in_threadpool(build_task_record_from_persistence, task_id)
-<<<<<<< HEAD
         if persisted and persisted.status in {TaskStatusEnum.COMPLETED, TaskStatusEnum.FAILED}:
             return {"status": "already_finished"}
-=======
->>>>>>> 89404cdd7a5495c421d5bddbe645a2a25e14a6c0
         if persisted and persisted.image_path:
             await registry.create_task(
                 persisted.task_id,
@@ -3348,23 +3290,17 @@ async def cancel_task(task_id: str, registry: AbstractTaskRegistry = Depends(get
                 original_filename=persisted.original_filename,
                 image_created_at=persisted.image_created_at,
                 batch=persisted.batch,
-<<<<<<< HEAD
                 content_sha256=persisted.content_sha256,
                 size_bytes=persisted.size_bytes,
                 media_type=persisted.media_type,
-=======
->>>>>>> 89404cdd7a5495c421d5bddbe645a2a25e14a6c0
             )
             task = await registry.get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="任务不存在")
 
-<<<<<<< HEAD
     if task.status in {TaskStatusEnum.COMPLETED, TaskStatusEnum.FAILED}:
         return {"status": "already_finished"}
 
-=======
->>>>>>> 89404cdd7a5495c421d5bddbe645a2a25e14a6c0
     if task.status in [TaskStatusEnum.UPLOADED, TaskStatusEnum.PENDING]:
         await registry.delete_task(task_id)
     elif task.status == TaskStatusEnum.PROCESSING:

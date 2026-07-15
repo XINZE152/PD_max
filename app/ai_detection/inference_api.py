@@ -18,10 +18,7 @@ from app.ai_detection.core.extractors import FeatureExtractor, FontFeatureLibrar
 from app.ai_detection.core.detectors import PixelLevelDetector, OriginalityChecker
 from app.ai_detection.core.utils import NumpyEncoder, safe_read_image
 from app.ai_detection.ocr_utils import _resize_for_ocr
-<<<<<<< HEAD
 from app.ai_detection.model_registry import ModelRegistry
-=======
->>>>>>> 89404cdd7a5495c421d5bddbe645a2a25e14a6c0
 
 logger = logging.getLogger(__name__)
 

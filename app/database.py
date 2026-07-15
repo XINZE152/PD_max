@@ -1842,13 +1842,10 @@ def create_tables() -> None:
     except Exception:
         logger.exception("检查/添加 ai_detection_history.image_created_at/batch 失败")
     try:
-<<<<<<< HEAD
         ensure_ai_detection_history_upload_metadata_columns()
     except Exception:
         logger.exception("检查/添加 ai_detection_history 上传元数据列失败")
     try:
-=======
->>>>>>> 89404cdd7a5495c421d5bddbe645a2a25e14a6c0
         ensure_ai_detection_history_feedback_status_column()
     except Exception:
         logger.exception("检查/添加 ai_detection_history.feedback_status 失败")
