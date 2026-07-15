@@ -704,12 +704,14 @@ class TLService:
                             raise ValueError(
                                 f"库房大类 id={warehouse_category_id} 不存在或未启用"
                             )
-                    cur.execute(
-                        "SELECT id, is_active FROM dict_warehouses WHERE name = %s",
-                        (name,),
-                    )
-                    row = cur.fetchone()
-                    if row:
+                    while True:
+                        cur.execute(
+                            "SELECT id, is_active FROM dict_warehouses WHERE name = %s",
+                            (name,),
+                        )
+                        row = cur.fetchone()
+                        if not row:
+                            break
                         wid, is_active = int(row[0]), row[1]
                         if is_active == 1:
                             return {"code": 200, "msg": "仓库已存在", "仓库id": wid, "新建": False}

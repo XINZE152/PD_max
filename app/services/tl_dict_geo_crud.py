@@ -294,12 +294,14 @@ def warehouse_create(payload: Dict[str, Any]) -> Dict[str, Any]:
                 if wt_id is None:
                     return _err(CODE_VALIDATION, "库房类型不存在或未启用，请先维护库房类型")
 
-                cur.execute(
-                    "SELECT id, is_active FROM dict_warehouses WHERE name = %s",
-                    (name,),
-                )
-                existing = cur.fetchone()
-                if existing:
+                while True:
+                    cur.execute(
+                        "SELECT id, is_active FROM dict_warehouses WHERE name = %s",
+                        (name,),
+                    )
+                    existing = cur.fetchone()
+                    if not existing:
+                        break
                     wh_id = int(existing["id"])
                     if int(existing.get("is_active") or 0) == 1:
                         cur.execute(
@@ -311,7 +313,7 @@ def warehouse_create(payload: Dict[str, Any]) -> Dict[str, Any]:
                         row = cur.fetchone()
                         data = _warehouse_row_api(row, row.get("type_name"))
                         return _ok("仓库已存在", data=data)
-                    # 停用状态：重命名旧记录释放原名，再创建全新仓库
+                    # 停用状态：重命名旧记录释放原名
                     old_name = f"{name}__已删除_{wh_id}"
                     if len(old_name) > 100:
                         old_name = old_name[:100]
