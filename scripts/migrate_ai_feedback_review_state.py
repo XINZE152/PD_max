@@ -17,9 +17,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from app.ai_detection.feedback_manager import FeedbackManager
-from app.ai_detection.history_db import get_async_v3_history_by_task_id
-from app.ai_detection.reviewed_dataset import normalize_display_filename
+from app.ai_detection.services.feedback_manager import FeedbackManager
+from app.ai_detection.services.history_db import get_async_v3_history_by_task_id
+from app.ai_detection.services.reviewed_dataset import normalize_display_filename
 from app.config import UPLOAD_DIR
 
 

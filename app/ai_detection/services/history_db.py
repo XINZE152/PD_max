@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from app.config import UPLOAD_DIR
 from app.database import get_conn
-from app.ai_detection.rule_check_display import build_rule_check_public_summary, derive_rule_check_status
+from app.ai_detection.services.rule_check_display import build_rule_check_public_summary, derive_rule_check_status
 
 logger = logging.getLogger(__name__)
 

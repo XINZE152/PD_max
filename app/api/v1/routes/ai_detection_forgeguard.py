@@ -11,7 +11,7 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 
-from app.ai_detection.forgeguard_client import (
+from app.ai_detection.services.forgeguard_client import (
     FORGEGUARD_API_KEY,
     FORGEGUARD_BASE_URL,
     forgeguard_detect,

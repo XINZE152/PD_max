@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from app.ai_detection.history_db import insert_ai_detection_history
+from app.ai_detection.services.history_db import insert_ai_detection_history
 
 MODE_RULE_CHECKS = "rule_checks"
 MODE_RULE_PIXEL_OVERLAP = "rule_pixel_overlap"

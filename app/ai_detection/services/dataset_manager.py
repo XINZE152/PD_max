@@ -12,7 +12,7 @@ import yaml
 from PIL import Image
 
 
-IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
 
 
 @dataclass(frozen=True)
@@ -25,9 +25,8 @@ class DatasetManager:
     """Manage images/ and locate_json/ used by the training pipeline."""
 
     def __init__(self, config_path: str = "config.yaml"):
-        config_file = Path(config_path)
-        if not config_file.is_absolute():
-            config_file = (Path(__file__).resolve().parent / config_file).resolve()
+        from app.ai_detection.runtime.paths import resolve_config_path
+        config_file = resolve_config_path(config_path)
         with open(config_file, "r", encoding="utf-8") as f:
             self.config = yaml.safe_load(f) or {}
         self.base_dir = config_file.parent
@@ -84,13 +83,32 @@ class DatasetManager:
 
     def _image_path(self, filename: str) -> Optional[Path]:
         name = self._safe_name(filename)
-        path = self.image_dir / name
-        if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES:
-            return path
+        candidates = [self.image_dir / name]
+        candidates.extend(self.image_dir / class_name / name for class_name in ("normal", "tampered"))
+        for path in candidates:
+            if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES:
+                return path
         return None
 
+    def _iter_image_paths(self):
+        class_dirs = [self.image_dir / "normal", self.image_dir / "tampered"]
+        if any(directory.is_dir() for directory in class_dirs):
+            for directory in class_dirs:
+                if directory.is_dir():
+                    yield from sorted(
+                        (path for path in directory.iterdir() if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES),
+                        key=lambda path: path.name.lower(),
+                    )
+            return
+        yield from sorted(
+            (path for path in self.image_dir.iterdir() if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES),
+            key=lambda path: path.name.lower(),
+        )
+
     def _json_path_for_stem(self, stem: str) -> Optional[Path]:
-        path = self.json_dir / f"{stem}.json"
+        from app.ai_detection.runtime.paths import legacy_annotation_dir
+
+        path = legacy_annotation_dir(self.json_dir) / f"{stem}.json"
         return path if path.is_file() else None
 
     def _entry_for_path(self, path: Path) -> Optional[Dict[str, Any]]:
@@ -111,7 +129,7 @@ class DatasetManager:
         stem = path.stem
         base_stem = self._base_stem(stem)
         json_path = self._json_path_for_stem(base_stem)
-        label = self.label_for_name(path.name)
+        label = 0 if path.parent.name == "normal" else 1 if path.parent.name == "tampered" else self.label_for_name(path.name)
         return {
             "filename": path.name,
             "stem": stem,
@@ -135,7 +153,7 @@ class DatasetManager:
 
     def list_entries(self, label: Optional[int] = None, include_enhanced: bool = True) -> List[Dict[str, Any]]:
         entries: List[Dict[str, Any]] = []
-        for path in sorted(self.image_dir.iterdir(), key=lambda p: p.name.lower()):
+        for path in self._iter_image_paths():
             entry = self._entry_for_path(path)
             if not entry:
                 continue
@@ -176,24 +194,45 @@ class DatasetManager:
         src = self._image_path(filename)
         if src is None:
             return None
-        if self.label_for_name(src.name) == label_int:
+        current_label = (
+            0 if src.parent.name == "normal"
+            else 1 if src.parent.name == "tampered"
+            else self.label_for_name(src.name)
+        )
+        if current_label == label_int:
             return self._entry_for_path(src)
 
         base_stem = self._base_stem(src.stem)
         image_moves = []
-        for candidate in self.image_dir.iterdir():
-            if (
-                candidate.is_file()
-                and candidate.suffix.lower() in IMAGE_SUFFIXES
-                and self._base_stem(candidate.stem) == base_stem
-            ):
-                target = candidate.with_name(f"{self._retag_stem(candidate.stem, label_int)}{candidate.suffix}")
-                image_moves.append((candidate, target))
+        existing_class_dirs = [
+            self.image_dir / class_name
+            for class_name in ("normal", "tampered")
+        ]
+        canonical_layout = any(directory.is_dir() for directory in existing_class_dirs)
+        family_paths = [
+            candidate
+            for candidate in self._iter_image_paths()
+            if self._base_stem(candidate.stem) == base_stem
+        ]
+        target_dir = (
+            self.image_dir / ("normal" if label_int == 0 else "tampered")
+            if canonical_layout or src.parent != self.image_dir
+            else self.image_dir
+        )
+        target_dir.mkdir(parents=True, exist_ok=True)
+        for candidate in family_paths:
+            target = target_dir / f"{self._retag_stem(candidate.stem, label_int)}{candidate.suffix}"
+            image_moves.append((candidate, target))
+
+        if not image_moves:
+            return None
 
         json_moves = []
         old_json = self._json_path_for_stem(base_stem)
         if old_json is not None:
-            json_moves.append((old_json, self.json_dir / f"{self._retag_stem(base_stem, label_int)}.json"))
+            from app.ai_detection.runtime.paths import legacy_annotation_dir
+
+            json_moves.append((old_json, legacy_annotation_dir(self.json_dir) / f"{self._retag_stem(base_stem, label_int)}.json"))
 
         for _old, new in image_moves + json_moves:
             if new.exists():
@@ -217,13 +256,8 @@ class DatasetManager:
         targets = [path]
         base_stem = self._base_stem(path.stem)
         if delete_family:
-            for candidate in self.image_dir.iterdir():
-                if (
-                    candidate.is_file()
-                    and candidate.suffix.lower() in IMAGE_SUFFIXES
-                    and self._base_stem(candidate.stem) == base_stem
-                    and candidate not in targets
-                ):
+            for candidate in self._iter_image_paths():
+                if self._base_stem(candidate.stem) == base_stem and candidate not in targets:
                     targets.append(candidate)
         removed = False
         for target in targets:

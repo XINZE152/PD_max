@@ -17,7 +17,7 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 from app.ai_detection.core.utils import load_chinese_font
-from app.ai_detection.history_db import (
+from app.ai_detection.services.history_db import (
     HISTORY_IMAGES_DIR,
     HISTORY_RETENTION_DAYS,
     get_ai_detection_history_image_path,
@@ -26,7 +26,7 @@ from app.ai_detection.history_db import (
 )
 from app.config import UPLOAD_DIR
 
-from app.ai_detection.rule_check_display import derive_rule_check_status
+from app.ai_detection.services.rule_check_display import derive_rule_check_status
 
 logger = logging.getLogger(__name__)
 

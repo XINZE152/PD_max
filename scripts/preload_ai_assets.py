@@ -8,9 +8,9 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from app.ai_detection.easyocr_download_patch import patch_easyocr_download
-from app.ai_detection.inference_api import InferenceEngineAPI
-from app.ai_detection.runtime_assets import (
+from app.ai_detection.runtime.easyocr_download_patch import patch_easyocr_download
+from app.ai_detection.workflows.inference_v3 import InferenceEngineAPI
+from app.ai_detection.runtime.assets import (
     EASYOCR_DOWNLOAD_ENABLED,
     EASYOCR_MODEL_DIR,
     TORCH_HOME_DIR,

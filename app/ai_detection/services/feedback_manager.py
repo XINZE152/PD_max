@@ -17,7 +17,7 @@ import cv2
 import numpy as np
 import yaml
 
-from app.ai_detection.reviewed_dataset import (
+from app.ai_detection.services.reviewed_dataset import (
     ReviewedDatasetManager,
     normalize_display_filename,
 )
@@ -31,9 +31,8 @@ class FeedbackManager:
     """管理用户对检测结果的标注反馈。"""
 
     def __init__(self, config_path: str = "config.yaml"):
-        config_file = Path(config_path)
-        if not config_file.is_absolute():
-            config_file = (Path(__file__).resolve().parent / config_file).resolve()
+        from app.ai_detection.runtime.paths import resolve_config_path
+        config_file = resolve_config_path(config_path)
         with open(config_file, "r", encoding="utf-8") as f:
             self.config = yaml.safe_load(f)
 
@@ -282,6 +281,7 @@ class FeedbackManager:
                     "second_reviewed_at": source.get("reviewed_at"),
                     "second_reviewer": source.get("reviewer"),
                     "second_review_note": source.get("note", ""),
+                    "second_review_regions": record.get("regions") or [],
                 }
             )
             self._write_metadata(metadata_path, metadata)
@@ -301,6 +301,7 @@ class FeedbackManager:
         label: int,
         reviewer: str,
         note: str = "",
+        regions: Optional[List[Dict[str, Any]]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Apply an explicit truth label and link the feedback to reviewed training data."""
         folder = self._find_entry_folder(entry_folder)
@@ -321,6 +322,7 @@ class FeedbackManager:
                     int(label),
                     reviewer=reviewer,
                     note=note,
+                    regions=regions,
                 )
 
         record = self.reviewed.add_review(
@@ -334,9 +336,11 @@ class FeedbackManager:
                 "initial_reviewer": metadata.get("initial_reviewer"),
                 "initial_timestamp": metadata.get("timestamp"),
                 "engine_result": metadata.get("engine_result"),
+                "regions": regions or [],
             },
             reviewer=reviewer,
             note=note,
+            regions=regions,
         )
         self._sync_review_links(record)
         return self._read_entry(folder)
@@ -372,6 +376,7 @@ class FeedbackManager:
             "second_reviewed_at",
             "second_reviewer",
             "second_review_note",
+            "second_review_regions",
         ):
             metadata.pop(key, None)
         metadata.update(
@@ -400,6 +405,7 @@ class FeedbackManager:
             "second_reviewed_at",
             "second_reviewer",
             "second_review_note",
+            "second_review_regions",
         ):
             metadata.pop(key, None)
         metadata.update(
@@ -417,6 +423,7 @@ class FeedbackManager:
         *,
         original_filename: Optional[str] = None,
         label: Optional[int] = None,
+        regions: Optional[List[Dict[str, Any]]] = None,
         reviewer: str,
         note: str = "",
     ) -> Dict[str, Any]:
@@ -424,6 +431,7 @@ class FeedbackManager:
             sample_id,
             original_filename=original_filename,
             label=label,
+            regions=regions,
             reviewer=reviewer,
             note=note,
         )

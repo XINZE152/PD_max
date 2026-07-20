@@ -1,7 +1,7 @@
 import os
 
 import app.config  # noqa: F401 — 先加载项目根 .env，再读 PORT 等变量
-from app.ai_detection.resource_limits import apply_ai_detection_resource_defaults
+from app.ai_detection.runtime.resource_limits import apply_ai_detection_resource_defaults
 
 apply_ai_detection_resource_defaults()
 

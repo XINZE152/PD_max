@@ -10,6 +10,13 @@ dataset:
   image_dir: "images"
   json_dir: "locate_json"
 
+training:
+  feature_config_version: "global-v2"
+  output_dir: "models/versions"
+  feature_cache_dir: "models/cache/v3_global"
+  evaluation_dir: "models/evaluations/v3"
+  visualization_enabled: true
+
 # 【新增】业务规则与几何参数
 business_rules:
   roi_expand_margin: 15          # 局部微观分析时的外扩像素边距
@@ -46,7 +53,8 @@ thresholds:
   exempt_pixel_safe: 0.40        # 非核心字段的像素风险 < 此值，直接豁免清零
 
   suspect_high: 0.65             # 综合风险率 > 此值，最终定性为“篡改”
-  suspect_low: 0.50              # 综合风险率 > 此值，最终定性为“可疑”
+  suspect_low: 0.55              # 综合风险率 > 此值，最终定性为“可疑”
+  strong_global_tamper: 0.65     # 高置信全局模型风险可直接判篡改
 
   timestamp_mismatch_risk: 0.58  # 时间不一致时的风险分
   timestamp_future_risk: 0.72    # 未来时间时的风险分

@@ -1,0 +1,27 @@
+{
+  "version": "20260717_193825",
+  "created_at": "2026-07-17T19:38:49",
+  "feature_config_version": "global-v2",
+  "artifacts": [
+    {
+      "filename": "font_lib.index",
+      "size_bytes": 200749,
+      "sha256": "a3a2cdb691f44346a47cad6a9e857e5841dee031fd0214ea91409a0c2340c719"
+    },
+    {
+      "filename": "font_lib_meta.pkl",
+      "size_bytes": 470,
+      "sha256": "2e46c0c3084f09a92376bf683973ca31aec247ae5c5993fd70999a45f0b1d176"
+    },
+    {
+      "filename": "global_layout_model.pkl",
+      "size_bytes": 918804,
+      "sha256": "d368f1733fe6b92d7c782f06c7f7f597862de19641a09bafce3a8cbc6391ad95"
+    },
+    {
+      "filename": "normal_reference_index.json",
+      "size_bytes": 4670,
+      "sha256": "3d630eb394a2851c2ec9c793c4a92767d575e96f5ab46b2ab5d33ed69daf0f0e"
+    }
+  ]
+}

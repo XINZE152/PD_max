@@ -15,7 +15,7 @@ from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -28,20 +28,20 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.ai_detection.amount_candidates import (
+from app.ai_detection.core.amount_candidates import (
     build_amount_candidates,
     detect_certificate_document_override,
 )
-from app.ai_detection.resource_limits import configure_loaded_cv2, trim_native_memory
+from app.ai_detection.runtime.resource_limits import configure_loaded_cv2, trim_native_memory
 from app.config import AI_RULE_CHECK_PERSIST, AI_RULE_CHECK_STORE_IMAGE, UPLOAD_DIR
-from app.ai_detection.easyocr_download_patch import patch_easyocr_download
-from app.ai_detection.history_export import (
+from app.ai_detection.runtime.easyocr_download_patch import patch_easyocr_download
+from app.ai_detection.services.history_export import (
     EXPORT_MAX_RECORDS,
     build_export_zip,
     preview_export,
     render_annotated_jpeg,
 )
-from app.ai_detection.history_db import (
+from app.ai_detection.services.history_db import (
     HISTORY_RETENTION_DAYS,
     clear_feedback_status,
     delete_ai_detection_history,
@@ -57,9 +57,9 @@ from app.ai_detection.history_db import (
     normalize_history_original_filename,
     purge_ai_detection_history_older_than,
 )
-from app.ai_detection.ocr_utils import build_key_field_rois_from_tokens, run_full_image_ocr
-from app.ai_detection.rule_check_display import build_rule_check_public_summary
-from app.ai_detection.rule_check_history import (
+from app.ai_detection.core.ocr_utils import build_key_field_rois_from_tokens, run_full_image_ocr
+from app.ai_detection.services.rule_check_display import build_rule_check_public_summary
+from app.ai_detection.services.rule_check_history import (
     MODE_RULE_CHECKS,
     MODE_RULE_PIXEL_OVERLAP,
     MODE_RULE_TIMESTAMP,
@@ -69,23 +69,23 @@ from app.ai_detection.rule_check_history import (
     build_timestamp_outcome,
     persist_rule_check_history,
 )
-from app.ai_detection.rule_check_service import (
+from app.ai_detection.services.rule_check_service import (
     merge_pixel_overlap_results,
     run_pixel_overlap_check,
     run_rule_checks,
     run_timestamp_check,
 )
-from app.ai_detection.runtime_assets import get_easyocr_reader_kwargs
-from app.ai_detection.upload_storage import (
+from app.ai_detection.runtime.assets import get_easyocr_reader_kwargs
+from app.ai_detection.services.upload_storage import (
     ImageTooLargeError,
     UnsupportedImageTypeError,
     save_original_image,
 )
-from app.ai_detection.review_audit import insert_review_audit
+from app.ai_detection.services.review_audit import insert_review_audit
 from app.services.user_service import decode_access_token
 
 if TYPE_CHECKING:
-    from app.ai_detection.inference_api import InferenceEngineAPI
+    from app.ai_detection.workflows.inference_v3 import InferenceEngineAPI
 
 configure_loaded_cv2()
 
@@ -545,7 +545,7 @@ async def ensure_ai_detection_runtime() -> None:
             device == "cuda",
         )
         EngineContainer.ocr_reader = ocr_reader
-        from app.ai_detection.inference_api import InferenceEngineAPI
+        from app.ai_detection.workflows.inference_v3 import InferenceEngineAPI
 
         def _build_engine() -> InferenceEngineAPI:
             # 与 FeatureExtractor 共用同一 EasyOCR，避免双份检测模型常驻（原先可占数百 MB～1GB+）
@@ -764,143 +764,6 @@ async def _persist_upload_task(
     except Exception:
         artifact.path.unlink(missing_ok=True)
         raise
-    task = await registry.get_task(task_id)
-    if not task:
-        raise HTTPException(status_code=500, detail="任务创建失败")
-    return task
-
-
-def _task_sidecar_path(task_id: str) -> Path:
-    return STORAGE_DIR / f"{task_id}.json"
-
-
-def _default_batch_id() -> str:
-    return datetime.now().strftime("%Y%m%d%H%M%S")
-
-
-def _normalized_batch(batch: Optional[str]) -> str:
-    raw = str(batch or "").strip()
-    return raw or _default_batch_id()
-
-
-def _write_json_atomic(path: Path, payload: Dict[str, Any]) -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
-
-
-def _read_task_sidecar(task_id: str) -> Optional[Dict[str, Any]]:
-    path = _task_sidecar_path(task_id)
-    if not path.is_file():
-        return None
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except (OSError, json.JSONDecodeError):
-        logger.exception("Read AI detection task sidecar failed task=%s", task_id)
-        return None
-    return data if isinstance(data, dict) else None
-
-
-def _write_task_sidecar(task: TaskRecordDTO) -> None:
-    if not task.image_path:
-        return
-    payload = {
-        "task_id": task.task_id,
-        "status": task.status.value if isinstance(task.status, TaskStatusEnum) else str(task.status),
-        "created_at": task.created_at,
-        "image_path": task.image_path,
-        "original_filename": task.original_filename,
-        "image_created_at": task.image_created_at,
-        "batch": task.batch,
-        "uploaded_at": datetime.now().isoformat(),
-    }
-    try:
-        _write_json_atomic(_task_sidecar_path(task.task_id), payload)
-    except OSError:
-        logger.exception("Write AI detection task sidecar failed task=%s", task.task_id)
-
-
-def _task_record_from_sidecar(task_id: str) -> Optional[TaskRecordDTO]:
-    meta = _read_task_sidecar(task_id)
-    if not meta:
-        return None
-    image_path = str(meta.get("image_path") or _storage_image_path(task_id))
-    if not Path(image_path).is_file():
-        return None
-    status_raw = str(meta.get("status") or TaskStatusEnum.UPLOADED.value).upper()
-    status = TaskStatusEnum.UPLOADED
-    if status_raw in TaskStatusEnum.__members__:
-        status = TaskStatusEnum[status_raw]
-    elif status_raw in {item.value for item in TaskStatusEnum}:
-        status = TaskStatusEnum(status_raw)
-    return TaskRecordDTO(
-        task_id=task_id,
-        status=status,
-        created_at=str(meta.get("created_at") or datetime.now().isoformat()),
-        image_path=image_path,
-        original_filename=normalize_history_original_filename(
-            str(meta.get("original_filename") or ""),
-            fallback_path=image_path,
-        ),
-        image_created_at=str(meta.get("image_created_at") or "") or None,
-        batch=str(meta.get("batch") or "") or None,
-    )
-
-
-def _storage_task_id_for_file(path: Path) -> Optional[str]:
-    name = path.name
-    if name.startswith("vis_") and name.lower().endswith(".jpg"):
-        return name[4:-4] or None
-    if path.suffix.lower() in {".jpg", ".jpeg", ".png", ".json"}:
-        return path.stem or None
-    if name.endswith(".json.tmp"):
-        return name[:-9] or None
-    return None
-
-
-def _cleanup_expired_storage_files(active_task_ids: set[str]) -> int:
-    """Remove stale upload sidecars/images that are no longer tracked in memory."""
-    if not STORAGE_DIR.is_dir():
-        return 0
-    cutoff = time.time() - max(1, GC_MAX_AGE_HOURS) * 3600
-    removed = 0
-    for path in STORAGE_DIR.iterdir():
-        if not path.is_file():
-            continue
-        task_id = _storage_task_id_for_file(path)
-        if not task_id or task_id in active_task_ids:
-            continue
-        try:
-            if path.stat().st_mtime > cutoff:
-                continue
-            path.unlink()
-            removed += 1
-        except OSError as exc:
-            logger.warning("删除过期鉴伪暂存文件失败 %s: %s", path, exc)
-    return removed
-
-
-async def _persist_upload_task(
-    *,
-    file: UploadFile,
-    registry: AbstractTaskRegistry,
-    image_created_at: Optional[str],
-    batch: Optional[str],
-) -> TaskRecordDTO:
-    task_id = str(uuid.uuid4())
-    batch_id = _normalized_batch(batch)
-    file_path = _storage_image_path(task_id)
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-    await registry.create_task(
-        task_id,
-        str(file_path),
-        original_filename=file.filename,
-        image_created_at=image_created_at,
-        batch=batch_id,
-    )
     task = await registry.get_task(task_id)
     if not task:
         raise HTTPException(status_code=500, detail="任务创建失败")
@@ -1223,7 +1086,7 @@ class RuleCheckService:
         """FORGEGUARD_REPLACE_RULE_CHECKS=1 时，将规则检测请求转发到 ForgeGuard。"""
         import requests as _requests
 
-        from app.ai_detection.forgeguard_client import (
+        from app.ai_detection.services.forgeguard_client import (
             FORGEGUARD_BASE_URL,
             forgeguard_detect,
             forgeguard_verify,
@@ -1892,68 +1755,8 @@ class DetectionDomainServiceV3:
         }
 
     def _visual_document_override(self) -> Optional[Dict[str, Any]]:
-        """Fallback for transfer certificates when OCR cannot locate key fields."""
-        img = self._cached_img_cv2
-        if img is None or img.size == 0:
-            return None
-        image_h, image_w = img.shape[:2]
-        if image_h * image_w < 500_000:
-            return None
-
-        scale = min(1.0, 1000.0 / float(max(image_h, image_w)))
-        small = (
-            cv2.resize(
-                img,
-                (max(1, int(image_w * scale)), max(1, int(image_h * scale))),
-                interpolation=cv2.INTER_AREA,
-            )
-            if scale < 1.0
-            else img
-        )
-        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-        binary = cv2.adaptiveThreshold(
-            gray,
-            255,
-            cv2.ADAPTIVE_THRESH_MEAN_C,
-            cv2.THRESH_BINARY_INV,
-            35,
-            12,
-        )
-
-        sh, sw = gray.shape[:2]
-        h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(24, sw // 8), 1))
-        v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(18, sh // 18)))
-        h_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, h_kernel)
-        v_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, v_kernel)
-        table_ratio = float((np.count_nonzero(h_lines) + np.count_nonzero(v_lines)) / max(1, sh * sw))
-
-        hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
-        red1 = cv2.inRange(hsv, (0, 45, 40), (12, 255, 255))
-        red2 = cv2.inRange(hsv, (165, 45, 40), (180, 255, 255))
-        red_ratio = float(np.count_nonzero(red1 | red2) / max(1, sh * sw))
-
-        if table_ratio < 0.010 or red_ratio < 0.0015:
-            return None
-
-        x1 = int(image_w * 0.07)
-        y1 = int(image_h * 0.16)
-        x2 = int(image_w * 0.92)
-        y2 = int(image_h * 0.56)
-        return {
-            "result": "篡改",
-            "confidence": 0.86,
-            "reason": "电子凭证存在红章表格结构，OCR无法稳定定位关键字段，按高风险篡改处理",
-            "bbox": self._xyxy_to_xywh([x1, y1, x2, y2]),
-            "original_bbox": [x1, y1, x2, y2],
-            "region_no": 1,
-            "field_type": "document",
-            "field_label": "电子凭证",
-            "source": "large_document_visual_override",
-            "visual_flags": {
-                "table_ratio": round(table_ratio, 4),
-                "red_ratio": round(red_ratio, 4),
-            },
-        }
+        """Do not infer tampering from document layout when key OCR fields are absent."""
+        return None
 
     async def _run_linked_rule_checks(
         self,
@@ -2145,21 +1948,6 @@ class DetectionDomainServiceV3:
             bboxes = self._deduplicate_bboxes(bboxes)
 
             if not bboxes:
-                visual_override = await run_in_threadpool(self._visual_document_override)
-                if visual_override:
-                    await self._finalize_completed_task(
-                        task_id,
-                        image_path,
-                        original_filename=history_filename,
-                        bbox=None,
-                        result=visual_override,
-                        multi_results=[visual_override],
-                        persist_bbox={"auto_ocr": True, "note": "large_document_visual_override"},
-                        image_created_at=image_created_at,
-                        batch=batch,
-                    )
-                    return
-
                 empty_res = {
                     "result": "无法自动检测",
                     "confidence": 0.0,
@@ -2909,7 +2697,7 @@ class HistoryExportRequest(BaseModel):
 
 
 def _parse_history_export_request(req: HistoryExportRequest) -> HistoryExportRequest:
-    from app.ai_detection.history_db import HISTORY_RETENTION_DAYS
+    from app.ai_detection.services.history_db import HISTORY_RETENTION_DAYS
 
     if req.retention_days is None:
         if req.start_time is None and req.end_time is None:
@@ -3326,15 +3114,25 @@ class FeedbackUpdateRequest(BaseModel):
     original_filename: Optional[str] = Field(None, max_length=512)
 
 
+class ReviewRegionRequest(BaseModel):
+    field_type: Literal["amount", "name", "time"]
+    x1: float = Field(..., ge=0.0, le=1.0)
+    y1: float = Field(..., ge=0.0, le=1.0)
+    x2: float = Field(..., ge=0.0, le=1.0)
+    y2: float = Field(..., ge=0.0, le=1.0)
+
+
 class FeedbackReviewRequest(BaseModel):
     label: int = Field(..., ge=0, le=1, description="真实标签：0=正常，1=篡改")
     note: str = ""
+    regions: List[ReviewRegionRequest] = Field(default_factory=list)
 
 
 class ReviewedDatasetUpdateRequest(BaseModel):
     original_filename: Optional[str] = Field(None, max_length=512)
     label: Optional[int] = Field(None, ge=0, le=1)
     note: str = ""
+    regions: Optional[List[ReviewRegionRequest]] = None
 
 
 class DatasetUpdateRequest(BaseModel):
@@ -3370,7 +3168,7 @@ async def submit_judgment(
     registry: AbstractTaskRegistry = Depends(get_registry),
     current_user: Optional[Dict[str, Any]] = Depends(_optional_ai_user),
 ):
-    from app.ai_detection.feedback_manager import FeedbackManager
+    from app.ai_detection.services.feedback_manager import FeedbackManager
 
     # 检查是否已标注（一个检测任务只允许标注一次）
     existing_status = await run_in_threadpool(get_feedback_status, req.task_id)
@@ -3445,7 +3243,7 @@ async def list_feedback(
     judgment: Optional[str] = Query(None, pattern="^(correct|wrong|suspicious)$"),
     review_status: Optional[str] = Query(None, pattern="^(pending|reviewed|all)$"),
 ):
-    from app.ai_detection.feedback_manager import FeedbackManager
+    from app.ai_detection.services.feedback_manager import FeedbackManager
 
     fb = FeedbackManager()
     entries = fb.list_entries(judgment_filter=judgment, review_filter=review_status)
@@ -3458,7 +3256,7 @@ async def list_feedback(
     description="按反馈条目文件夹名返回元数据、AI 原始结果、图片访问地址等。",
 )
 async def get_feedback_detail(folder_name: str):
-    from app.ai_detection.feedback_manager import FeedbackManager
+    from app.ai_detection.services.feedback_manager import FeedbackManager
 
     fb = FeedbackManager()
     entry = fb.get_entry(folder_name)
@@ -3473,7 +3271,7 @@ async def get_feedback_detail(folder_name: str):
     response_class=FileResponse,
 )
 async def get_feedback_image(folder_name: str):
-    from app.ai_detection.feedback_manager import FeedbackManager
+    from app.ai_detection.services.feedback_manager import FeedbackManager
 
     fb = FeedbackManager()
     path = fb.get_entry_file(folder_name, "image")
@@ -3489,7 +3287,7 @@ async def get_feedback_image(folder_name: str):
     response_class=FileResponse,
 )
 async def get_feedback_roi(folder_name: str):
-    from app.ai_detection.feedback_manager import FeedbackManager
+    from app.ai_detection.services.feedback_manager import FeedbackManager
 
     fb = FeedbackManager()
     path = fb.get_entry_file(folder_name, "roi")
@@ -3508,7 +3306,7 @@ async def update_feedback(
     req: FeedbackUpdateRequest,
     current_user: Optional[Dict[str, Any]] = Depends(_optional_ai_user),
 ):
-    from app.ai_detection.feedback_manager import FeedbackManager
+    from app.ai_detection.services.feedback_manager import FeedbackManager
 
     if req.original_filename is not None:
         if not current_user:
@@ -3543,7 +3341,7 @@ async def update_feedback(
     summary="删除/撤销反馈标注",
 )
 async def delete_feedback(folder_name: str):
-    from app.ai_detection.feedback_manager import FeedbackEntryReviewedError, FeedbackManager
+    from app.ai_detection.services.feedback_manager import FeedbackEntryReviewedError, FeedbackManager
 
     fb = FeedbackManager()
     # 删除前先获取 task_id
@@ -3575,7 +3373,7 @@ async def delete_feedback(folder_name: str):
     ),
 )
 async def confirm_suspicious(folder_name: str = Form(...), judgment: str = Form(..., pattern="^(correct|wrong)$")):
-    from app.ai_detection.feedback_manager import FeedbackManager
+    from app.ai_detection.services.feedback_manager import FeedbackManager
 
     fb = FeedbackManager()
     entry = fb.confirm_suspicious(folder_name, judgment)
@@ -3597,8 +3395,8 @@ async def review_feedback(
     req: FeedbackReviewRequest,
     admin: Dict[str, Any] = Depends(_require_ai_admin),
 ):
-    from app.ai_detection.feedback_manager import FeedbackManager
-    from app.ai_detection.reviewed_dataset import ReviewedDatasetConflict
+    from app.ai_detection.services.feedback_manager import FeedbackManager
+    from app.ai_detection.services.reviewed_dataset import ReviewedDatasetConflict, ReviewRegionRequired
 
     manager = FeedbackManager()
     before = manager.get_entry(folder_name)
@@ -3615,12 +3413,13 @@ async def review_feedback(
                 label=req.label,
                 reviewer=_actor_name(admin),
                 note=req.note,
+                regions=[region.model_dump() for region in req.regions],
             )
         )
-    except ReviewedDatasetConflict as exc:
+    except (ReviewedDatasetConflict, ReviewRegionRequired, ValueError) as exc:
         raise HTTPException(
-            409,
-            detail={"code": exc.code, "message": str(exc)},
+            422 if isinstance(exc, (ReviewRegionRequired, ValueError)) else 409,
+            detail={"code": getattr(exc, "code", "REVIEW_REGION_INVALID"), "message": str(exc)},
         ) from exc
     if not entry:
         raise HTTPException(
@@ -3652,8 +3451,8 @@ async def revoke_feedback_review(
     note: str = Query("", max_length=2000),
     admin: Dict[str, Any] = Depends(_require_ai_admin),
 ):
-    from app.ai_detection.feedback_manager import FeedbackManager
-    from app.ai_detection.reviewed_dataset import ReviewedDatasetNotFound
+    from app.ai_detection.services.feedback_manager import FeedbackManager
+    from app.ai_detection.services.reviewed_dataset import ReviewedDatasetNotFound
 
     manager = FeedbackManager()
     before = manager.get_entry(folder_name)
@@ -3704,7 +3503,7 @@ async def list_reviewed_dataset(
     page_size: int = Query(50, ge=1, le=200),
     label: Optional[int] = Query(None, ge=0, le=1),
 ):
-    from app.ai_detection.feedback_manager import FeedbackManager
+    from app.ai_detection.services.feedback_manager import FeedbackManager
 
     manager = FeedbackManager().reviewed
     data = await run_in_threadpool(
@@ -3723,7 +3522,7 @@ async def list_reviewed_dataset(
     response_class=FileResponse,
 )
 async def get_reviewed_dataset_image(sample_id: str):
-    from app.ai_detection.feedback_manager import FeedbackManager
+    from app.ai_detection.services.feedback_manager import FeedbackManager
 
     path = await run_in_threadpool(FeedbackManager().reviewed.image_path, sample_id)
     if path is None:
@@ -3745,10 +3544,11 @@ async def update_reviewed_dataset(
     req: ReviewedDatasetUpdateRequest,
     admin: Dict[str, Any] = Depends(_require_ai_admin),
 ):
-    from app.ai_detection.feedback_manager import FeedbackManager
-    from app.ai_detection.reviewed_dataset import (
+    from app.ai_detection.services.feedback_manager import FeedbackManager
+    from app.ai_detection.services.reviewed_dataset import (
         ReviewedDatasetConflict,
         ReviewedDatasetNotFound,
+        ReviewRegionRequired,
     )
 
     manager = FeedbackManager()
@@ -3762,6 +3562,7 @@ async def update_reviewed_dataset(
                 sample_id,
                 original_filename=req.original_filename,
                 label=req.label,
+                regions=[region.model_dump() for region in req.regions] if req.regions is not None else None,
                 reviewer=_actor_name(admin),
                 note=req.note,
             )
@@ -3770,6 +3571,11 @@ async def update_reviewed_dataset(
         raise HTTPException(404, detail={"code": exc.code, "message": str(exc)}) from exc
     except ReviewedDatasetConflict as exc:
         raise HTTPException(409, detail={"code": exc.code, "message": str(exc)}) from exc
+    except (ReviewRegionRequired, ValueError) as exc:
+        raise HTTPException(
+            422,
+            detail={"code": getattr(exc, "code", "REVIEW_REGION_INVALID"), "message": str(exc)},
+        ) from exc
     await run_in_threadpool(
         partial(
             insert_review_audit,
@@ -3795,7 +3601,7 @@ async def delete_reviewed_dataset(
     note: str = Query("", max_length=2000),
     admin: Dict[str, Any] = Depends(_require_ai_admin),
 ):
-    from app.ai_detection.feedback_manager import FeedbackManager
+    from app.ai_detection.services.feedback_manager import FeedbackManager
 
     manager = FeedbackManager()
     before = manager.reviewed.get_entry(sample_id)
@@ -3836,7 +3642,7 @@ async def list_training_dataset(
     label: Optional[int] = Query(None, ge=0, le=1, description="可选。0=正常，1=篡改"),
     include_enhanced: bool = Query(True, description="是否包含 *_enhanced 增强样本"),
 ):
-    from app.ai_detection.dataset_manager import DatasetManager
+    from app.ai_detection.services.dataset_manager import DatasetManager
 
     manager = DatasetManager()
     entries = await run_in_threadpool(manager.list_entries, label, include_enhanced)
@@ -3854,7 +3660,7 @@ async def list_training_dataset(
     response_class=FileResponse,
 )
 async def get_training_dataset_image(filename: str):
-    from app.ai_detection.dataset_manager import DatasetManager
+    from app.ai_detection.services.dataset_manager import DatasetManager
 
     manager = DatasetManager()
     path = await run_in_threadpool(manager.get_image_file, filename)
@@ -3868,7 +3674,7 @@ async def get_training_dataset_image(filename: str):
     summary="获取训练集样本区域标注 JSON",
 )
 async def get_training_dataset_annotation(filename: str):
-    from app.ai_detection.dataset_manager import DatasetManager
+    from app.ai_detection.services.dataset_manager import DatasetManager
 
     manager = DatasetManager()
     annotation = await run_in_threadpool(manager.get_annotation, filename)
@@ -3887,7 +3693,7 @@ async def update_training_dataset_entry(
     req: DatasetUpdateRequest,
     admin: Dict[str, Any] = Depends(_require_ai_admin),
 ):
-    from app.ai_detection.dataset_manager import DatasetManager
+    from app.ai_detection.services.dataset_manager import DatasetManager
 
     manager = DatasetManager()
     try:
@@ -3918,7 +3724,7 @@ async def delete_training_dataset_entry(
     delete_family: bool = Query(True, description="是否同时删除同一基础样本的增强图和 JSON 标注"),
     admin: Dict[str, Any] = Depends(_require_ai_admin),
 ):
-    from app.ai_detection.dataset_manager import DatasetManager
+    from app.ai_detection.services.dataset_manager import DatasetManager
 
     manager = DatasetManager()
     removed = await run_in_threadpool(manager.delete_entry, filename, delete_family)
@@ -3938,7 +3744,7 @@ async def delete_training_dataset_entry(
 # ---- 训练端点 (含风险提示) ----
 
 def _training_job_store():
-    from app.ai_detection.training_jobs import TrainingJobStore
+    from app.ai_detection.services.training_jobs import TrainingJobStore
 
     cfg = _read_model_config()
     training = cfg.get("training") if isinstance(cfg.get("training"), dict) else {}
@@ -3947,7 +3753,7 @@ def _training_job_store():
 
 
 def _model_registry_manager():
-    from app.ai_detection.model_registry import ModelRegistry
+    from app.ai_detection.services.model_registry import ModelRegistry
 
     cfg = _read_model_config()
     paths = cfg.get("paths") if isinstance(cfg.get("paths"), dict) else {}
@@ -3957,12 +3763,55 @@ def _model_registry_manager():
     return ModelRegistry(registry_path, fallback_model_path=fallback)
 
 
+def _v3_holdout_metrics(predictions: Sequence[Tuple[str, int, str]]) -> Dict[str, Any]:
+    labels = [int(label) for _path, label, _actual in predictions]
+    if not labels or len(set(labels)) < 2:
+        return {
+            "available": False,
+            "balanced_accuracy": None,
+            "normal_recall": None,
+            "tampered_recall": None,
+            "confusion_matrix": None,
+        }
+    normal_total = sum(label == 0 for label in labels)
+    tampered_total = sum(label == 1 for label in labels)
+    normal_correct = sum(label == 0 and actual == "正常" for _path, label, actual in predictions)
+    tampered_correct = sum(label == 1 and actual == "篡改" for _path, label, actual in predictions)
+    matrix = [[0, 0], [0, 0]]
+    abstained_count = 0
+    for _path, label, actual in predictions:
+        if actual == "正常":
+            predicted = 0
+        elif actual == "篡改":
+            predicted = 1
+        else:
+            predicted = 1 - int(label)
+            abstained_count += 1
+        matrix[int(label)][predicted] += 1
+    normal_recall = normal_correct / max(1, normal_total)
+    tampered_recall = tampered_correct / max(1, tampered_total)
+    return {
+        "available": True,
+        "sample_count": len(predictions),
+        "balanced_accuracy": (normal_recall + tampered_recall) / 2.0,
+        "normal_recall": normal_recall,
+        "tampered_recall": tampered_recall,
+        "confusion_matrix": matrix,
+        "abstained_count": abstained_count,
+    }
+
+
 async def _evaluate_candidate_model(
     version: str,
     engine: "InferenceEngineAPI",
     ocr_reader: Any,
 ) -> Dict[str, Any]:
-    from app.ai_detection.candidate_evaluation import build_candidate_gates, fixed_regression_samples
+    from app.ai_detection.workflows.candidate_evaluation import (
+        build_candidate_gates,
+        fixed_regression_samples,
+        holdout_samples,
+        training_replay_samples,
+    )
 
     registry = _model_registry_manager()
     candidate_model, candidate = await run_in_threadpool(registry.validate_loadable, version)
@@ -3973,10 +3822,15 @@ async def _evaluate_candidate_model(
     config = _read_model_config()
     dataset_cfg = config.get("dataset") if isinstance(config.get("dataset"), dict) else {}
     image_dir = _resolve_model_path(dataset_cfg.get("image_dir", "images"))
-    pptest_dir = _resolve_model_path(dataset_cfg.get("regression_dir", "pptest"))
     predictions = []
+    replay_predictions = []
+    holdout_predictions = []
+    coverage = {"sample_count": 0, "recognized_count": 0}
     old_model = engine.global_model
     old_font_lib = engine.font_lib
+    old_threshold = getattr(engine, "_global_fake_threshold", None)
+    old_threshold_calibrated = getattr(engine, "_has_calibrated_global_threshold", False)
+    old_known_source_matcher = getattr(engine, "_known_source_matcher", None)
     candidate_font_lib = None
     candidate_font_path = str(candidate.get("font_lib_path") or "").strip()
     if candidate_font_path:
@@ -3985,52 +3839,50 @@ async def _evaluate_candidate_model(
         loaded_font_lib = FontFeatureLibrary()
         if loaded_font_lib.load(candidate_font_path):
             candidate_font_lib = loaded_font_lib
-    service = DetectionDomainServiceV3(MemoryTaskRegistry(), asyncio.Semaphore(1))
     try:
         engine.global_model = candidate_model
+        engine._global_fake_threshold = float(candidate.get("global_fake_threshold", old_threshold or 0.65))
+        engine._has_calibrated_global_threshold = "global_fake_threshold" in candidate
+        engine._known_source_matcher = engine._load_known_source_matcher(candidate)
         if candidate_font_lib is not None:
             engine.font_lib = candidate_font_lib
-        for image_path, expected_label in fixed_regression_samples(image_dir, pptest_dir):
-            service._clear_task_cache()
-            await run_in_threadpool(service._run_ocr_once, str(image_path), ocr_reader)
-            bboxes = service._deduplicate_bboxes(service._easyocr_auto_detect(str(image_path)))
-            rows = []
-            if not bboxes:
-                visual_override = await run_in_threadpool(service._visual_document_override)
-                if visual_override:
-                    rows.append(visual_override)
-            for bbox in bboxes:
-                bbox_list = [bbox.x1, bbox.y1, bbox.x2, bbox.y2]
-                raw = await run_in_threadpool(
-                    partial(
-                        engine.predict,
-                        str(image_path),
-                        bbox_list,
-                        "xyxy",
-                        **service._predict_kwargs(),
-                    )
-                )
-                result = json.loads(raw)
-                if result.get("result") != "错误":
-                    rows.append(result)
-            document_override = await run_in_threadpool(
-                service._document_rule_override,
-                str(image_path),
-            )
-            if document_override and not any(item.get("result") == "篡改" for item in rows):
-                rows.append(document_override)
-            top = service._select_top_result(rows)
-            actual = str((top or {}).get("result") or "无法自动检测")
+
+        from app.ai_detection.workflows.v3_evaluation import ProductionV3Evaluator
+
+        evaluator = ProductionV3Evaluator(engine, ocr_reader)
+
+        async def evaluate_one(image_path: Path) -> tuple[str, bool]:
+            result = await run_in_threadpool(evaluator.evaluate_image, image_path)
+            return str(result.get("result") or "无法自动检测"), bool(result.get("roi_count"))
+
+        for image_path, expected_label in fixed_regression_samples(image_dir):
+            actual, _recognized = await evaluate_one(image_path)
             predictions.append((str(image_path), expected_label, actual))
+        for image_path, expected_label in training_replay_samples(image_dir):
+            actual, _recognized = await evaluate_one(image_path)
+            replay_predictions.append((str(image_path), expected_label, actual))
+        for image_path, expected_label in holdout_samples(image_dir):
+            actual, recognized = await evaluate_one(image_path)
+            holdout_predictions.append((str(image_path), expected_label, actual))
+            coverage["sample_count"] += 1
+            coverage["recognized_count"] += int(recognized)
     finally:
         engine.global_model = old_model
         engine.font_lib = old_font_lib
-        service._clear_task_cache()
+        if old_threshold is not None:
+            engine._global_fake_threshold = old_threshold
+        engine._has_calibrated_global_threshold = old_threshold_calibrated
+        engine._known_source_matcher = old_known_source_matcher
 
+    holdout_metrics = _v3_holdout_metrics(holdout_predictions)
+    coverage["coverage"] = coverage["recognized_count"] / max(1, coverage["sample_count"])
     gates = build_candidate_gates(
         regression_predictions=predictions,
         candidate_metrics=candidate.get("evaluation"),
         active_metrics=active_metrics,
+        training_replay_predictions=replay_predictions,
+        holdout_metrics=holdout_metrics,
+        roi_coverage=coverage,
     )
     report = {
         "version": version,
@@ -4039,8 +3891,36 @@ async def _evaluate_candidate_model(
             {"path": path, "expected_label": label, "actual": actual}
             for path, label, actual in predictions
         ],
+        "training_replay_predictions": [
+            {"path": path, "expected_label": label, "actual": actual}
+            for path, label, actual in replay_predictions
+        ],
+        "holdout_predictions": [
+            {"path": path, "expected_label": label, "actual": actual}
+            for path, label, actual in holdout_predictions
+        ],
+        "holdout_metrics": holdout_metrics,
+        "roi_coverage": coverage,
     }
     report_path = candidate.get("report_path")
+    version_dir = Path(str(candidate.get("model_path") or "")).parent
+    reports_dir = version_dir / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    production_report_path = reports_dir / "production_evaluation.json"
+    production_report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    production_report_markdown = [
+        "# v3 Production Candidate Evaluation",
+        "",
+        f"- Version: `{version}`",
+        f"- Gate passed: `{gates.get('passed', False)}`",
+        f"- Holdout ROI coverage: `{coverage['coverage']:.1%}`",
+        f"- Holdout balanced accuracy: `{holdout_metrics.get('balanced_accuracy')}`",
+        f"- Replay failures: `{len(gates.get('training_replay_regression', {}).get('failures', []))}`",
+    ]
+    (reports_dir / "production_evaluation.md").write_text(
+        "\n".join(production_report_markdown) + "\n",
+        encoding="utf-8",
+    )
     if report_path:
         path = Path(str(report_path))
         try:
@@ -4049,6 +3929,13 @@ async def _evaluate_candidate_model(
             existing = {}
         existing["candidate_evaluation"] = report
         path.write_text(json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8")
+    from app.ai_detection.workflows.training_v3 import write_version_manifest
+
+    write_version_manifest(
+        version_dir,
+        version=version,
+        feature_config_version=str(candidate.get("feature_config_version") or "global-v2"),
+    )
     registry.update_candidate(version, gates=gates, evaluation_report=report)
     return gates
 
@@ -4078,7 +3965,7 @@ async def _run_training_job(job_id: str, actor: Dict[str, Any]) -> None:
             if engine is None or ocr_reader is None:
                 raise RuntimeError("AI 检测运行时不可用")
 
-            from app.ai_detection.train_pipeline_v2 import TrainPipeline
+            from app.ai_detection.workflows.training_v3 import TrainPipeline
 
             def progress(current: int, total: int, message: str) -> None:
                 ratio = 0.05 + (0.70 * current / max(1, total))
@@ -4205,7 +4092,7 @@ async def trigger_training(
     ),
 )
 async def get_train_visualization(filename: str):
-    from app.ai_detection.train_pipeline_v2 import TrainPipeline
+    from app.ai_detection.workflows.training_v3 import TrainPipeline
 
     pipeline = TrainPipeline()
     viz_file = pipeline.viz_dir / filename
@@ -4269,7 +4156,7 @@ async def activate_model(
     req: ModelActivateRequest,
     admin: Dict[str, Any] = Depends(_require_ai_admin),
 ):
-    from app.ai_detection.model_registry import ModelActivationError
+    from app.ai_detection.services.model_registry import ModelActivationError
 
     if req.force and not req.reason.strip():
         raise HTTPException(

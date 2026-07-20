@@ -3,7 +3,7 @@ import os
 import time
 
 import app.config as app_config  # noqa: F401 — 加载项目根 .env（副作用）
-from app.ai_detection.resource_limits import apply_ai_detection_resource_defaults
+from app.ai_detection.runtime.resource_limits import apply_ai_detection_resource_defaults
 
 apply_ai_detection_resource_defaults()
 

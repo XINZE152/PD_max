@@ -10,8 +10,8 @@ import yaml
 
 from app.ai_detection.core.detectors import PixelLevelDetector
 from app.ai_detection.core.utils import safe_read_image
-from app.ai_detection.rule_check_roi import find_suggested_rois
-from app.ai_detection.timestamp_checker import check_image_timestamps
+from app.ai_detection.core.rule_check_roi import find_suggested_rois
+from app.ai_detection.core.timestamp_checker import check_image_timestamps
 
 
 def load_rule_check_config(config_path: str = "config.yaml") -> Dict[str, Any]:
