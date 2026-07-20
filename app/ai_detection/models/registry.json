@@ -1,21 +1,2128 @@
 {
   "schema_version": 2,
-  "active_version": "legacy-12d628d8ddde",
+  "active_version": "20260717_193825",
   "versions": [
+    {
+      "version": "20260717_184950",
+      "timestamp": "20260717_184950",
+      "model_path": "/home/ubuntu/var/www/PD_max/app/ai_detection/models/trained/20260717_184950/global_layout_model.pkl",
+      "font_lib_path": "/home/ubuntu/var/www/PD_max/app/ai_detection/models/trained/20260717_184950/font_lib",
+      "train_accuracy": 1.0,
+      "total_samples": 368,
+      "evaluation": {
+        "available": true,
+        "balanced_accuracy": 1.0,
+        "normal_recall": 1.0,
+        "tampered_recall": 1.0,
+        "confusion_matrix": [
+          [
+            9,
+            0
+          ],
+          [
+            0,
+            6
+          ]
+        ],
+        "threshold": 0.51
+      },
+      "active_evaluation": {
+        "available": true,
+        "balanced_accuracy": 0.7777777777777778,
+        "normal_recall": 0.5555555555555556,
+        "tampered_recall": 1.0,
+        "confusion_matrix": [
+          [
+            5,
+            4
+          ],
+          [
+            0,
+            6
+          ]
+        ],
+        "threshold": 0.65
+      },
+      "test_evaluation": {
+        "available": true,
+        "balanced_accuracy": 1.0,
+        "normal_recall": 1.0,
+        "tampered_recall": 1.0,
+        "confusion_matrix": [
+          [
+            8,
+            0
+          ],
+          [
+            0,
+            6
+          ]
+        ],
+        "threshold": 0.51,
+        "sample_count": 14,
+        "paths": [
+          "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/10.png",
+          "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/37.png",
+          "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/22.jpg",
+          "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/43.png",
+          "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/16.png",
+          "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/15.jpg",
+          "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/14.jpg",
+          "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/5.png",
+          "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (16).jpg",
+          "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (43).jpg",
+          "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (41).jpg",
+          "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (12).jpg",
+          "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (15).jpg",
+          "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (8).jpg"
+        ],
+        "predictions": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ],
+        "sample_failures": []
+      },
+      "training_replay_evaluation": {
+        "available": false,
+        "balanced_accuracy": null,
+        "normal_recall": null,
+        "tampered_recall": null,
+        "confusion_matrix": null,
+        "sample_count": 2,
+        "paths": [
+          "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/pptest__ebe78fef76ed__111.png",
+          "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/pptest__21a9066bff6a__92e595cffb63d039f10b271f23b180dd.png"
+        ],
+        "predictions": [
+          1,
+          1
+        ],
+        "sample_failures": []
+      },
+      "global_fake_threshold": 0.51,
+      "source_counts": {
+        "real_certificate": 40,
+        "legacy_normal": 12,
+        "legacy_tampered": 44,
+        "production_tampered": 2
+      },
+      "manifest_path": "/home/ubuntu/var/www/PD_max/app/ai_detection/models/trained/20260717_184950/manifest.json",
+      "report_path": "/home/ubuntu/var/www/PD_max/app/ai_detection/models/trained/20260717_184950/evaluation_report.json",
+      "gates": {
+        "passed": false,
+        "fixed_regression": {
+          "passed": false,
+          "total": 56,
+          "failures": [
+            {
+              "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/no (12).jpg",
+              "expected": "正常",
+              "actual": "篡改"
+            },
+            {
+              "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (43).jpg",
+              "expected": "篡改",
+              "actual": "无法自动检测"
+            },
+            {
+              "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (2).jpg",
+              "expected": "篡改",
+              "actual": "正常"
+            },
+            {
+              "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (14).jpg",
+              "expected": "篡改",
+              "actual": "无法自动检测"
+            },
+            {
+              "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (21).jpg",
+              "expected": "篡改",
+              "actual": "无法自动检测"
+            },
+            {
+              "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (1).jpg",
+              "expected": "篡改",
+              "actual": "无法自动检测"
+            },
+            {
+              "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (29).jpg",
+              "expected": "篡改",
+              "actual": "无法自动检测"
+            },
+            {
+              "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (17).jpg",
+              "expected": "篡改",
+              "actual": "无法自动检测"
+            }
+          ]
+        },
+        "training_replay_regression": {
+          "passed": true,
+          "total": 2,
+          "failures": []
+        },
+        "validation_metrics": {
+          "passed": true,
+          "comparisons": {
+            "balanced_accuracy": {
+              "candidate": 1.0,
+              "active": 0.7777777777777778,
+              "passed": true
+            },
+            "normal_recall": {
+              "candidate": 1.0,
+              "active": 0.5555555555555556,
+              "passed": true
+            },
+            "tampered_recall": {
+              "candidate": 1.0,
+              "active": 1.0,
+              "passed": true
+            }
+          }
+        },
+        "holdout_metrics": {
+          "passed": false,
+          "comparisons": {
+            "balanced_accuracy": {
+              "candidate": 0.9166666666666667,
+              "minimum": 0.9,
+              "passed": true
+            },
+            "normal_recall": {
+              "candidate": 1.0,
+              "minimum": 0.9,
+              "passed": true
+            },
+            "tampered_recall": {
+              "candidate": 0.8333333333333334,
+              "minimum": 0.9,
+              "passed": false
+            }
+          }
+        },
+        "roi_coverage": {
+          "passed": true,
+          "coverage": 0.9285714285714286,
+          "minimum": 0.9,
+          "sample_count": 14,
+          "recognized_count": 13
+        }
+      },
+      "status": "CANDIDATE",
+      "created_at": "2026-07-17T10:50:22+00:00",
+      "model_sha256": "f1667b6333f07e08bd0776874e2e1554a806476994d1b8da48bf4be210212448",
+      "evaluation_report": {
+        "version": "20260717_184950",
+        "gates": {
+          "passed": false,
+          "fixed_regression": {
+            "passed": false,
+            "total": 56,
+            "failures": [
+              {
+                "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/no (12).jpg",
+                "expected": "正常",
+                "actual": "篡改"
+              },
+              {
+                "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (43).jpg",
+                "expected": "篡改",
+                "actual": "无法自动检测"
+              },
+              {
+                "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (2).jpg",
+                "expected": "篡改",
+                "actual": "正常"
+              },
+              {
+                "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (14).jpg",
+                "expected": "篡改",
+                "actual": "无法自动检测"
+              },
+              {
+                "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (21).jpg",
+                "expected": "篡改",
+                "actual": "无法自动检测"
+              },
+              {
+                "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (1).jpg",
+                "expected": "篡改",
+                "actual": "无法自动检测"
+              },
+              {
+                "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (29).jpg",
+                "expected": "篡改",
+                "actual": "无法自动检测"
+              },
+              {
+                "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (17).jpg",
+                "expected": "篡改",
+                "actual": "无法自动检测"
+              }
+            ]
+          },
+          "training_replay_regression": {
+            "passed": true,
+            "total": 2,
+            "failures": []
+          },
+          "validation_metrics": {
+            "passed": true,
+            "comparisons": {
+              "balanced_accuracy": {
+                "candidate": 1.0,
+                "active": 0.7777777777777778,
+                "passed": true
+              },
+              "normal_recall": {
+                "candidate": 1.0,
+                "active": 0.5555555555555556,
+                "passed": true
+              },
+              "tampered_recall": {
+                "candidate": 1.0,
+                "active": 1.0,
+                "passed": true
+              }
+            }
+          },
+          "holdout_metrics": {
+            "passed": false,
+            "comparisons": {
+              "balanced_accuracy": {
+                "candidate": 0.9166666666666667,
+                "minimum": 0.9,
+                "passed": true
+              },
+              "normal_recall": {
+                "candidate": 1.0,
+                "minimum": 0.9,
+                "passed": true
+              },
+              "tampered_recall": {
+                "candidate": 0.8333333333333334,
+                "minimum": 0.9,
+                "passed": false
+              }
+            }
+          },
+          "roi_coverage": {
+            "passed": true,
+            "coverage": 0.9285714285714286,
+            "minimum": 0.9,
+            "sample_count": 14,
+            "recognized_count": 13
+          }
+        },
+        "regression_predictions": [
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/no (10).jpg",
+            "expected_label": 0,
+            "actual": "正常"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/no (9).jpg",
+            "expected_label": 0,
+            "actual": "正常"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/no (3).jpg",
+            "expected_label": 0,
+            "actual": "正常"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/no (2).jpg",
+            "expected_label": 0,
+            "actual": "正常"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/no (11).jpg",
+            "expected_label": 0,
+            "actual": "正常"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/no (4).jpg",
+            "expected_label": 0,
+            "actual": "正常"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/no (8).jpg",
+            "expected_label": 0,
+            "actual": "正常"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/no (12).jpg",
+            "expected_label": 0,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/no (6).jpg",
+            "expected_label": 0,
+            "actual": "正常"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/no (7).jpg",
+            "expected_label": 0,
+            "actual": "正常"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/no (5).jpg",
+            "expected_label": 0,
+            "actual": "正常"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/no (1).jpg",
+            "expected_label": 0,
+            "actual": "正常"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (16).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (43).jpg",
+            "expected_label": 1,
+            "actual": "无法自动检测"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (41).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (12).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (15).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (8).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (37).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (9).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (39).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (11).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (2).jpg",
+            "expected_label": 1,
+            "actual": "正常"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (10).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (32).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (24).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (7).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (36).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (6).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (4).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (26).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (14).jpg",
+            "expected_label": 1,
+            "actual": "无法自动检测"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (13).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (42).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (20).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (23).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (21).jpg",
+            "expected_label": 1,
+            "actual": "无法自动检测"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (27).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (1).jpg",
+            "expected_label": 1,
+            "actual": "无法自动检测"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (28).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (31).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (35).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (5).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (29).jpg",
+            "expected_label": 1,
+            "actual": "无法自动检测"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (30).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (18).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (22).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (17).jpg",
+            "expected_label": 1,
+            "actual": "无法自动检测"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (3).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (25).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (44).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (38).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (33).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (34).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (40).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (19).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          }
+        ],
+        "training_replay_predictions": [
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/pptest__ebe78fef76ed__111.png",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/pptest__21a9066bff6a__92e595cffb63d039f10b271f23b180dd.png",
+            "expected_label": 1,
+            "actual": "篡改"
+          }
+        ],
+        "holdout_predictions": [
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/10.png",
+            "expected_label": 0,
+            "actual": "正常"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/37.png",
+            "expected_label": 0,
+            "actual": "正常"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/22.jpg",
+            "expected_label": 0,
+            "actual": "正常"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/43.png",
+            "expected_label": 0,
+            "actual": "正常"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/16.png",
+            "expected_label": 0,
+            "actual": "正常"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/15.jpg",
+            "expected_label": 0,
+            "actual": "正常"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/14.jpg",
+            "expected_label": 0,
+            "actual": "正常"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/5.png",
+            "expected_label": 0,
+            "actual": "正常"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (16).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (43).jpg",
+            "expected_label": 1,
+            "actual": "无法自动检测"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (41).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (12).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (15).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (8).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          }
+        ],
+        "holdout_metrics": {
+          "available": true,
+          "sample_count": 14,
+          "balanced_accuracy": 0.9166666666666667,
+          "normal_recall": 1.0,
+          "tampered_recall": 0.8333333333333334,
+          "confusion_matrix": [
+            [
+              8,
+              0
+            ],
+            [
+              1,
+              5
+            ]
+          ],
+          "abstained_count": 1
+        },
+        "roi_coverage": {
+          "sample_count": 14,
+          "recognized_count": 13,
+          "coverage": 0.9285714285714286
+        }
+      },
+      "updated_at": "2026-07-17T10:53:39+00:00"
+    },
     {
       "version": "legacy-12d628d8ddde",
       "timestamp": "legacy-12d628d8ddde",
-      "status": "ACTIVE",
+      "status": "INACTIVE",
       "model_path": "/home/ubuntu/var/www/PD_max/app/ai_detection/models/global_layout_model.pkl",
       "model_sha256": "12d628d8dddee0c00835968563a35ca9a9b3984ad7b179a1594c302113c2fd2e",
       "gates": {
         "passed": true,
         "legacy_baseline": true
       },
-      "created_at": "2026-07-14T11:53:04+00:00",
-      "activated_at": "2026-07-14T11:53:04+00:00",
+      "created_at": "2026-07-17T10:52:09+00:00",
+      "activated_at": "2026-07-17T10:52:09+00:00",
       "activated_by": "system-bootstrap"
+    },
+    {
+      "version": "20260717_190636",
+      "timestamp": "20260717_190636",
+      "model_path": "/home/ubuntu/var/www/PD_max/app/ai_detection/models/trained/20260717_190636/global_layout_model.pkl",
+      "font_lib_path": "/home/ubuntu/var/www/PD_max/app/ai_detection/models/trained/20260717_190636/font_lib",
+      "train_accuracy": 1.0,
+      "total_samples": 368,
+      "evaluation": {
+        "available": true,
+        "balanced_accuracy": 1.0,
+        "normal_recall": 1.0,
+        "tampered_recall": 1.0,
+        "confusion_matrix": [
+          [
+            9,
+            0
+          ],
+          [
+            0,
+            6
+          ]
+        ],
+        "threshold": 0.45999999999999996
+      },
+      "active_evaluation": {
+        "available": true,
+        "balanced_accuracy": 0.7777777777777778,
+        "normal_recall": 0.5555555555555556,
+        "tampered_recall": 1.0,
+        "confusion_matrix": [
+          [
+            5,
+            4
+          ],
+          [
+            0,
+            6
+          ]
+        ],
+        "threshold": 0.65
+      },
+      "test_evaluation": {
+        "available": true,
+        "balanced_accuracy": 1.0,
+        "normal_recall": 1.0,
+        "tampered_recall": 1.0,
+        "confusion_matrix": [
+          [
+            8,
+            0
+          ],
+          [
+            0,
+            6
+          ]
+        ],
+        "threshold": 0.45999999999999996,
+        "sample_count": 14,
+        "paths": [
+          "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/10.png",
+          "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/37.png",
+          "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/22.jpg",
+          "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/43.png",
+          "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/16.png",
+          "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/15.jpg",
+          "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/14.jpg",
+          "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/5.png",
+          "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (16).jpg",
+          "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (43).jpg",
+          "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (41).jpg",
+          "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (12).jpg",
+          "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (15).jpg",
+          "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (8).jpg"
+        ],
+        "predictions": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ],
+        "sample_failures": []
+      },
+      "training_replay_evaluation": {
+        "available": false,
+        "balanced_accuracy": null,
+        "normal_recall": null,
+        "tampered_recall": null,
+        "confusion_matrix": null,
+        "sample_count": 2,
+        "paths": [
+          "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/pptest__ebe78fef76ed__111.png",
+          "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/pptest__21a9066bff6a__92e595cffb63d039f10b271f23b180dd.png"
+        ],
+        "predictions": [
+          1,
+          1
+        ],
+        "sample_failures": []
+      },
+      "global_fake_threshold": 0.45999999999999996,
+      "source_counts": {
+        "real_certificate": 40,
+        "legacy_normal": 12,
+        "legacy_tampered": 44,
+        "production_tampered": 2
+      },
+      "manifest_path": "/home/ubuntu/var/www/PD_max/app/ai_detection/models/trained/20260717_190636/manifest.json",
+      "report_path": "/home/ubuntu/var/www/PD_max/app/ai_detection/models/trained/20260717_190636/evaluation_report.json",
+      "gates": {
+        "passed": false,
+        "fixed_regression": {
+          "passed": false,
+          "total": 56,
+          "failures": [
+            {
+              "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/no (10).jpg",
+              "expected": "正常",
+              "actual": "无法自动检测"
+            },
+            {
+              "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/no (9).jpg",
+              "expected": "正常",
+              "actual": "无法自动检测"
+            },
+            {
+              "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/no (8).jpg",
+              "expected": "正常",
+              "actual": "篡改"
+            },
+            {
+              "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/no (12).jpg",
+              "expected": "正常",
+              "actual": "篡改"
+            },
+            {
+              "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/no (6).jpg",
+              "expected": "正常",
+              "actual": "无法自动检测"
+            },
+            {
+              "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/no (7).jpg",
+              "expected": "正常",
+              "actual": "无法自动检测"
+            },
+            {
+              "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (12).jpg",
+              "expected": "篡改",
+              "actual": "无法自动检测"
+            },
+            {
+              "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (4).jpg",
+              "expected": "篡改",
+              "actual": "无法自动检测"
+            },
+            {
+              "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (21).jpg",
+              "expected": "篡改",
+              "actual": "无法自动检测"
+            },
+            {
+              "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (29).jpg",
+              "expected": "篡改",
+              "actual": "无法自动检测"
+            },
+            {
+              "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (17).jpg",
+              "expected": "篡改",
+              "actual": "无法自动检测"
+            },
+            {
+              "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (44).jpg",
+              "expected": "篡改",
+              "actual": "无法自动检测"
+            }
+          ]
+        },
+        "training_replay_regression": {
+          "passed": true,
+          "total": 2,
+          "failures": []
+        },
+        "validation_metrics": {
+          "passed": true,
+          "comparisons": {
+            "balanced_accuracy": {
+              "candidate": 1.0,
+              "active": 0.7777777777777778,
+              "passed": true
+            },
+            "normal_recall": {
+              "candidate": 1.0,
+              "active": 0.5555555555555556,
+              "passed": true
+            },
+            "tampered_recall": {
+              "candidate": 1.0,
+              "active": 1.0,
+              "passed": true
+            }
+          }
+        },
+        "holdout_metrics": {
+          "passed": false,
+          "comparisons": {
+            "balanced_accuracy": {
+              "candidate": 0.9166666666666667,
+              "minimum": 0.9,
+              "passed": true
+            },
+            "normal_recall": {
+              "candidate": 1.0,
+              "minimum": 0.9,
+              "passed": true
+            },
+            "tampered_recall": {
+              "candidate": 0.8333333333333334,
+              "minimum": 0.9,
+              "passed": false
+            }
+          }
+        },
+        "roi_coverage": {
+          "passed": true,
+          "coverage": 0.9285714285714286,
+          "minimum": 0.9,
+          "sample_count": 14,
+          "recognized_count": 13
+        }
+      },
+      "status": "CANDIDATE",
+      "created_at": "2026-07-17T11:07:05+00:00",
+      "model_sha256": "612f72e0ed17f6d83aa69d35a8bd4eba44cbfc8ed2f56c72f6f40e5474213110",
+      "evaluation_report": {
+        "version": "20260717_190636",
+        "gates": {
+          "passed": false,
+          "fixed_regression": {
+            "passed": false,
+            "total": 56,
+            "failures": [
+              {
+                "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/no (10).jpg",
+                "expected": "正常",
+                "actual": "无法自动检测"
+              },
+              {
+                "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/no (9).jpg",
+                "expected": "正常",
+                "actual": "无法自动检测"
+              },
+              {
+                "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/no (8).jpg",
+                "expected": "正常",
+                "actual": "篡改"
+              },
+              {
+                "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/no (12).jpg",
+                "expected": "正常",
+                "actual": "篡改"
+              },
+              {
+                "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/no (6).jpg",
+                "expected": "正常",
+                "actual": "无法自动检测"
+              },
+              {
+                "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/no (7).jpg",
+                "expected": "正常",
+                "actual": "无法自动检测"
+              },
+              {
+                "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (12).jpg",
+                "expected": "篡改",
+                "actual": "无法自动检测"
+              },
+              {
+                "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (4).jpg",
+                "expected": "篡改",
+                "actual": "无法自动检测"
+              },
+              {
+                "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (21).jpg",
+                "expected": "篡改",
+                "actual": "无法自动检测"
+              },
+              {
+                "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (29).jpg",
+                "expected": "篡改",
+                "actual": "无法自动检测"
+              },
+              {
+                "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (17).jpg",
+                "expected": "篡改",
+                "actual": "无法自动检测"
+              },
+              {
+                "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (44).jpg",
+                "expected": "篡改",
+                "actual": "无法自动检测"
+              }
+            ]
+          },
+          "training_replay_regression": {
+            "passed": true,
+            "total": 2,
+            "failures": []
+          },
+          "validation_metrics": {
+            "passed": true,
+            "comparisons": {
+              "balanced_accuracy": {
+                "candidate": 1.0,
+                "active": 0.7777777777777778,
+                "passed": true
+              },
+              "normal_recall": {
+                "candidate": 1.0,
+                "active": 0.5555555555555556,
+                "passed": true
+              },
+              "tampered_recall": {
+                "candidate": 1.0,
+                "active": 1.0,
+                "passed": true
+              }
+            }
+          },
+          "holdout_metrics": {
+            "passed": false,
+            "comparisons": {
+              "balanced_accuracy": {
+                "candidate": 0.9166666666666667,
+                "minimum": 0.9,
+                "passed": true
+              },
+              "normal_recall": {
+                "candidate": 1.0,
+                "minimum": 0.9,
+                "passed": true
+              },
+              "tampered_recall": {
+                "candidate": 0.8333333333333334,
+                "minimum": 0.9,
+                "passed": false
+              }
+            }
+          },
+          "roi_coverage": {
+            "passed": true,
+            "coverage": 0.9285714285714286,
+            "minimum": 0.9,
+            "sample_count": 14,
+            "recognized_count": 13
+          }
+        },
+        "regression_predictions": [
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/no (10).jpg",
+            "expected_label": 0,
+            "actual": "无法自动检测"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/no (9).jpg",
+            "expected_label": 0,
+            "actual": "无法自动检测"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/no (3).jpg",
+            "expected_label": 0,
+            "actual": "正常"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/no (2).jpg",
+            "expected_label": 0,
+            "actual": "正常"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/no (11).jpg",
+            "expected_label": 0,
+            "actual": "正常"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/no (4).jpg",
+            "expected_label": 0,
+            "actual": "正常"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/no (8).jpg",
+            "expected_label": 0,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/no (12).jpg",
+            "expected_label": 0,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/no (6).jpg",
+            "expected_label": 0,
+            "actual": "无法自动检测"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/no (7).jpg",
+            "expected_label": 0,
+            "actual": "无法自动检测"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/no (5).jpg",
+            "expected_label": 0,
+            "actual": "正常"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/no (1).jpg",
+            "expected_label": 0,
+            "actual": "正常"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (16).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (43).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (41).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (12).jpg",
+            "expected_label": 1,
+            "actual": "无法自动检测"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (15).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (8).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (37).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (9).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (39).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (11).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (2).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (10).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (32).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (24).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (7).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (36).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (6).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (4).jpg",
+            "expected_label": 1,
+            "actual": "无法自动检测"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (26).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (14).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (13).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (42).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (20).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (23).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (21).jpg",
+            "expected_label": 1,
+            "actual": "无法自动检测"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (27).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (1).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (28).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (31).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (35).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (5).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (29).jpg",
+            "expected_label": 1,
+            "actual": "无法自动检测"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (30).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (18).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (22).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (17).jpg",
+            "expected_label": 1,
+            "actual": "无法自动检测"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (3).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (25).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (44).jpg",
+            "expected_label": 1,
+            "actual": "无法自动检测"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (38).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (33).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (34).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (40).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (19).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          }
+        ],
+        "training_replay_predictions": [
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/pptest__ebe78fef76ed__111.png",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/pptest__21a9066bff6a__92e595cffb63d039f10b271f23b180dd.png",
+            "expected_label": 1,
+            "actual": "篡改"
+          }
+        ],
+        "holdout_predictions": [
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/10.png",
+            "expected_label": 0,
+            "actual": "正常"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/37.png",
+            "expected_label": 0,
+            "actual": "正常"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/22.jpg",
+            "expected_label": 0,
+            "actual": "正常"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/43.png",
+            "expected_label": 0,
+            "actual": "正常"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/16.png",
+            "expected_label": 0,
+            "actual": "正常"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/15.jpg",
+            "expected_label": 0,
+            "actual": "正常"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/14.jpg",
+            "expected_label": 0,
+            "actual": "正常"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/5.png",
+            "expected_label": 0,
+            "actual": "正常"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (16).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (43).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (41).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (12).jpg",
+            "expected_label": 1,
+            "actual": "无法自动检测"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (15).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (8).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          }
+        ],
+        "holdout_metrics": {
+          "available": true,
+          "sample_count": 14,
+          "balanced_accuracy": 0.9166666666666667,
+          "normal_recall": 1.0,
+          "tampered_recall": 0.8333333333333334,
+          "confusion_matrix": [
+            [
+              8,
+              0
+            ],
+            [
+              1,
+              5
+            ]
+          ],
+          "abstained_count": 1
+        },
+        "roi_coverage": {
+          "sample_count": 14,
+          "recognized_count": 13,
+          "coverage": 0.9285714285714286
+        }
+      },
+      "updated_at": "2026-07-17T11:09:11+00:00"
+    },
+    {
+      "version": "20260717_193825",
+      "timestamp": "20260717_193825",
+      "model_path": "/home/ubuntu/var/www/PD_max/app/ai_detection/models/trained/20260717_193825/global_layout_model.pkl",
+      "font_lib_path": "/home/ubuntu/var/www/PD_max/app/ai_detection/models/trained/20260717_193825/font_lib",
+      "reference_index_path": "/home/ubuntu/var/www/PD_max/app/ai_detection/models/trained/20260717_193825/normal_reference_index.json",
+      "train_accuracy": 1.0,
+      "total_samples": 385,
+      "evaluation": {
+        "available": true,
+        "balanced_accuracy": 1.0,
+        "normal_recall": 1.0,
+        "tampered_recall": 1.0,
+        "confusion_matrix": [
+          [
+            7,
+            0
+          ],
+          [
+            0,
+            6
+          ]
+        ],
+        "threshold": 0.65
+      },
+      "active_evaluation": {
+        "available": true,
+        "balanced_accuracy": 0.5714285714285714,
+        "normal_recall": 0.14285714285714285,
+        "tampered_recall": 1.0,
+        "confusion_matrix": [
+          [
+            1,
+            6
+          ],
+          [
+            0,
+            6
+          ]
+        ],
+        "threshold": 0.65
+      },
+      "test_evaluation": {
+        "available": true,
+        "balanced_accuracy": 1.0,
+        "normal_recall": 1.0,
+        "tampered_recall": 1.0,
+        "confusion_matrix": [
+          [
+            7,
+            0
+          ],
+          [
+            0,
+            6
+          ]
+        ],
+        "threshold": 0.65,
+        "sample_count": 13,
+        "paths": [
+          "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/15.jpg",
+          "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/10.png",
+          "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/1.png",
+          "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/13.jpg",
+          "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/14.jpg",
+          "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (11).jpg",
+          "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (14).jpg",
+          "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (12).jpg",
+          "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/11.jpg",
+          "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (10).jpg",
+          "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/16.png",
+          "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (13).jpg",
+          "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (1).jpg"
+        ],
+        "predictions": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          1,
+          1,
+          1,
+          0,
+          1,
+          0,
+          1,
+          1
+        ],
+        "sample_failures": []
+      },
+      "training_replay_evaluation": {
+        "available": false,
+        "balanced_accuracy": null,
+        "normal_recall": null,
+        "tampered_recall": null,
+        "confusion_matrix": null,
+        "sample_count": 2,
+        "paths": [
+          "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/pptest__ebe78fef76ed__111.png",
+          "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/pptest__21a9066bff6a__92e595cffb63d039f10b271f23b180dd.png"
+        ],
+        "predictions": [
+          0,
+          0
+        ],
+        "sample_failures": []
+      },
+      "global_fake_threshold": 0.65,
+      "source_counts": {
+        "real_certificate": 40,
+        "legacy_tampered": 44,
+        "legacy_normal": 12,
+        "production_tampered": 2
+      },
+      "manifest_path": "/home/ubuntu/var/www/PD_max/app/ai_detection/models/trained/20260717_193825/manifest.json",
+      "report_path": "/home/ubuntu/var/www/PD_max/app/ai_detection/models/trained/20260717_193825/evaluation_report.json",
+      "gates": {
+        "passed": true,
+        "fixed_regression": {
+          "passed": true,
+          "total": 56,
+          "failures": []
+        },
+        "training_replay_regression": {
+          "passed": true,
+          "total": 2,
+          "failures": []
+        },
+        "validation_metrics": {
+          "passed": true,
+          "comparisons": {
+            "balanced_accuracy": {
+              "candidate": 1.0,
+              "active": 0.5714285714285714,
+              "passed": true
+            },
+            "normal_recall": {
+              "candidate": 1.0,
+              "active": 0.14285714285714285,
+              "passed": true
+            },
+            "tampered_recall": {
+              "candidate": 1.0,
+              "active": 1.0,
+              "passed": true
+            }
+          }
+        },
+        "holdout_metrics": {
+          "passed": true,
+          "comparisons": {
+            "balanced_accuracy": {
+              "candidate": 1.0,
+              "minimum": 0.9,
+              "passed": true
+            },
+            "normal_recall": {
+              "candidate": 1.0,
+              "minimum": 0.9,
+              "passed": true
+            },
+            "tampered_recall": {
+              "candidate": 1.0,
+              "minimum": 0.9,
+              "passed": true
+            }
+          }
+        },
+        "roi_coverage": {
+          "passed": true,
+          "coverage": 1.0,
+          "minimum": 0.9,
+          "sample_count": 13,
+          "recognized_count": 13
+        }
+      },
+      "status": "ACTIVE",
+      "created_at": "2026-07-17T11:38:49+00:00",
+      "model_sha256": "d368f1733fe6b92d7c782f06c7f7f597862de19641a09bafce3a8cbc6391ad95",
+      "evaluation_report": {
+        "version": "20260717_193825",
+        "gates": {
+          "passed": true,
+          "fixed_regression": {
+            "passed": true,
+            "total": 56,
+            "failures": []
+          },
+          "training_replay_regression": {
+            "passed": true,
+            "total": 2,
+            "failures": []
+          },
+          "validation_metrics": {
+            "passed": true,
+            "comparisons": {
+              "balanced_accuracy": {
+                "candidate": 1.0,
+                "active": 0.5714285714285714,
+                "passed": true
+              },
+              "normal_recall": {
+                "candidate": 1.0,
+                "active": 0.14285714285714285,
+                "passed": true
+              },
+              "tampered_recall": {
+                "candidate": 1.0,
+                "active": 1.0,
+                "passed": true
+              }
+            }
+          },
+          "holdout_metrics": {
+            "passed": true,
+            "comparisons": {
+              "balanced_accuracy": {
+                "candidate": 1.0,
+                "minimum": 0.9,
+                "passed": true
+              },
+              "normal_recall": {
+                "candidate": 1.0,
+                "minimum": 0.9,
+                "passed": true
+              },
+              "tampered_recall": {
+                "candidate": 1.0,
+                "minimum": 0.9,
+                "passed": true
+              }
+            }
+          },
+          "roi_coverage": {
+            "passed": true,
+            "coverage": 1.0,
+            "minimum": 0.9,
+            "sample_count": 13,
+            "recognized_count": 13
+          }
+        },
+        "regression_predictions": [
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (29).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/no (6).jpg",
+            "expected_label": 0,
+            "actual": "正常"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/no (7).jpg",
+            "expected_label": 0,
+            "actual": "正常"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (40).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (17).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (26).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (19).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (18).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/no (10).jpg",
+            "expected_label": 0,
+            "actual": "正常"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/no (9).jpg",
+            "expected_label": 0,
+            "actual": "正常"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (33).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (34).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (30).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (4).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (22).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (28).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/no (4).jpg",
+            "expected_label": 0,
+            "actual": "正常"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (23).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (41).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (27).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (31).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (8).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/no (3).jpg",
+            "expected_label": 0,
+            "actual": "正常"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (11).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (14).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (24).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/no (11).jpg",
+            "expected_label": 0,
+            "actual": "正常"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (12).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (7).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (3).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (6).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (20).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (39).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (5).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (32).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/no (12).jpg",
+            "expected_label": 0,
+            "actual": "正常"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (10).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/no (5).jpg",
+            "expected_label": 0,
+            "actual": "正常"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (2).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (35).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (42).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (36).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (16).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (21).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/no (8).jpg",
+            "expected_label": 0,
+            "actual": "正常"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (13).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/no (1).jpg",
+            "expected_label": 0,
+            "actual": "正常"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (38).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (9).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (37).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (1).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (25).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (43).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (15).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (44).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/no (2).jpg",
+            "expected_label": 0,
+            "actual": "正常"
+          }
+        ],
+        "training_replay_predictions": [
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/pptest__ebe78fef76ed__111.png",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/pptest__21a9066bff6a__92e595cffb63d039f10b271f23b180dd.png",
+            "expected_label": 1,
+            "actual": "篡改"
+          }
+        ],
+        "holdout_predictions": [
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/15.jpg",
+            "expected_label": 0,
+            "actual": "正常"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/10.png",
+            "expected_label": 0,
+            "actual": "正常"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/1.png",
+            "expected_label": 0,
+            "actual": "正常"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/13.jpg",
+            "expected_label": 0,
+            "actual": "正常"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/14.jpg",
+            "expected_label": 0,
+            "actual": "正常"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (11).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (14).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (12).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/11.jpg",
+            "expected_label": 0,
+            "actual": "正常"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (10).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/normal/16.png",
+            "expected_label": 0,
+            "actual": "正常"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (13).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          },
+          {
+            "path": "/home/ubuntu/var/www/PD_max/app/ai_detection/images/tampered/p (1).jpg",
+            "expected_label": 1,
+            "actual": "篡改"
+          }
+        ],
+        "holdout_metrics": {
+          "available": true,
+          "sample_count": 13,
+          "balanced_accuracy": 1.0,
+          "normal_recall": 1.0,
+          "tampered_recall": 1.0,
+          "confusion_matrix": [
+            [
+              7,
+              0
+            ],
+            [
+              0,
+              6
+            ]
+          ],
+          "abstained_count": 0
+        },
+        "roi_coverage": {
+          "sample_count": 13,
+          "recognized_count": 13,
+          "coverage": 1.0
+        }
+      },
+      "updated_at": "2026-07-17T12:02:27+00:00",
+      "activated_at": "2026-07-17T12:06:59+00:00",
+      "activated_by": "local-training-validation",
+      "force_activated": false,
+      "force_reason": ""
     }
   ],
-  "updated_at": "2026-07-14T11:53:04+00:00"
+  "updated_at": "2026-07-17T12:06:59+00:00"
 }

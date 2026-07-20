@@ -8,14 +8,14 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import cv2
 import numpy as np
 
-from app.ai_detection.amount_candidates import (
+from app.ai_detection.core.amount_candidates import (
     MASKED_ACCOUNT_PATTERN,
     OCRToken,
     group_tokens_by_line,
     normalize_text,
 )
 from app.ai_detection.core.detectors import OriginalityChecker
-from app.ai_detection.timestamp_checker import parse_exif_timestamps
+from app.ai_detection.core.timestamp_checker import parse_exif_timestamps
 
 AMOUNT_DECIMAL_PATTERN = re.compile(
     r"(?<!\d)[+\-]?\s*(?:[¥￥])?\d[\d,]*\.\d{2}(?:元)?(?!\d)"
